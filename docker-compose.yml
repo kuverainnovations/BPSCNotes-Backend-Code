@@ -1,0 +1,170 @@
+version: '3.9'
+
+# ════════════════════════════════════════════════════════════
+# BPSCNotes — Production Docker Compose
+# Usage:
+#   cp .env.example .env   (fill in all values)
+#   docker compose up -d
+# ════════════════════════════════════════════════════════════
+
+networks:
+  bpscnotes-net:
+    driver: bridge
+
+volumes:
+  postgres-data:
+  redis-data:
+  nginx-certs:
+  nginx-vhost:
+  nginx-html:
+
+services:
+
+  # ── API Server ──────────────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+    container_name: bpscnotes-api
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      NODE_ENV:     production
+      DB_HOST:      postgres
+      REDIS_HOST:   redis
+      PORT:         5000
+    ports:
+      - "5000:5000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - bpscnotes-net
+    deploy:
+      resources:
+        limits:
+          cpus:   '1'
+          memory: 512M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:5000/health"]
+      interval: 30s
+      timeout:  10s
+      retries:  3
+      start_period: 40s
+
+  # ── PostgreSQL ──────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: bpscnotes-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB:       ${DB_NAME:-bpscnotes}
+      POSTGRES_USER:     ${DB_USER:-postgres}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      PGDATA:            /var/lib/postgresql/data/pgdata
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./scripts/init-db.sh:/docker-entrypoint-initdb.d/init-db.sh:ro
+    networks:
+      - bpscnotes-net
+    ports:
+      - "5432:5432"    # Remove in production — expose only internally
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-postgres} -d ${DB_NAME:-bpscnotes}"]
+      interval: 10s
+      timeout:  5s
+      retries:  5
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ── Redis ───────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: bpscnotes-redis
+    restart: unless-stopped
+    command: >
+      redis-server
+      --requirepass ${REDIS_PASSWORD:-}
+      --appendonly yes
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+      --save 900 1
+      --save 300 10
+    volumes:
+      - redis-data:/data
+    networks:
+      - bpscnotes-net
+    ports:
+      - "6379:6379"    # Remove in production
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout:  5s
+      retries:  5
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+
+  # ── Nginx (Reverse Proxy + SSL) ─────────────────────────────
+  nginx:
+    image: nginx:alpine
+    container_name: bpscnotes-nginx
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+      - nginx-certs:/etc/letsencrypt
+      - nginx-html:/var/www/certbot
+      - ./nginx/logs:/var/log/nginx
+    depends_on:
+      - api
+    networks:
+      - bpscnotes-net
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ── Certbot (SSL Renewal) ───────────────────────────────────
+  certbot:
+    image: certbot/certbot
+    container_name: bpscnotes-certbot
+    volumes:
+      - nginx-certs:/etc/letsencrypt
+      - nginx-html:/var/www/certbot
+    entrypoint: "/bin/sh -c 'trap exit TERM; while :; do certbot renew; sleep 12h & wait $${!}; done;'"
+
+  # ── pgAdmin (Optional — remove in production) ───────────────
+  pgadmin:
+    image: dpage/pgadmin4
+    container_name: bpscnotes-pgadmin
+    profiles: ["tools"]          # Only starts with: docker compose --profile tools up
+    environment:
+      PGADMIN_DEFAULT_EMAIL:    admin@bpscnotes.com
+      PGADMIN_DEFAULT_PASSWORD: ${DB_PASSWORD}
+    ports:
+      - "5050:80"
+    depends_on:
+      - postgres
+    networks:
+      - bpscnotes-net

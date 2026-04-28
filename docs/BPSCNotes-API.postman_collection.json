@@ -1,0 +1,219 @@
+{
+  "info": {
+    "name": "BPSCNotes API — Complete Collection",
+    "description": "Complete API collection for BPSCNotes mobile app and admin panel.\n\n**Setup:**\n1. Set `baseUrl` variable to your server URL\n2. Run 'Auth — Send OTP' then 'Auth — Verify OTP' to get tokens\n3. Tokens auto-save to collection variables\n\n**Variables:** baseUrl, accessToken, refreshToken, adminToken",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "baseUrl",      "value": "http://localhost:5000/api/v1", "type": "string" },
+    { "key": "accessToken",  "value": "", "type": "string" },
+    { "key": "refreshToken", "value": "", "type": "string" },
+    { "key": "adminToken",   "value": "", "type": "string" },
+    { "key": "mobile",       "value": "+919876543210", "type": "string" }
+  ],
+  "item": [
+    {
+      "name": "🔐 Auth (Mobile)",
+      "item": [
+        {
+          "name": "1. Send OTP",
+          "request": {
+            "method": "POST", "url": "{{baseUrl}}/auth/send-otp",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\"mobile\": \"{{mobile}}\"}" }
+          },
+          "event": [{ "listen": "test", "script": { "exec": [
+            "const res = pm.response.json();",
+            "if (res.data?.otp) pm.collectionVariables.set('otp', res.data.otp);",
+            "pm.test('Status 200', () => pm.response.to.have.status(200));"
+          ] } }]
+        },
+        {
+          "name": "2. Verify OTP (Login / Get Temp Token)",
+          "request": {
+            "method": "POST", "url": "{{baseUrl}}/auth/verify-otp",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\"mobile\": \"{{mobile}}\", \"otp\": \"{{otp}}\"}" }
+          },
+          "event": [{ "listen": "test", "script": { "exec": [
+            "const res = pm.response.json();",
+            "if (res.data?.accessToken) { pm.collectionVariables.set('accessToken', res.data.accessToken); pm.collectionVariables.set('refreshToken', res.data.refreshToken); }",
+            "if (res.data?.tempToken) pm.collectionVariables.set('tempToken', res.data.tempToken);",
+            "pm.test('OTP verified', () => pm.response.to.have.status(200));"
+          ] } }]
+        },
+        {
+          "name": "3. Register (New User)",
+          "request": {
+            "method": "POST", "url": "{{baseUrl}}/auth/register",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\"tempToken\": \"{{tempToken}}\", \"name\": \"Test User\", \"email\": \"test@example.com\", \"district\": \"Patna\"}" }
+          },
+          "event": [{ "listen": "test", "script": { "exec": [
+            "const res = pm.response.json();",
+            "if (res.data?.accessToken) { pm.collectionVariables.set('accessToken', res.data.accessToken); pm.collectionVariables.set('refreshToken', res.data.refreshToken); }"
+          ] } }]
+        },
+        {
+          "name": "4. Exam Selection",
+          "request": {
+            "method": "POST", "url": "{{baseUrl}}/auth/exam-selection",
+            "header": [{ "key": "Content-Type", "value": "application/json" }, { "key": "Authorization", "value": "Bearer {{accessToken}}" }],
+            "body": { "mode": "raw", "raw": "{\"primaryExam\": \"BPSC 70th CCE\", \"prepLevel\": \"intermediate\", \"targetYear\": 2026}" }
+          }
+        },
+        {
+          "name": "5. Refresh Token",
+          "request": {
+            "method": "POST", "url": "{{baseUrl}}/auth/refresh",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\"refreshToken\": \"{{refreshToken}}\"}" }
+          },
+          "event": [{ "listen": "test", "script": { "exec": [
+            "const res = pm.response.json();",
+            "if (res.data?.accessToken) pm.collectionVariables.set('accessToken', res.data.accessToken);"
+          ] } }]
+        },
+        { "name": "6. Get Me", "request": { "method": "GET", "url": "{{baseUrl}}/auth/me", "header": [{ "key": "Authorization", "value": "Bearer {{accessToken}}" }] } },
+        { "name": "7. Update FCM Token", "request": { "method": "POST", "url": "{{baseUrl}}/auth/fcm-token", "header": [{ "key": "Content-Type", "value": "application/json" }, { "key": "Authorization", "value": "Bearer {{accessToken}}" }], "body": { "mode": "raw", "raw": "{\"fcmToken\": \"device_token_here\"}" } } },
+        { "name": "8. Logout", "request": { "method": "POST", "url": "{{baseUrl}}/auth/logout", "header": [{ "key": "Authorization", "value": "Bearer {{accessToken}}" }] } }
+      ]
+    },
+    {
+      "name": "👤 Users",
+      "item": [
+        { "name": "Get Profile",    "request": { "method": "GET", "url": "{{baseUrl}}/users/profile",   "header": [{ "key": "Authorization", "value": "Bearer {{accessToken}}" }] } },
+        { "name": "Update Profile", "request": { "method": "PUT", "url": "{{baseUrl}}/users/profile",   "header": [{ "key": "Content-Type", "value": "application/json" }, { "key": "Authorization", "value": "Bearer {{accessToken}}" }], "body": { "mode": "raw", "raw": "{\"name\":\"Rahul Kumar\",\"bio\":\"BPSC Aspirant\",\"district\":\"Patna\"}" } } },
+        { "name": "Get Stats",      "request": { "method": "GET", "url": "{{baseUrl}}/users/stats",     "header": [{ "key": "Authorization", "value": "Bearer {{accessToken}}" }] } },
+        { "name": "Leaderboard",    "request": { "method": "GET", "url": "{{baseUrl}}/users/leaderboard?exam=BPSC 70th CCE", "header": [{ "key": "Authorization", "value": "Bearer {{accessToken}}" }] } },
+        { "name": "My Enrollments", "request": { "method": "GET", "url": "{{baseUrl}}/users/enrollments","header": [{ "key": "Authorization", "value": "Bearer {{accessToken}}" }] } },
+        { "name": "My Downloads",   "request": { "method": "GET", "url": "{{baseUrl}}/users/downloads",  "header": [{ "key": "Authorization", "value": "Bearer {{accessToken}}" }] } },
+        { "name": "My Certificates","request": { "method": "GET", "url": "{{baseUrl}}/users/certificates","header": [{ "key": "Authorization", "value": "Bearer {{accessToken}}" }] } },
+        { "name": "Live Classes",   "request": { "method": "GET", "url": "{{baseUrl}}/users/live-classes","header": [{ "key": "Authorization", "value": "Bearer {{accessToken}}" }] } },
+        { "name": "Notif Settings", "request": { "method": "PUT", "url": "{{baseUrl}}/users/notification-settings","header": [{ "key": "Content-Type", "value": "application/json" }, { "key": "Authorization", "value": "Bearer {{accessToken}}" }], "body": { "mode": "raw", "raw": "{\"enabled\":true}" } } }
+      ]
+    },
+    {
+      "name": "📚 Courses",
+      "item": [
+        { "name": "List Courses (Free)",   "request": { "method": "GET", "url": "{{baseUrl}}/courses?type=free&page=1&limit=20", "header": [{ "key": "Authorization", "value": "Bearer {{accessToken}}" }] } },
+        { "name": "List Courses (Paid)",   "request": { "method": "GET", "url": "{{baseUrl}}/courses?type=paid", "header": [{ "key": "Authorization", "value": "Bearer {{accessToken}}" }] } },
+        { "name": "Search Courses",        "request": { "method": "GET", "url": "{{baseUrl}}/courses?search=polity", "header": [{ "key": "Authorization", "value": "Bearer {{accessToken}}" }] } },
+        { "name": "Course Detail",         "request": { "method": "GET", "url": "{{baseUrl}}/courses/COURSE_ID", "header": [{ "key": "Authorization", "value": "Bearer {{accessToken}}" }] } },
+        { "name": "Enroll Course",         "request": { "method": "POST","url": "{{baseUrl}}/courses/COURSE_ID/enroll", "header": [{ "key": "Authorization", "value": "Bearer {{accessToken}}" }] } },
+        { "name": "Complete Lesson",       "request": { "method": "POST","url": "{{baseUrl}}/courses/COURSE_ID/lessons/LESSON_ID/complete","header": [{ "key": "Content-Type", "value": "application/json" }, { "key": "Authorization", "value": "Bearer {{accessToken}}" }], "body": { "mode": "raw", "raw": "{\"watchTimeSecs\":600}" } } },
+        { "name": "Submit Review",         "request": { "method": "POST","url": "{{baseUrl}}/courses/COURSE_ID/review","header": [{ "key": "Content-Type", "value": "application/json" }, { "key": "Authorization", "value": "Bearer {{accessToken}}" }], "body": { "mode": "raw", "raw": "{\"rating\":5,\"comment\":\"Excellent course!\"}" } } }
+      ]
+    },
+    {
+      "name": "🎯 Quizzes",
+      "item": [
+        { "name": "Daily Quizzes",   "request": { "method": "GET", "url": "{{baseUrl}}/quizzes?type=daily",  "header": [{ "key": "Authorization", "value": "Bearer {{accessToken}}" }] } },
+        { "name": "Topic Quizzes",   "request": { "method": "GET", "url": "{{baseUrl}}/quizzes?type=topic&subject=Polity", "header": [{ "key": "Authorization", "value": "Bearer {{accessToken}}" }] } },
+        { "name": "Mock Tests",      "request": { "method": "GET", "url": "{{baseUrl}}/quizzes?type=mock",   "header": [{ "key": "Authorization", "value": "Bearer {{accessToken}}" }] } },
+        { "name": "Quiz Detail",     "request": { "method": "GET", "url": "{{baseUrl}}/quizzes/QUIZ_ID",     "header": [{ "key": "Authorization", "value": "Bearer {{accessToken}}" }] } },
+        { "name": "Submit Quiz",     "request": { "method": "POST","url": "{{baseUrl}}/quizzes/QUIZ_ID/submit","header": [{ "key": "Content-Type", "value": "application/json" }, { "key": "Authorization", "value": "Bearer {{accessToken}}" }], "body": { "mode": "raw", "raw": "{\"answers\":[{\"questionId\":\"Q_ID\",\"answer\":\"a\"},{\"questionId\":\"Q_ID2\",\"answer\":\"c\"}],\"timeTakenSecs\":300}" } } }
+      ]
+    },
+    {
+      "name": "📖 Library",
+      "item": [
+        { "name": "All Notes",        "request": { "method": "GET", "url": "{{baseUrl}}/library",                   "header": [{ "key": "Authorization", "value": "Bearer {{accessToken}}" }] } },
+        { "name": "PDFs only",        "request": { "method": "GET", "url": "{{baseUrl}}/library?type=pdf",          "header": [{ "key": "Authorization", "value": "Bearer {{accessToken}}" }] } },
+        { "name": "Free Notes",       "request": { "method": "GET", "url": "{{baseUrl}}/library?premium=false",     "header": [{ "key": "Authorization", "value": "Bearer {{accessToken}}" }] } },
+        { "name": "Search Library",   "request": { "method": "GET", "url": "{{baseUrl}}/library?search=constitution","header": [{ "key": "Authorization", "value": "Bearer {{accessToken}}" }] } },
+        { "name": "Toggle Bookmark",  "request": { "method": "POST","url": "{{baseUrl}}/library/NOTE_ID/bookmark",  "header": [{ "key": "Authorization", "value": "Bearer {{accessToken}}" }] } },
+        { "name": "Download Note",    "request": { "method": "POST","url": "{{baseUrl}}/library/NOTE_ID/download",  "header": [{ "key": "Authorization", "value": "Bearer {{accessToken}}" }] } }
+      ]
+    },
+    {
+      "name": "📰 Current Affairs",
+      "item": [
+        { "name": "Today's Affairs",   "request": { "method": "GET", "url": "{{baseUrl}}/current-affairs?date=2026-04-21", "header": [{ "key": "Authorization", "value": "Bearer {{accessToken}}" }] } },
+        { "name": "By Category",       "request": { "method": "GET", "url": "{{baseUrl}}/current-affairs?category=Bihar Affairs", "header": [{ "key": "Authorization", "value": "Bearer {{accessToken}}" }] } },
+        { "name": "Important Only",    "request": { "method": "GET", "url": "{{baseUrl}}/current-affairs?important=true", "header": [{ "key": "Authorization", "value": "Bearer {{accessToken}}" }] } },
+        { "name": "Article Detail",    "request": { "method": "GET", "url": "{{baseUrl}}/current-affairs/AFFAIR_ID", "header": [{ "key": "Authorization", "value": "Bearer {{accessToken}}" }] } },
+        { "name": "Toggle Bookmark",   "request": { "method": "POST","url": "{{baseUrl}}/current-affairs/AFFAIR_ID/bookmark", "header": [{ "key": "Authorization", "value": "Bearer {{accessToken}}" }] } }
+      ]
+    },
+    {
+      "name": "💼 Jobs",
+      "item": [
+        { "name": "Active Jobs",   "request": { "method": "GET", "url": "{{baseUrl}}/jobs",                       "header": [{ "key": "Authorization", "value": "Bearer {{accessToken}}" }] } },
+        { "name": "By Category",   "request": { "method": "GET", "url": "{{baseUrl}}/jobs?category=BPSC",         "header": [{ "key": "Authorization", "value": "Bearer {{accessToken}}" }] } },
+        { "name": "Toggle Save",   "request": { "method": "POST","url": "{{baseUrl}}/jobs/JOB_ID/save",           "header": [{ "key": "Authorization", "value": "Bearer {{accessToken}}" }] } }
+      ]
+    },
+    {
+      "name": "💳 Subscriptions",
+      "item": [
+        { "name": "Get Plans",         "request": { "method": "GET", "url": "{{baseUrl}}/subscriptions/plans",   "header": [{ "key": "Authorization", "value": "Bearer {{accessToken}}" }] } },
+        { "name": "Check Status",      "request": { "method": "GET", "url": "{{baseUrl}}/subscriptions/status",  "header": [{ "key": "Authorization", "value": "Bearer {{accessToken}}" }] } },
+        { "name": "Validate Coupon",   "request": { "method": "POST","url": "{{baseUrl}}/subscriptions/coupons/validate","header": [{ "key": "Content-Type", "value": "application/json" }, { "key": "Authorization", "value": "Bearer {{accessToken}}" }], "body": { "mode": "raw", "raw": "{\"code\":\"BPSC50\",\"type\":\"subscription\"}" } } },
+        { "name": "Initiate Payment",  "request": { "method": "POST","url": "{{baseUrl}}/subscriptions/initiate","header": [{ "key": "Content-Type", "value": "application/json" }, { "key": "Authorization", "value": "Bearer {{accessToken}}" }], "body": { "mode": "raw", "raw": "{\"plan\":\"annual\",\"coinsToUse\":0,\"couponCode\":\"BPSC50\"}" } } },
+        { "name": "Confirm Payment",   "request": { "method": "POST","url": "{{baseUrl}}/subscriptions/SUB_ID/confirm","header": [{ "key": "Content-Type", "value": "application/json" }, { "key": "Authorization", "value": "Bearer {{accessToken}}" }], "body": { "mode": "raw", "raw": "{\"upiId\":\"9876543210@paytm\",\"transactionId\":\"TXN12345\",\"paymentMethod\":\"UPI\"}" } } }
+      ]
+    },
+    {
+      "name": "🏠 Home Screen",
+      "item": [
+        { "name": "Banners",    "request": { "method": "GET", "url": "{{baseUrl}}/banners",     "header": [{ "key": "Authorization", "value": "Bearer {{accessToken}}" }] } },
+        { "name": "Exams",      "request": { "method": "GET", "url": "{{baseUrl}}/exams" } },
+        { "name": "App Config", "request": { "method": "GET", "url": "{{baseUrl}}/app-config" } }
+      ]
+    },
+    {
+      "name": "🪙 Coins",
+      "item": [
+        { "name": "Balance",  "request": { "method": "GET", "url": "{{baseUrl}}/coins/balance", "header": [{ "key": "Authorization", "value": "Bearer {{accessToken}}" }] } },
+        { "name": "History",  "request": { "method": "GET", "url": "{{baseUrl}}/coins/history", "header": [{ "key": "Authorization", "value": "Bearer {{accessToken}}" }] } }
+      ]
+    },
+    {
+      "name": "👥 Study Rooms",
+      "item": [
+        { "name": "List Rooms",  "request": { "method": "GET",  "url": "{{baseUrl}}/study-rooms",              "header": [{ "key": "Authorization", "value": "Bearer {{accessToken}}" }] } },
+        { "name": "Create Room", "request": { "method": "POST", "url": "{{baseUrl}}/study-rooms",              "header": [{ "key": "Content-Type", "value": "application/json" }, { "key": "Authorization", "value": "Bearer {{accessToken}}" }], "body": { "mode": "raw", "raw": "{\"name\":\"BPSC Study Group\",\"subject\":\"Polity\",\"isPrivate\":false,\"examTags\":[\"BPSC 70th CCE\"]}" } } },
+        { "name": "Join Room",   "request": { "method": "POST", "url": "{{baseUrl}}/study-rooms/ROOM_ID/join", "header": [{ "key": "Content-Type", "value": "application/json" }, { "key": "Authorization", "value": "Bearer {{accessToken}}" }], "body": { "mode": "raw", "raw": "{}" } } },
+        { "name": "Leave Room",  "request": { "method": "POST", "url": "{{baseUrl}}/study-rooms/ROOM_ID/leave","header": [{ "key": "Authorization", "value": "Bearer {{accessToken}}" }] } }
+      ]
+    },
+    {
+      "name": "🔑 Admin Panel",
+      "item": [
+        {
+          "name": "Login",
+          "request": {
+            "method": "POST", "url": "{{baseUrl}}/admin/login",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\"email\":\"admin@bpscnotes.com\",\"password\":\"Admin@123456\"}" }
+          },
+          "event": [{ "listen": "test", "script": { "exec": [
+            "const res = pm.response.json();",
+            "if (res.data?.token) pm.collectionVariables.set('adminToken', res.data.token);",
+            "pm.test('Admin login', () => pm.response.to.have.status(200));"
+          ] } }]
+        },
+        { "name": "Dashboard Stats",    "request": { "method": "GET", "url": "{{baseUrl}}/admin/stats",              "header": [{ "key": "Authorization", "value": "Bearer {{adminToken}}" }] } },
+        { "name": "User Growth Chart",  "request": { "method": "GET", "url": "{{baseUrl}}/admin/analytics/chart?type=users&period=12months",   "header": [{ "key": "Authorization", "value": "Bearer {{adminToken}}" }] } },
+        { "name": "Revenue Chart",      "request": { "method": "GET", "url": "{{baseUrl}}/admin/analytics/chart?type=revenue&period=12months", "header": [{ "key": "Authorization", "value": "Bearer {{adminToken}}" }] } },
+        { "name": "List Users",         "request": { "method": "GET", "url": "{{baseUrl}}/admin/users?page=1&limit=20",  "header": [{ "key": "Authorization", "value": "Bearer {{adminToken}}" }] } },
+        { "name": "Search Users",       "request": { "method": "GET", "url": "{{baseUrl}}/admin/users?search=rahul",     "header": [{ "key": "Authorization", "value": "Bearer {{adminToken}}" }] } },
+        { "name": "Ban User",           "request": { "method": "PUT", "url": "{{baseUrl}}/admin/users/USER_ID/status",   "header": [{ "key": "Content-Type", "value": "application/json" }, { "key": "Authorization", "value": "Bearer {{adminToken}}" }], "body": { "mode": "raw", "raw": "{\"status\":\"banned\"}" } } },
+        { "name": "Create Course",      "request": { "method": "POST","url": "{{baseUrl}}/admin/courses",              "header": [{ "key": "Content-Type", "value": "application/json" }, { "key": "Authorization", "value": "Bearer {{adminToken}}" }], "body": { "mode": "raw", "raw": "{\"title\":\"BPSC Polity Complete\",\"subject\":\"Polity\",\"instructor\":\"Dr. Kumar\",\"isPaid\":false,\"status\":\"published\",\"examTags\":[\"BPSC 70th CCE\"]}" } } },
+        { "name": "Publish Course",     "request": { "method": "PUT", "url": "{{baseUrl}}/admin/courses/COURSE_ID",    "header": [{ "key": "Content-Type", "value": "application/json" }, { "key": "Authorization", "value": "Bearer {{adminToken}}" }], "body": { "mode": "raw", "raw": "{\"status\":\"published\"}" } } },
+        { "name": "Create Quiz",        "request": { "method": "POST","url": "{{baseUrl}}/admin/quizzes",              "header": [{ "key": "Content-Type", "value": "application/json" }, { "key": "Authorization", "value": "Bearer {{adminToken}}" }], "body": { "mode": "raw", "raw": "{\"title\":\"Polity Daily Quiz\",\"subject\":\"Polity\",\"type\":\"daily\",\"totalQuestions\":10,\"durationMins\":15,\"coinsReward\":10,\"status\":\"published\",\"examTags\":[\"BPSC 70th CCE\"]}" } } },
+        { "name": "Add Quiz Questions", "request": { "method": "POST","url": "{{baseUrl}}/admin/quizzes/QUIZ_ID/questions","header": [{ "key": "Content-Type", "value": "application/json" }, { "key": "Authorization", "value": "Bearer {{adminToken}}" }], "body": { "mode": "raw", "raw": "{\"questions\":[{\"question\":\"Article 1 of Indian Constitution deals with?\",\"optionA\":\"Citizenship\",\"optionB\":\"Name and territory\",\"optionC\":\"Fundamental Rights\",\"optionD\":\"Legislature\",\"correctOption\":\"b\",\"explanation\":\"Article 1 declares India to be a Union of States.\"}]}" } } },
+        { "name": "Post Current Affair","request": { "method": "POST","url": "{{baseUrl}}/admin/current-affairs",     "header": [{ "key": "Content-Type", "value": "application/json" }, { "key": "Authorization", "value": "Bearer {{adminToken}}" }], "body": { "mode": "raw", "raw": "{\"title\":\"Bihar CM announces new scheme\",\"summary\":\"Chief Minister announced a new scholarship scheme for BPSC aspirants.\",\"category\":\"Bihar Affairs\",\"date\":\"2026-04-21\",\"isImportant\":true,\"examTags\":[\"BPSC 70th CCE\"],\"status\":\"published\"}" } } },
+        { "name": "Add Job Vacancy",    "request": { "method": "POST","url": "{{baseUrl}}/admin/jobs",                "header": [{ "key": "Content-Type", "value": "application/json" }, { "key": "Authorization", "value": "Bearer {{adminToken}}" }], "body": { "mode": "raw", "raw": "{\"title\":\"BPSC 71st CCE\",\"organization\":\"Bihar Public Service Commission\",\"category\":\"BPSC\",\"totalPosts\":250,\"lastDate\":\"2026-05-31\",\"ageLimit\":\"21-37 years\",\"qualification\":\"Graduation\",\"status\":\"active\"}" } } },
+        { "name": "Send Notification",  "request": { "method": "POST","url": "{{baseUrl}}/admin/notifications/send",  "header": [{ "key": "Content-Type", "value": "application/json" }, { "key": "Authorization", "value": "Bearer {{adminToken}}" }], "body": { "mode": "raw", "raw": "{\"title\":\"New Daily Quiz Available! 🎯\",\"body\":\"Test your knowledge with today's Polity quiz. Earn 10 coins on passing!\",\"type\":\"quiz\",\"target\":\"all\"}" } } },
+        { "name": "Update Settings",    "request": { "method": "PUT", "url": "{{baseUrl}}/admin/settings",            "header": [{ "key": "Content-Type", "value": "application/json" }, { "key": "Authorization", "value": "Bearer {{adminToken}}" }], "body": { "mode": "raw", "raw": "{\"settings\":{\"maintenance_mode\":\"false\",\"coin_value_inr\":\"0.10\",\"max_coin_discount_sub\":\"30\"}}" } } },
+        { "name": "Get Coin Rules",     "request": { "method": "GET", "url": "{{baseUrl}}/admin/coins/rules",         "header": [{ "key": "Authorization", "value": "Bearer {{adminToken}}" }] } },
+        { "name": "Update Coin Rule",   "request": { "method": "PUT", "url": "{{baseUrl}}/admin/coins/rules/RULE_ID", "header": [{ "key": "Content-Type", "value": "application/json" }, { "key": "Authorization", "value": "Bearer {{adminToken}}" }], "body": { "mode": "raw", "raw": "{\"coinsAwarded\":15,\"maxPerDay\":1,\"isActive\":true}" } } },
+        { "name": "Create Coupon",      "request": { "method": "POST","url": "{{baseUrl}}/admin/subscriptions/coupons","header": [{ "key": "Content-Type", "value": "application/json" }, { "key": "Authorization", "value": "Bearer {{adminToken}}" }], "body": { "mode": "raw", "raw": "{\"code\":\"EXAM2026\",\"type\":\"percent\",\"value\":15,\"description\":\"Exam season discount\",\"appliesTo\":\"both\",\"maxUses\":5000}" } } },
+        { "name": "Recalculate Ranks",  "request": { "method": "POST","url": "{{baseUrl}}/admin/leaderboard/recalculate","header": [{ "key": "Authorization", "value": "Bearer {{adminToken}}" }] } },
+        { "name": "Award Coins",        "request": { "method": "POST","url": "{{baseUrl}}/admin/users/award-coins",   "header": [{ "key": "Content-Type", "value": "application/json" }, { "key": "Authorization", "value": "Bearer {{adminToken}}" }], "body": { "mode": "raw", "raw": "{\"userId\":\"USER_UUID\",\"amount\":50,\"reason\":\"Contest winner reward\"}" } } }
+      ]
+    }
+  ]
+}
