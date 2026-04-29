@@ -141,16 +141,22 @@ export class OtpService {
     }
 
     try {
-      await axios.default.post('https://api.msg91.com/api/v5/otp', {
-        template_id: otpConfig.msg91TemplateId,
-        mobile:      `91${mobile.replace('+91', '')}`,
-        authkey:     otpConfig.msg91AuthKey,
-        otp,
-      });
+      await axios.default.post(
+        'https://api.msg91.com/api/v5/otp',
+        null,
+        {
+          params: {
+            authkey: otpConfig.msg91AuthKey,
+            mobile: `91${mobile.replace('+91', '')}`,
+            template_id: otpConfig.msg91TemplateId,
+            otp,
+          },
+        }
+      );
       return { success: true };
     } catch (err) {
-      console.error('MSG91 error:', err.response?.data || err.message);
-      throw new BadRequestException('Failed to send OTP. Please try again.');
+      console.error('MSG91 FULL ERROR:', err.response?.data || err.message);
+      throw new BadRequestException('Failed to send OTP');
     }
   }
 
