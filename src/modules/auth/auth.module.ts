@@ -141,19 +141,20 @@ export class OtpService {
     }
 
     try {
-      await axios.default.post(
-        'https://api.msg91.com/api/v5/otp',
-        null,
-        {
-          params: {
-            authkey: otpConfig.msg91AuthKey,
-            mobile: `91${mobile.replace('+91', '')}`,
-            template_id: otpConfig.msg91TemplateId,
-            otp,
-          },
-        }
-      );
-      console.log("OTP : ", otp); 
+      // await axios.default.post(
+      //   'https://api.msg91.com/api/v5/otp',
+      //   null,
+      //   {
+      //     params: {
+      //       authkey: otpConfig.msg91AuthKey,
+      //       mobile: `91${mobile.replace('+91', '')}`,
+      //       template_id: otpConfig.msg91TemplateId,
+      //       otp,
+      //     },
+      //   }
+      // );
+
+      console.log("OTP is __ : ", otp); 
 return { success: true, otp };
     } catch (err) {
       console.error('MSG91 FULL ERROR:', err.response?.data || err.message);
