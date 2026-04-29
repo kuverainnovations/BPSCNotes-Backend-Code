@@ -153,7 +153,7 @@ export class OtpService {
           },
         }
       );
-      console.log("OTP:", otp);
+      console.log("OTP : ", otp); 
 return { success: true, otp };
     } catch (err) {
       console.error('MSG91 FULL ERROR:', err.response?.data || err.message);
