@@ -153,7 +153,8 @@ export class OtpService {
           },
         }
       );
-      return { success: true };
+      console.log("OTP:", otp);
+return { success: true, otp };
     } catch (err) {
       console.error('MSG91 FULL ERROR:', err.response?.data || err.message);
       throw new BadRequestException('Failed to send OTP');
