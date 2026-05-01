@@ -52,7 +52,7 @@ import { DailyTargetsModule } from './modules/combined-modules-2.module';
         username: config.get('database.user'),
         password: config.get('database.password'),
         ssl: config.get('database.ssl') ? { rejectUnauthorized: false } : false,
-        entities: [join(__dirname, 'modules/**/*.entity{.ts,.js}')],
+        autoLoadEntities: true,
         migrations: [join(__dirname, 'database/migrations/*{.ts,.js}')],
         synchronize: true,
         logging: config.get('database.logging'),
