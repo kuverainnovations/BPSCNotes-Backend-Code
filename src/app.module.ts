@@ -5,7 +5,8 @@ import { ThrottlerModule, ThrottlerGuard } from '@nestjs/throttler';
 import { CacheModule } from '@nestjs/cache-manager';
 import { APP_GUARD, APP_FILTER, APP_INTERCEPTOR } from '@nestjs/core';
 import { join } from 'path';
-import * as redisStore from 'cache-manager-redis-store';
+// import * as redisStore from 'cache-manager-redis-store';
+import { redisStore } from 'cache-manager-ioredis-yet';
 
 import { allConfigs } from './config';
 import { GlobalExceptionFilter } from './common/filters/global-exception.filter';
@@ -68,18 +69,15 @@ import { DailyTargetsModule } from './modules/combined-modules-2.module';
     CacheModule.registerAsync({
       isGlobal: true,
       inject: [ConfigService],
-      useFactory: async (config: ConfigService): Promise<any> => {
-        if (config.get('app.env') === 'development' && !config.get('redis.password')) {
-          return { ttl: config.get('redis.ttl') };
-        }
+      useFactory: async (config: ConfigService) => {
         return {
-          store: redisStore,
-          host: config.get('redis.host'),
-          port: config.get('redis.port'),
-          password: config.get('redis.password'),
-          db: config.get('redis.db'),
-          ttl: config.get('redis.ttl'),
-          max: 100,
+          store: await redisStore({
+            host: config.get('redis.host') || 'redis',
+            port: config.get('redis.port') || 6379,
+            password: config.get('redis.password') || undefined,
+            db: config.get('redis.db') || 0,
+            ttl: config.get('redis.ttl') || 300,
+          }),
         };
       },
     }),
