@@ -69,17 +69,14 @@ import { DailyTargetsModule } from './modules/combined-modules-2.module';
     CacheModule.registerAsync({
       isGlobal: true,
       inject: [ConfigService],
-      useFactory: async (config: ConfigService) => {
-        return {
-          store: await redisStore({
-            host: config.get('redis.host') || 'redis',
-            port: config.get('redis.port') || 6379,
-            password: config.get('redis.password') || undefined,
-            db: config.get('redis.db') || 0,
-            ttl: config.get('redis.ttl') || 300,
-          }),
-        };
-      },
+      useFactory: async (config: ConfigService) => ({
+        store: redisStore,   // ✅ NOT await here
+        host: config.get('redis.host') || 'redis',
+        port: config.get('redis.port') || 6379,
+        password: config.get('redis.password') || undefined,
+        db: config.get('redis.db') || 0,
+        ttl: config.get('redis.ttl') || 300,
+      }),
     }),
 
     // ── Rate Limiting ─────────────────────────────────────────
