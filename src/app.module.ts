@@ -66,18 +66,22 @@ import { DailyTargetsModule } from './modules/combined-modules-2.module';
     }),
 
     // ── Redis Cache ───────────────────────────────────────────
-    CacheModule.registerAsync({
+    // CacheModule.registerAsync({
+    //   isGlobal: true,
+    //   inject: [ConfigService],
+    //   useFactory: async (config: ConfigService) => ({
+    //     store: await redisStore({   // ✅ IMPORTANT CHANGE
+    //       host: config.get('redis.host') || 'redis',
+    //       port: config.get('redis.port') || 6379,
+    //       password: config.get('redis.password') || undefined,
+    //       db: config.get('redis.db') || 0,
+    //       ttl: config.get('redis.ttl') || 300,
+    //     }),
+    //   }),
+    // })
+    CacheModule.register({
       isGlobal: true,
-      inject: [ConfigService],
-      useFactory: async (config: ConfigService) => ({
-        store: await redisStore({   // ✅ IMPORTANT CHANGE
-          host: config.get('redis.host') || 'redis',
-          port: config.get('redis.port') || 6379,
-          password: config.get('redis.password') || undefined,
-          db: config.get('redis.db') || 0,
-          ttl: config.get('redis.ttl') || 300,
-        }),
-      }),
+      ttl: 300,
     }),
 
     // ── Rate Limiting ─────────────────────────────────────────
