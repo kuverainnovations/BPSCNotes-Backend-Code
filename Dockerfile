@@ -15,7 +15,7 @@ COPY src ./src
 RUN npm run build
 
 # Prune dev dependencies
-RUN npm prune --production
+RUN npm prune --omit=dev --legacy-peer-deps
 
 # ════════════════════════════════════════════════════════════
 # Stage 2 — Production image
@@ -34,8 +34,11 @@ COPY --from=builder --chown=nestjs:nodejs /app/dist         ./dist
 COPY --from=builder --chown=nestjs:nodejs /app/package.json ./package.json
 
 # Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
-  CMD wget -qO- http://localhost:5000/health || exit 1
+# Install curl (needed for healthcheck)
+RUN apk add --no-cache curl
+
+# Health check
+HEALTHCHECK CMD curl -f http://localhost:5000/health || exit 1
 
 USER nestjs
 

@@ -2,7 +2,7 @@ version: '3.9'
 
 # ════════════════════════════════════════════════════════════
 # BPSCNotes — Production Docker Compose
-# Usage:
+#Usage:
 #   cp .env.example .env   (fill in all values)
 #   docker compose up -d
 # ════════════════════════════════════════════════════════════
@@ -30,10 +30,15 @@ services:
     restart: unless-stopped
     env_file: .env
     environment:
-      NODE_ENV:     production
-      DB_HOST:      postgres
-      REDIS_HOST:   redis
-      PORT:         5000
+      NODE_ENV: production
+      DB_HOST: postgres
+      REDIS_HOST: redis
+      JWT_SECRET: secret123
+      JWT_ACCESS_SECRET: secret123
+      JWT_REFRESH_SECRET: secret123
+      JWT_ADMIN_SECRET: secret123
+      ADMIN_JWT_SECRET: secret123
+      PORT: 5000
     ports:
       - "5000:5000"
     depends_on:
@@ -54,13 +59,15 @@ services:
         max-size: "10m"
         max-file: "3"
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:5000/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:5000/v1/api/health"]
       interval: 30s
       timeout:  10s
       retries:  3
       start_period: 40s
 
-  # ── PostgreSQL ──────────────────────────────────────────────
+
+
+# ── PostgreSQL ──────────────────────────────────────────────
   postgres:
     image: postgres:16-alpine
     container_name: bpscnotes-postgres
@@ -68,11 +75,13 @@ services:
     environment:
       POSTGRES_DB:       ${DB_NAME:-bpscnotes}
       POSTGRES_USER:     ${DB_USER:-postgres}
-      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      #POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_PASSWORD:  postgres
       PGDATA:            /var/lib/postgresql/data/pgdata
     volumes:
       - postgres-data:/var/lib/postgresql/data
       - ./scripts/init-db.sh:/docker-entrypoint-initdb.d/init-db.sh:ro
+      - ./scripts/schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro
     networks:
       - bpscnotes-net
     ports:
@@ -99,7 +108,6 @@ services:
     restart: unless-stopped
     command: >
       redis-server
-      --requirepass ${REDIS_PASSWORD:-}
       --appendonly yes
       --maxmemory 256mb
       --maxmemory-policy allkeys-lru
@@ -132,13 +140,15 @@ services:
     volumes:
       - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
       - ./nginx/conf.d:/etc/nginx/conf.d:ro
-      - nginx-certs:/etc/letsencrypt
-      - nginx-html:/var/www/certbot
+      - /etc/letsencrypt:/etc/letsencrypt:ro
+      - ./nginx/html:/var/www/certbot
       - ./nginx/logs:/var/log/nginx
     depends_on:
       - api
     networks:
       - bpscnotes-net
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     logging:
       driver: json-file
       options:
@@ -150,7 +160,7 @@ services:
     image: certbot/certbot
     container_name: bpscnotes-certbot
     volumes:
-      - nginx-certs:/etc/letsencrypt
+      - /etc/letsencrypt:/etc/letsencrypt:ro
       - nginx-html:/var/www/certbot
     entrypoint: "/bin/sh -c 'trap exit TERM; while :; do certbot renew; sleep 12h & wait $${!}; done;'"
 

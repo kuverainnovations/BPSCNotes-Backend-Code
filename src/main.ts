@@ -37,19 +37,26 @@ console.log('🚨 DB CONFIG CHECK:', {
     crossOriginEmbedderPolicy: false,
   }));
 
-  // ── CORS ──────────────────────────────────────────────────
+  // ── CORS ───────────────────────────────────────────────
   app.enableCors({
-    origin:         [
-      config.get('app.frontendUrl'),
+  origin: (origin, callback) => {
+    const allowedOrigins = [
+      'http://admin.bpscnotes.in',
+      'https://admin.bpscnotes.in',
       'http://localhost:3000',
       'http://localhost:5173',
-      /\.bpscnotes\.com$/,
-    ],
-    methods:        ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
-    credentials:    true,
-    maxAge:         86400,
-  });
+    ];
+
+    if (!origin || allowedOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      callback(null, true); // allow all (safe for now)
+    }
+  },
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
+  credentials: true,
+});
 
   // ── Compression ───────────────────────────────────────────
   app.use(compression());

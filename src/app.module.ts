@@ -24,7 +24,7 @@ import { CurrentAffairsModule, JobsModule, SubscriptionsModule, NotificationsMod
 import { StudyRoomsModule, UsersModule, BannersModule, ExamsModule } from './modules/combined-modules-2.module';
 
 import { DailyTargetsModule } from './modules/combined-modules-2.module';
-
+import { HealthController } from './health.controller';
 
 
 
@@ -127,6 +127,7 @@ import { DailyTargetsModule } from './modules/combined-modules-2.module';
     ExamsModule,
     DailyTargetsModule
   ],
+controllers: [HealthController],
 
   providers: [
     // Global guards
