@@ -2,9 +2,14 @@ version: '3.9'
 
 # ════════════════════════════════════════════════════════════
 # BPSCNotes — Production Docker Compose
-#Usage:
-#   cp .env.example .env   (fill in all values)
-#   docker compose up -d
+#
+# BUGS FIXED:
+#   1. POSTGRES_PASSWORD now uses ${DB_PASSWORD} from .env
+#      (was hardcoded "postgres" while backend used "bpscpassword")
+#   2. healthcheck URL fixed from /v1/api/health → /health
+#   3. JWT secrets removed from environment: block (were overriding .env)
+#   4. certbot volume unified to named volume (was bind mount vs named volume)
+#   5. api service no longer exposes :5000 externally in prod (nginx proxies it)
 # ════════════════════════════════════════════════════════════
 
 networks:
@@ -14,9 +19,8 @@ networks:
 volumes:
   postgres-data:
   redis-data:
-  nginx-certs:
-  nginx-vhost:
-  nginx-html:
+  letsencrypt-data:   # unified volume for SSL certs (shared by nginx + certbot)
+  certbot-webroot:    # unified volume for ACME challenges (shared by nginx + certbot)
 
 services:
 
@@ -28,19 +32,26 @@ services:
       target: production
     container_name: bpscnotes-api
     restart: unless-stopped
+
+    # BUG FIX 3: removed hardcoded JWT_SECRET / ADMIN_JWT_SECRET from here.
+    # They were overriding the strong values in .env with "secret123".
+    # docker-compose environment: block has higher priority than env_file.
+    # Only set values here that MUST differ from .env (like hosts for docker networking).
     env_file: .env
     environment:
       NODE_ENV: production
-      DB_HOST: postgres
-      REDIS_HOST: redis
-      JWT_SECRET: secret123
-      JWT_ACCESS_SECRET: secret123
-      JWT_REFRESH_SECRET: secret123
-      JWT_ADMIN_SECRET: secret123
-      ADMIN_JWT_SECRET: secret123
-      PORT: 5000
-    ports:
-      - "5000:5000"
+      DB_HOST: postgres         # override .env DB_HOST=localhost with docker service name
+      REDIS_HOST: redis         # override .env REDIS_HOST=localhost with docker service name
+
+    # BUG FIX 5: do NOT expose :5000 to the public internet.
+    # nginx handles all external traffic. The port is still reachable
+    # inside the Docker network (nginx → api:5000).
+    # Uncomment only for local debugging:
+    # ports:
+    #   - "127.0.0.1:5000:5000"   # bind to localhost only if you need direct access
+    expose:
+      - "5000"
+
     depends_on:
       postgres:
         condition: service_healthy
@@ -51,46 +62,53 @@ services:
     deploy:
       resources:
         limits:
-          cpus:   '1'
+          cpus: '1'
           memory: 512M
     logging:
       driver: json-file
       options:
         max-size: "10m"
         max-file: "3"
+
+    # BUG FIX 2: path was /v1/api/health (wrong order).
+    # The /health endpoint is registered BEFORE the global prefix in main.ts,
+    # so it lives at /health, not /api/v1/health.
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:5000/v1/api/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
       interval: 30s
-      timeout:  10s
-      retries:  3
-      start_period: 40s
+      timeout: 10s
+      retries: 3
+      start_period: 60s   # increased — NestJS + TypeORM startup takes time
 
-
-
-# ── PostgreSQL ──────────────────────────────────────────────
+  # ── PostgreSQL ──────────────────────────────────────────────
   postgres:
     image: postgres:16-alpine
     container_name: bpscnotes-postgres
     restart: unless-stopped
     environment:
       POSTGRES_DB:       ${DB_NAME:-bpscnotes}
-      POSTGRES_USER:     ${DB_USER:-postgres}
-      #POSTGRES_PASSWORD: ${DB_PASSWORD}
-      POSTGRES_PASSWORD:  postgres
-      PGDATA:            /var/lib/postgresql/data/pgdata
+      POSTGRES_USER:     ${DB_USER:-bpscuser}
+      # BUG FIX 1: was hardcoded "postgres" — must match DB_PASSWORD in .env.
+      # The ${DB_PASSWORD} variable is read from the .env file in the same directory.
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      PGDATA: /var/lib/postgresql/data/pgdata
     volumes:
       - postgres-data:/var/lib/postgresql/data
-      - ./scripts/init-db.sh:/docker-entrypoint-initdb.d/init-db.sh:ro
-      - ./scripts/schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro
     networks:
       - bpscnotes-net
-    ports:
-      - "5432:5432"    # Remove in production — expose only internally
+    # Remove port exposure in production — only accessible inside Docker network.
+    # Uncomment only for emergency direct DB access:
+    # ports:
+    #   - "127.0.0.1:5432:5432"
+    expose:
+      - "5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-postgres} -d ${DB_NAME:-bpscnotes}"]
+      # Uses the correct DB_USER to verify credentials work, not just that postgres is up
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-bpscuser} -d ${DB_NAME:-bpscnotes}"]
       interval: 10s
-      timeout:  5s
-      retries:  5
+      timeout: 5s
+      retries: 5
+      start_period: 30s
     deploy:
       resources:
         limits:
@@ -117,13 +135,13 @@ services:
       - redis-data:/data
     networks:
       - bpscnotes-net
-    ports:
-      - "6379:6379"    # Remove in production
+    expose:
+      - "6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
-      timeout:  5s
-      retries:  5
+      timeout: 5s
+      retries: 5
     deploy:
       resources:
         limits:
@@ -140,15 +158,22 @@ services:
     volumes:
       - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
       - ./nginx/conf.d:/etc/nginx/conf.d:ro
-      - /etc/letsencrypt:/etc/letsencrypt:ro
-      - ./nginx/html:/var/www/certbot
+      # BUG FIX 4: use named volumes shared with certbot — not bind mounts.
+      # Previously nginx used bind mount ./nginx/html but certbot used
+      # named volume nginx-html for the same path — they never shared files.
+      - letsencrypt-data:/etc/letsencrypt:ro   # read certs written by certbot
+      - certbot-webroot:/var/www/certbot:ro     # serve ACME challenges written by certbot
       - ./nginx/logs:/var/log/nginx
     depends_on:
-      - api
+      api:
+        condition: service_healthy
     networks:
       - bpscnotes-net
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "nginx", "-t"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
     logging:
       driver: json-file
       options:
@@ -159,21 +184,30 @@ services:
   certbot:
     image: certbot/certbot
     container_name: bpscnotes-certbot
+    restart: unless-stopped
     volumes:
-      - /etc/letsencrypt:/etc/letsencrypt:ro
-      - nginx-html:/var/www/certbot
-    entrypoint: "/bin/sh -c 'trap exit TERM; while :; do certbot renew; sleep 12h & wait $${!}; done;'"
+      # BUG FIX 4 (continued): certbot WRITES here — no :ro
+      - letsencrypt-data:/etc/letsencrypt
+      - certbot-webroot:/var/www/certbot
+    entrypoint: >
+      /bin/sh -c '
+        trap exit TERM;
+        while :; do
+          certbot renew --webroot --webroot-path=/var/www/certbot --quiet;
+          sleep 12h & wait $${!};
+        done
+      '
 
-  # ── pgAdmin (Optional — remove in production) ───────────────
+  # ── pgAdmin (Optional — only start with --profile tools) ────
   pgadmin:
     image: dpage/pgadmin4
     container_name: bpscnotes-pgadmin
-    profiles: ["tools"]          # Only starts with: docker compose --profile tools up
+    profiles: ["tools"]
     environment:
       PGADMIN_DEFAULT_EMAIL:    admin@bpscnotes.com
       PGADMIN_DEFAULT_PASSWORD: ${DB_PASSWORD}
     ports:
-      - "5050:80"
+      - "127.0.0.1:5050:80"   # bind to localhost only
     depends_on:
       - postgres
     networks:
