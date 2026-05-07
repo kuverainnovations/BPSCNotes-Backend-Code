@@ -22,7 +22,7 @@ DB_NAME=$(grep "^DB_NAME=" .env | cut -d= -f2-)
 echo "Fixing password for user: $DB_USER on db: $DB_NAME"
 
 # Connect using the postgres superuser (bypasses password auth)
-docker compose exec -T postgres psql -U postgres << SQL
+docker-compose exec -T postgres psql -U postgres << SQL
 -- Update the application user's password to match .env
 ALTER USER "${DB_USER}" WITH PASSWORD '${DB_PASS}';
 
@@ -32,4 +32,4 @@ SQL
 
 echo ""
 echo "✅ Password updated. Now restart the API:"
-echo "   docker compose restart api"
+echo "   docker-compose restart api"

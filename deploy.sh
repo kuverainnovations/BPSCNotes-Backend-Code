@@ -39,18 +39,18 @@ info "DB_USER=$DB_USER  DB_NAME=$DB_NAME"
 # If the container was first created with password A, changing .env to password B
 # does NOT update postgres — you have to ALTER the role.
 
-POSTGRES_RUNNING=$(docker compose ps postgres --format json 2>/dev/null | grep '"State":"running"' || true)
+POSTGRES_RUNNING=$(docker-compose ps postgres --format json 2>/dev/null | grep '"State":"running"' || true)
 
 if [[ -n "$POSTGRES_RUNNING" ]]; then
   info "Postgres is running. Syncing password to match .env..."
-  docker compose exec -T postgres psql -U "$DB_USER" -c \
+  docker-compose exec -T postgres psql -U "$DB_USER" -c \
     "ALTER USER \"${DB_USER}\" WITH PASSWORD '${DB_PASS}';" 2>/dev/null \
     || warn "Could not sync password (postgres may use old credentials — see manual fix below)"
 fi
 
 # ── 2. Build and start ────────────────────────────────────────
 info "Building API image..."
-docker compose build --no-cache api
+docker-compose build --no-cache api
 
 info "Starting all services..."
 docker compose up -d
@@ -86,19 +86,19 @@ done
 
 # ── 5. Verify DB credentials work ────────────────────────────
 info "Verifying DB credentials..."
-docker compose exec -T postgres psql -U "$DB_USER" -d "$DB_NAME" -c "SELECT 1;" > /dev/null 2>&1 \
+docker-compose exec -T postgres psql -U "$DB_USER" -d "$DB_NAME" -c "SELECT 1;" > /dev/null 2>&1 \
   && info "DB credentials OK ✅" \
   || error "DB credential check failed. Password in .env does not match postgres. Run fix-db-password.sh"
 
 # ── 6. Run migrations ─────────────────────────────────────────
 info "Running database migrations..."
-docker compose exec -T api node dist/database/migrate.js 2>/dev/null \
+docker-compose exec -T api node dist/database/migrate.js 2>/dev/null \
   || warn "Migration command failed or no migrate script. Ensure TypeORM migrationsRun:true in production."
 
 # ── 7. Final status ───────────────────────────────────────────
 echo ""
 echo -e "${BOLD}════ Container Status ════${NC}"
-docker compose ps
+docker-compose ps
 echo ""
 info "Deployment complete 🎉"
 info "API:   https://api.bpscnotes.in/health"
