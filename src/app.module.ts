@@ -26,6 +26,7 @@ import {
 
 import {
   StudyRoomsModule, UsersModule, BannersModule, ExamsModule, DailyTargetsModule,
+  FlashcardsModule,
 } from './modules/combined-modules-2.module';
 
 @Module({
@@ -114,6 +115,7 @@ import {
     BannersModule,
     ExamsModule,
     DailyTargetsModule,
+    FlashcardsModule,
   ],
 
   controllers: [HealthController],

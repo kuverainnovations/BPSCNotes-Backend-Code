@@ -517,7 +517,12 @@ class UsersService {
   }
 
   async getStats(userId: string) {
-    const [subjectStats, recentQuizzes, weeklyActivity] = await Promise.all([
+    const [userRow, subjectStats, recentQuizzes, weeklyActivity] = await Promise.all([
+      // Fetch user-level stats so Android header (rank/accuracy/study) always has data
+      this.db.query(
+        `SELECT streak, accuracy, rank, total_study_minutes, quizzes_attempted FROM users WHERE id=$1`,
+        [userId]
+      ),
       this.db.query(
         `SELECT q.subject, COUNT(*) AS attempts, ROUND(AVG(qa.score::decimal/NULLIF(qa.total_questions,0)*100),1) AS avg_accuracy
          FROM quiz_attempts qa JOIN quizzes q ON qa.quiz_id=q.id WHERE qa.user_id=$1 GROUP BY q.subject`,
@@ -538,7 +543,21 @@ ORDER BY date ASC`,
         [userId]
       ),
     ]);
-    return successResponse({ subjectAccuracy: subjectStats, recentQuizzes, weeklyActivity });
+
+    const u = userRow[0] || {};
+    return successResponse({
+      // ── Top-level user stats (for Dashboard header) ──────────
+      // These are the fields UserStatsData DTO expects
+      accuracy:           parseFloat(u.accuracy) || 0,
+      current_streak:     u.streak || 0,
+      total_study_minutes: u.total_study_minutes || 0,
+      quizzes_attempted:  u.quizzes_attempted || 0,
+      rank:               u.rank || null,
+      // ── Activity data ─────────────────────────────────────────
+      weekly_activity:    weeklyActivity,       // snake_case matches @SerializedName("weekly_activity")
+      subjectAccuracy:    subjectStats,
+      recentQuizzes,
+    });
   }
 
   async getLeaderboard(query: any, userId: string) {
@@ -859,3 +878,172 @@ class AdminExamsController {
 
 @Module({ imports:[ConfigModule], controllers:[ExamsController, AdminExamsController], providers:[ExamsService] })
 export class ExamsModule {}
+
+// ════════════════════════════════════════════════════════════
+// FLASHCARDS MODULE
+// GET  /api/v1/flashcards          — list for Active Recall screen
+// GET  /admin/flashcards           — admin list with full fields
+// POST /admin/flashcards           — create
+// PUT  /admin/flashcards/:id       — update
+// DELETE /admin/flashcards/:id     — delete
+//
+// Table schema (from migration):
+//   id, front, back, subject, exam_tags, difficulty, is_active, created_by, created_at
+//
+// Android FlashcardDto expects:
+//   id, subject, topic, question, answer, hint, example, difficulty, related_mcq
+//
+// Mapping: front→question, back→answer, topic="General" (not in schema, derive from subject)
+// ════════════════════════════════════════════════════════════
+
+@Injectable()
+class FlashcardsService {
+  constructor(
+    @InjectDataSource() private readonly db: DataSource,
+    @Inject(CACHE_MANAGER) private readonly cache: Cache,
+  ) {}
+
+  async findAll(query: any) {
+    const { subject, limit = 200, exam } = query;
+    const cacheKey = `flashcards:${subject || 'all'}:${exam || 'all'}`;
+    const cached = await this.cache.get(cacheKey);
+    if (cached) return cached;
+
+    const conditions = [`f.is_active = TRUE`];
+    const params: any[] = [];
+
+    if (subject) {
+      conditions.push(`f.subject = $${params.length + 1}`);
+      params.push(subject);
+    }
+    if (exam) {
+      conditions.push(`$${params.length + 1} = ANY(f.exam_tags)`);
+      params.push(exam);
+    }
+
+    const rows = await this.db.query(
+      `SELECT
+         f.id,
+         f.subject,
+         f.subject AS topic,       -- topic derives from subject (table has no separate topic column)
+         f.front   AS question,    -- front → question (Android expects "question")
+         f.back    AS answer,      -- back  → answer   (Android expects "answer")
+         ''        AS hint,
+         ''        AS example,
+         f.difficulty,
+         NULL      AS related_mcq,
+         f.exam_tags
+       FROM flashcards f
+       WHERE ${conditions.join(' AND ')}
+       ORDER BY f.subject, f.created_at ASC
+       LIMIT $${params.length + 1}`,
+      [...params, limit]
+    );
+
+    const result = successResponse({ flashcards: rows });
+    await this.cache.set(cacheKey, result, 300);
+    return result;
+  }
+
+  async findAllAdmin(query: any) {
+    const { page = 1, limit = 50, subject } = query;
+    const offset = (page - 1) * limit;
+    const conditions = ['1=1'];
+    const params: any[] = [];
+    if (subject) { conditions.push(`subject=$${params.length + 1}`); params.push(subject); }
+    const [rows, countResult] = await Promise.all([
+      this.db.query(
+        `SELECT * FROM flashcards WHERE ${conditions.join(' AND ')} ORDER BY subject, created_at ASC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
+        [...params, limit, offset]
+      ),
+      this.db.query(`SELECT COUNT(*) FROM flashcards WHERE ${conditions.join(' AND ')}`, params),
+    ]);
+    return successResponse({ flashcards: rows, total: parseInt(countResult[0].count) });
+  }
+
+  async create(data: any, adminId: string) {
+    if (!data.front || !data.back) {
+      throw new BadRequestException('front (question) and back (answer) are required');
+    }
+    const result = await this.db.query(
+      `INSERT INTO flashcards (front, back, subject, exam_tags, difficulty, created_by)
+       VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+      [
+        data.front || data.question,
+        data.back  || data.answer,
+        data.subject || 'General',
+        data.examTags || data.exam_tags || [],
+        data.difficulty || 'medium',
+        adminId,
+      ]
+    );
+    await this.invalidateCache();
+    return successResponse({ flashcard: result[0] }, 'Flashcard created ✅');
+  }
+
+  async update(id: string, data: any) {
+    const existing = await this.db.query(`SELECT id FROM flashcards WHERE id=$1`, [id]);
+    if (!existing.length) throw new NotFoundException('Flashcard not found');
+    const fields: string[] = [], vals: any[] = [];
+    let i = 1;
+    const map: any = {
+      front: 'front', back: 'back', question: 'front', answer: 'back',
+      subject: 'subject', difficulty: 'difficulty', isActive: 'is_active',
+    };
+    for (const [key, col] of Object.entries(map)) {
+      if (data[key] !== undefined) { fields.push(`${col}=$${i++}`); vals.push(data[key]); }
+    }
+    if (data.examTags) { fields.push(`exam_tags=$${i++}`); vals.push(data.examTags); }
+    if (!fields.length) throw new BadRequestException('No fields to update');
+    await this.db.query(`UPDATE flashcards SET ${fields.join(',')} WHERE id=$${i}`, [...vals, id]);
+    await this.invalidateCache();
+    return successResponse(null, 'Flashcard updated ✅');
+  }
+
+  async remove(id: string) {
+    await this.db.query(`UPDATE flashcards SET is_active=FALSE WHERE id=$1`, [id]);
+    await this.invalidateCache();
+    return successResponse(null, 'Flashcard deleted ✅');
+  }
+
+  private async invalidateCache() {
+    // Clear all flashcard cache keys
+    await this.cache.del('flashcards:all:all');
+    const subjects = ['Polity','History','Geography','Economy','Bihar GK','Science','Environment'];
+    for (const s of subjects) await this.cache.del(`flashcards:${s}:all`);
+  }
+}
+
+@ApiTags('Flashcards')
+@ApiBearerAuth()
+@UseGuards(JwtAuthGuard)
+@Controller('flashcards')
+class FlashcardsController {
+  constructor(private s: FlashcardsService) {}
+
+  /** GET /api/v1/flashcards?subject=Polity&limit=200 */
+  @Get()
+  findAll(@Query() q: any) {
+    return this.s.findAll(q);
+  }
+}
+
+@ApiTags('Admin — Flashcards')
+@ApiBearerAuth()
+@Public()
+@UseGuards(AdminJwtGuard, PermissionGuard)
+@Controller('admin/flashcards')
+class AdminFlashcardsController {
+  constructor(private s: FlashcardsService) {}
+
+  @Get()                @RequirePermission('library')    findAll(@Query() q: any)  { return this.s.findAllAdmin(q); }
+  @Post()               @RequirePermission('library')    @HttpCode(201) create(@Body() dto: any, @Req() r: any) { return this.s.create(dto, r.admin.id); }
+  @Put(':id')           @RequirePermission('library')    update(@Param('id', ParseUUIDPipe) id: string, @Body() dto: any) { return this.s.update(id, dto); }
+  @Delete(':id')        @RequirePermission('library')    remove(@Param('id', ParseUUIDPipe) id: string) { return this.s.remove(id); }
+}
+
+@Module({
+  controllers: [FlashcardsController, AdminFlashcardsController],
+  providers:   [FlashcardsService],
+})
+export class FlashcardsModule {}

@@ -1,3 +1,4 @@
+import { seedFlashcards } from './rich-data.seed';
 import { AppDataSource } from '../data-source';
 import * as bcrypt from 'bcryptjs';
 
@@ -105,6 +106,11 @@ async function runSeeds() {
       );
     }
     console.log('✅ Default coupons seeded');
+  }
+
+  // ── Flashcards ─────────────────────────────────────────────
+  if (adminId) {
+    await seedFlashcards(AppDataSource.query.bind(AppDataSource), adminId);
   }
 
   await AppDataSource.destroy();

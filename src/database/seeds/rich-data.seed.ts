@@ -461,3 +461,55 @@ seedRichData().catch(err => {
   console.error('❌ Seeding failed:', err.message);
   process.exit(1);
 });
+
+// ═══════════════════════════════════════════════════════════════
+// FLASHCARDS SEED — Sample data for Active Recall screen
+// These are BPSC-relevant study cards across all major subjects
+// ═══════════════════════════════════════════════════════════════
+export async function seedFlashcards(db: any, adminId: string) {
+  const count = await db.query('SELECT COUNT(*) FROM flashcards');
+  if (parseInt(count[0].count) > 0) {
+    console.log('⏭️  Flashcards already seeded');
+    return;
+  }
+
+  const flashcards = [
+    // Polity
+    { front: 'Which article of the Indian Constitution abolishes untouchability?', back: 'Article 17 abolishes untouchability and forbids its practice in any form.', subject: 'Polity', difficulty: 'easy', exam_tags: ['BPSC 70th CCE', 'UPSC CSE'] },
+    { front: 'What is the minimum age to become President of India?', back: '35 years. The President must be a citizen of India, at least 35 years of age, and qualified to be a member of the Lok Sabha.', subject: 'Polity', difficulty: 'easy', exam_tags: ['BPSC 70th CCE'] },
+    { front: 'Under which article can the President declare a National Emergency?', back: 'Article 352. A National Emergency can be declared on grounds of war, external aggression, or armed rebellion.', subject: 'Polity', difficulty: 'medium', exam_tags: ['BPSC 70th CCE', 'UPSC CSE'] },
+    { front: 'What is the Doctrine of Basic Structure?', back: 'Established in Kesavananda Bharati case (1973) — Parliament cannot amend the Constitution to destroy its basic structure (democracy, federalism, secularism, judiciary independence).', subject: 'Polity', difficulty: 'hard', exam_tags: ['BPSC 70th CCE', 'UPSC CSE'] },
+    { front: 'How many subjects are in the Concurrent List?', back: '52 subjects (after 42nd Amendment). Both Parliament and State Legislatures can legislate on these subjects. In case of conflict, Central law prevails.', subject: 'Polity', difficulty: 'medium', exam_tags: ['BPSC 70th CCE'] },
+    // History
+    { front: 'In which year was the Indian National Congress founded?', back: '1885. Founded by A.O. Hume, Dadabhai Naoroji, and Dinshaw Wacha. First session held in Bombay.', subject: 'History', difficulty: 'easy', exam_tags: ['BPSC 70th CCE', 'UPSC CSE'] },
+    { front: 'What was the significance of the Dandi March (1930)?', back: 'Led by Gandhi, it marked the beginning of the Civil Disobedience Movement. Gandhi walked 240 miles to Dandi to make salt and defy the British salt tax.', subject: 'History', difficulty: 'medium', exam_tags: ['BPSC 70th CCE'] },
+    { front: 'Who founded the Maurya Empire?', back: 'Chandragupta Maurya founded the Maurya Empire around 322 BCE with the help of Chanakya (Kautilya). He overthrew the Nanda dynasty.', subject: 'History', difficulty: 'easy', exam_tags: ['BPSC 70th CCE', 'UPSC CSE'] },
+    { front: 'What is the Treaty of Allahabad (1765)?', back: 'Signed after Battle of Buxar. The Mughal Emperor Shah Alam II granted Diwani rights (right to collect revenue) of Bengal, Bihar and Orissa to the British East India Company.', subject: 'History', difficulty: 'hard', exam_tags: ['BPSC 70th CCE'] },
+    // Geography
+    { front: 'Which is the largest river basin in India?', back: 'Ganga River Basin — covers about 8.6 lakh sq km, spanning across 11 states including UP, Bihar, West Bengal, MP and Rajasthan.', subject: 'Geography', difficulty: 'easy', exam_tags: ['BPSC 70th CCE'] },
+    { front: 'What is the International Date Line?', back: 'An imaginary line at approximately 180° longitude where the date changes by one day. Travelers crossing eastward go back one day; crossing westward, they advance one day.', subject: 'Geography', difficulty: 'medium', exam_tags: ['BPSC 70th CCE', 'UPSC CSE'] },
+    { front: 'What are Western Disturbances?', back: 'Extratropical cyclones originating in the Mediterranean Sea that bring rainfall and snowfall to northwestern India (Punjab, Haryana, J&K) during winter months (Dec-Feb).', subject: 'Geography', difficulty: 'medium', exam_tags: ['BPSC 70th CCE', 'UPSC CSE'] },
+    // Economy
+    { front: 'What is the difference between GDP and GNP?', 
+      back: 'GDP (Gross Domestic Product) = total value of goods/services produced within a country`s borders. GNP = GDP + income earned by residents abroad - income earned by foreigners domestically.', subject: 'Economy', difficulty: 'medium', exam_tags: ['BPSC 70th CCE', 'UPSC CSE'] },
+    { front: 'What is the purpose of the RBI`s Repo Rate?', back: 'Repo Rate is the rate at which RBI lends money to commercial banks. Increasing it makes borrowing expensive (controls inflation); decreasing it makes borrowing cheap (stimulates growth).', subject: 'Economy', difficulty: 'medium', exam_tags: ['BPSC 70th CCE'] },
+    { front: 'What is MGNREGA?', back: 'Mahatma Gandhi National Rural Employment Guarantee Act (2005) — guarantees 100 days of wage employment per year to every rural household. Helps reduce rural unemployment and poverty.', subject: 'Economy', difficulty: 'easy', exam_tags: ['BPSC 70th CCE', 'Bihar Police SI'] },
+    // Bihar GK
+    { front: 'What is the capital of Bihar and on which river is it situated?', back: 'Patna is the capital of Bihar, situated on the southern bank of the Ganga river. It is one of the oldest continuously inhabited cities in the world (ancient Pataliputra).', subject: 'Bihar GK', difficulty: 'easy', exam_tags: ['BPSC 70th CCE', 'Bihar Police SI'] },
+    { front: 'When was Bihar separated from Bengal Presidency?', back: 'Bihar was separated from Bengal Presidency on March 22, 1912. This date is celebrated as Bihar Diwas (Bihar Foundation Day).', subject: 'Bihar GK', difficulty: 'easy', exam_tags: ['BPSC 70th CCE'] },
+    { front: 'Which was the first state in India to implement Panchayati Raj?', back: 'Rajasthan was the first state (October 2, 1959, at Nagaur). However, Bihar also has a long history of Panchayati Raj institutions and was one of the early adopters.', subject: 'Bihar GK', difficulty: 'medium', exam_tags: ['BPSC 70th CCE'] },
+    // Science
+    { front: 'What is Newton`s Second Law of Motion?', back: 'Force = Mass × Acceleration (F = ma). The acceleration of an object is directly proportional to the net force acting on it and inversely proportional to its mass.', subject: 'Science', difficulty: 'easy', exam_tags: ['BPSC 70th CCE', 'Bihar Police SI'] },
+    { front: 'What is the difference between Mitosis and Meiosis?', back: 'Mitosis: produces 2 genetically identical daughter cells (used for growth/repair). Meiosis: produces 4 genetically different cells with half the chromosomes (used for sexual reproduction).', subject: 'Science', difficulty: 'medium', exam_tags: ['BPSC 70th CCE'] },
+  ];
+
+  for (const card of flashcards) {
+    await db.query(
+      `INSERT INTO flashcards (front, back, subject, difficulty, exam_tags, created_by, is_active)
+       VALUES ($1, $2, $3, $4, $5, $6, TRUE)
+       ON CONFLICT DO NOTHING`,
+      [card.front, card.back, card.subject, card.difficulty, card.exam_tags, adminId]
+    );
+  }
+  console.log('✅ \${flashcards.length} flashcards seeded');
+}
