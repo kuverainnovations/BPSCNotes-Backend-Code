@@ -106,7 +106,7 @@ class StudyRoomsController {
   @Post(':id/leave') @HttpCode(200) leave(@Param('id', ParseUUIDPipe) id: string, @Req() r: any) { return this.s.leave(id, r.user.id); }
 }
 
-@ApiTags('Admin — Study Rooms') @ApiBearerAuth() @Public()
+@ApiTags('Admin — Study Rooms') @ApiBearerAuth()
 @UseGuards(AdminJwtGuard, PermissionGuard) @Controller('admin/study-rooms')
 class AdminStudyRoomsController {
   constructor(private s: StudyRoomsService) {}
