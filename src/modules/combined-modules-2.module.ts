@@ -485,8 +485,8 @@ class DailyTargetsController {
 
 @Module({
   imports:     [AuthModule],
-  controllers: [DailyTargetsController, StudyRoomsController, AdminStudyRoomsController],
-  providers:   [DailyTargetsService, StudyRoomsService],
+  controllers: [DailyTargetsController],   // StudyRooms controllers live in StudyRoomsModule only
+  providers:   [DailyTargetsService],
 })
 
 export class DailyTargetsModule {}
