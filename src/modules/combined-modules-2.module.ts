@@ -106,17 +106,45 @@ class StudyRoomsController {
   @Post(':id/leave') @HttpCode(200) leave(@Param('id', ParseUUIDPipe) id: string, @Req() r: any) { return this.s.leave(id, r.user.id); }
 }
 
-@ApiTags('Admin — Study Rooms') @ApiBearerAuth()
-@UseGuards(AdminJwtGuard, PermissionGuard) @Controller('admin/study-rooms')
+// @ApiTags('Admin — Study Rooms') @ApiBearerAuth()
+// @UseGuards(AdminJwtGuard, PermissionGuard) @Controller('admin/study-rooms')
+// class AdminStudyRoomsController {
+//   constructor(private s: StudyRoomsService) {}
+//   @Get()         @RequirePermission('study-rooms') findAll()  { return this.s.findAllAdmin(); }
+//   @Put(':id/end') @RequirePermission('study-rooms') end(@Param('id', ParseUUIDPipe) id: string) { return this.s.endRoom(id); }
+//   @Post()
+//   @RequirePermission('study-rooms')
+//   @HttpCode(201)
+//   create(@Body() dto: any, @Req() r: any) {
+//     return this.s.create(dto, r.admin.id);
+//   }
+// }
+
+@ApiTags('Admin — Study Rooms')
+@ApiBearerAuth()
+@UseGuards(AdminJwtGuard, PermissionGuard)
+@Controller('admin/study-rooms')
 class AdminStudyRoomsController {
   constructor(private s: StudyRoomsService) {}
-  @Get()         @RequirePermission('study-rooms') findAll()  { return this.s.findAllAdmin(); }
-  @Put(':id/end') @RequirePermission('study-rooms') end(@Param('id', ParseUUIDPipe) id: string) { return this.s.endRoom(id); }
+
+  @Get()
+  @RequirePermission('study-rooms')
+  findAll() {
+    return this.s.findAllAdmin();
+  }
+
   @Post()
   @RequirePermission('study-rooms')
   @HttpCode(201)
   create(@Body() dto: any, @Req() r: any) {
+    console.log('ADMIN CREATE 👉', r.admin);
     return this.s.create(dto, r.admin.id);
+  }
+
+  @Put(':id/end')
+  @RequirePermission('study-rooms')
+  end(@Param('id', ParseUUIDPipe) id: string) {
+    return this.s.endRoom(id);
   }
 }
 
