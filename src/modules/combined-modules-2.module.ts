@@ -112,6 +112,12 @@ class AdminStudyRoomsController {
   constructor(private s: StudyRoomsService) {}
   @Get()         @RequirePermission('study-rooms') findAll()  { return this.s.findAllAdmin(); }
   @Put(':id/end') @RequirePermission('study-rooms') end(@Param('id', ParseUUIDPipe) id: string) { return this.s.endRoom(id); }
+  @Post()
+  @RequirePermission('study-rooms')
+  @HttpCode(201)
+  create(@Body() dto: any, @Req() r: any) {
+    return this.s.create(dto, r.admin.id);
+  }
 }
 
 @Module({ imports:[AuthModule], controllers:[StudyRoomsController, AdminStudyRoomsController], providers:[StudyRoomsService] })
