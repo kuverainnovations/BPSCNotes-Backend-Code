@@ -60,6 +60,30 @@ class StudyRoomsService {
     return successResponse({ room }, 'Study room created!');
   }
 
+  /**
+   * Admin creates a room — host_id is NULL because admins are not in the users table.
+   * The room is marked as featured and official so it shows prominently in the app.
+   */
+  async createByAdmin(data: any) {
+    if (!data.name || !data.subject) throw new BadRequestException('Name and subject required');
+    const joinCode = Math.random().toString(36).substring(2, 8).toUpperCase();
+    const result   = await this.db.query(
+      `INSERT INTO study_rooms
+         (name, subject, host_id, max_members, is_private, join_code, exam_tags, status)
+       VALUES ($1, $2, NULL, $3, $4, $5, $6, 'active')
+       RETURNING *`,
+      [
+        data.name,
+        data.subject,
+        data.maxMembers   || 100,
+        data.isPrivate    || false,
+        joinCode,
+        data.examTags     || [],
+      ]
+    );
+    return successResponse({ room: result[0] }, 'Study room created!');
+  }
+
   async join(roomId: string, userId: string, joinCode?: string) {
     const room = await this.db.query(`SELECT * FROM study_rooms WHERE id=$1 AND status='active'`, [roomId]);
     if (!room.length) throw new NotFoundException('Room not found or ended');
@@ -116,7 +140,7 @@ class StudyRoomsController {
 //   @RequirePermission('study-rooms')
 //   @HttpCode(201)
 //   create(@Body() dto: any, @Req() r: any) {
-//     return this.s.create(dto, r.admin.id);
+//     return this.s.createByAdmin(dto);
 //   }
 // }
 
@@ -136,9 +160,8 @@ class AdminStudyRoomsController {
   @Post()
   @RequirePermission('study-rooms')
   @HttpCode(201)
-  create(@Body() dto: any, @Req() r: any) {
-    console.log('ADMIN CREATE 👉', r.admin);
-    return this.s.create(dto, r.admin.id);
+  create(@Body() dto: any) {
+    return this.s.createByAdmin(dto);
   }
 
   @Put(':id/end')
