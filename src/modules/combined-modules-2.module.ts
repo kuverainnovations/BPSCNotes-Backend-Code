@@ -37,7 +37,7 @@ class StudyRoomsService {
       `SELECT sr.*, u.name AS host_name,
          COUNT(rm.user_id) FILTER (WHERE rm.left_at IS NULL) AS current_members,
          (SELECT TRUE FROM room_members WHERE room_id=sr.id AND user_id=$${params.length+1} AND left_at IS NULL) AS is_member
-       FROM study_rooms sr JOIN users u ON sr.host_id=u.id
+       FROM study_rooms sr LEFT JOIN users u ON sr.host_id=u.id
        LEFT JOIN room_members rm ON sr.id=rm.room_id
        WHERE ${conditions.join(' AND ')}
        GROUP BY sr.id, u.name ORDER BY sr.created_at DESC`,
@@ -108,7 +108,7 @@ class StudyRoomsService {
     const rows = await this.db.query(
       `SELECT sr.*, u.name AS host_name,
          COUNT(rm.user_id) FILTER (WHERE rm.left_at IS NULL) AS current_members
-       FROM study_rooms sr JOIN users u ON sr.host_id=u.id
+       FROM study_rooms sr LEFT JOIN users u ON sr.host_id=u.id
        LEFT JOIN room_members rm ON sr.id=rm.room_id
        GROUP BY sr.id, u.name ORDER BY sr.created_at DESC`
     );
