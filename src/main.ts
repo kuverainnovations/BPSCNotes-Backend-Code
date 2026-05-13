@@ -6,26 +6,26 @@ import * as helmet from 'helmet';
 import * as compression from 'compression';
 import * as morgan from 'morgan';
 import { AppModule }    from './app.module';
-import { IoAdapter }    from '@nestjs/platform-socket.io';
-import { ServerOptions } from 'socket.io';
+// import { IoAdapter }    from '@nestjs/platform-socket.io';
+// import { ServerOptions } from 'socket.io';
 
 // Custom IoAdapter that passes CORS config to Socket.IO
-class CorsIoAdapter extends IoAdapter {
-  createIOServer(port: number, options?: ServerOptions) {
-    return super.createIOServer(port, {
-      ...options,
-      cors: {
-        origin: [
-          'http://localhost:3000',
-          'https://admin.bpscnotes.in',
-        ],
-        credentials: true,
-      },
-      pingTimeout:  20000,
-      pingInterval: 25000,
-    });
-  }
-}
+// class CorsIoAdapter extends IoAdapter {
+//   createIOServer(port: number, options?: ServerOptions) {
+//     return super.createIOServer(port, {
+//       ...options,
+//       cors: {
+//         origin: [
+//           'http://localhost:3000',
+//           'https://admin.bpscnotes.in',
+//         ],
+//         credentials: true,
+//       },
+//       pingTimeout:  20000,
+//       pingInterval: 25000,
+//     });
+//   }
+// }
 
 async function bootstrap() {
   const logger = new Logger('Bootstrap');
@@ -71,7 +71,7 @@ async function bootstrap() {
 
   // ── WebSocket adapter ────────────────────────────────────
   // Must be done before app.listen() and after app.create()
-  app.useWebSocketAdapter(new CorsIoAdapter(app));
+  // app.useWebSocketAdapter(new CorsIoAdapter(app));
 
   // ── Compression ───────────────────────────────────────────
   app.use(compression());
