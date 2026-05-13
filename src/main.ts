@@ -5,7 +5,27 @@ import { ConfigService } from '@nestjs/config';
 import * as helmet from 'helmet';
 import * as compression from 'compression';
 import * as morgan from 'morgan';
-import { AppModule } from './app.module';
+import { AppModule }    from './app.module';
+import { IoAdapter }    from '@nestjs/platform-socket.io';
+import { ServerOptions } from 'socket.io';
+
+// Custom IoAdapter that passes CORS config to Socket.IO
+class CorsIoAdapter extends IoAdapter {
+  createIOServer(port: number, options?: ServerOptions) {
+    return super.createIOServer(port, {
+      ...options,
+      cors: {
+        origin: [
+          'http://localhost:3000',
+          'https://admin.bpscnotes.in',
+        ],
+        credentials: true,
+      },
+      pingTimeout:  20000,
+      pingInterval: 25000,
+    });
+  }
+}
 
 async function bootstrap() {
   const logger = new Logger('Bootstrap');
@@ -16,15 +36,6 @@ async function bootstrap() {
   });
 
   const config = app.get(ConfigService);
-
-  // 🔥 ADD THIS
-console.log('🚨 DB CONFIG CHECK:', {
-  host: config.get('database.host'),
-  port: config.get('database.port'),
-  db: config.get('database.name'),
-  user: config.get('database.user'),
-  env: config.get('app.env'),
-});
 
   const port      = config.get<number>('app.port', 5000);
   const prefix    = config.get<string>('app.apiPrefix', 'api/v1');
@@ -57,6 +68,10 @@ console.log('🚨 DB CONFIG CHECK:', {
   allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
   credentials: true,
 });
+
+  // ── WebSocket adapter ────────────────────────────────────
+  // Must be done before app.listen() and after app.create()
+  app.useWebSocketAdapter(new CorsIoAdapter(app));
 
   // ── Compression ───────────────────────────────────────────
   app.use(compression());

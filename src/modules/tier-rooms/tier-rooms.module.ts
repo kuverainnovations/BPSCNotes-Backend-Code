@@ -22,6 +22,7 @@ import {
 } from '../../common/guards';
 import { successResponse, paginationMeta } from '../../common/utils/response.util';
 import { TierNotificationsService } from './tier-notifications.service';
+import { TierRoomsGateway }       from './tier-rooms.gateway';
 
 // ============================================================
 // TIER ROOMS SERVICE
@@ -366,6 +367,7 @@ export class StudySessionsService {
     @Inject(CACHE_MANAGER) private readonly cache: Cache,
     private readonly authService: AuthService,
     private readonly notifService: TierNotificationsService,
+    private readonly gateway: TierRoomsGateway,
   ) {}
 
   async startSession(userId: string, roomId?: string, mode: string = 'study') {
@@ -573,7 +575,6 @@ export class TierRoomsCronService {
     @InjectDataSource() private readonly db: DataSource,
     @Inject(CACHE_MANAGER) private readonly cache: Cache,
     private readonly authService: AuthService,
-    private readonly notifService: TierNotificationsService,
   ) {}
 
   @Cron('*/5 * * * *')
@@ -639,6 +640,40 @@ export class TierRoomsCronService {
       }
       this.logger.log(`${rule.from_key}->${rule.to_key}: +${promoted} promoted, -${demoted} demoted`);
     }
+  }
+
+  // ── Every 30 min during study hours — live leaderboard tick ─
+  // Broadcasts current top-3 of each tier to WS-connected clients.
+  // Cheap: reads from the already-computed room_leaderboard snapshot.
+  @Cron('*/30 6-23 * * *')
+  async broadcastLeaderboardTick() {
+    const tiers      = await this.db.query(`SELECT id, tier_key FROM room_tiers WHERE is_active=TRUE`);
+    const period     = this.getCurrentPeriodKey('weekly');
+
+    for (const tier of tiers) {
+      const top3 = await this.db.query(`
+        SELECT rl.rank_position, rl.study_minutes, rl.coins_earned,
+               u.id AS user_id, u.name AS user_name
+        FROM room_leaderboard rl
+        JOIN users u ON u.id = rl.user_id
+        WHERE rl.tier_id=$1 AND rl.period_type='weekly' AND rl.period_key=$2
+        ORDER BY rl.rank_position ASC LIMIT 3
+      `, [tier.id, period]);
+
+      if (top3.length > 0) {
+        this.gateway.broadcastLeaderboardTick(tier.tier_key, top3);
+      }
+    }
+  }
+
+  private getCurrentPeriodKey(period: string): string {
+    const now = new Date();
+    if (period === 'weekly') {
+      const s = new Date(now.getFullYear(), 0, 1);
+      const w = Math.ceil(((now.getTime()-s.getTime())/86400000+s.getDay()+1)/7);
+      return `${now.getFullYear()}-W${String(w).padStart(2,'0')}`;
+    }
+    return `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}`;
   }
 
   // ── 1st of month at 01:00 — monthly leaderboard snapshot ──
@@ -763,14 +798,18 @@ export class TierRoomsCronService {
     await this.authService.awardCoins(userId, 'tier_promotion', toTierId);
     await this.cache.del(`user_tier:${userId}`);
     await this.cache.del('tier_rooms:all');
-    // Fire-and-forget push notification
+    // Emit WS event first (instant if user online), then push notif as fallback
     const tierInfo = await this.db.query(
       `SELECT tier_key, name, icon_emoji FROM room_tiers WHERE id=$1 LIMIT 1`, [toTierId]
     );
     if (tierInfo.length) {
       const t = tierInfo[0];
-      this.notifService.notifyPromotion(userId, t.tier_key, t.name, t.icon_emoji)
-        .catch(e => this.logger.error(`Promotion push failed: ${e.message}`));
+      const wsDelivered = this.gateway.emitPromotion(userId, t.tier_key, t.name, t.icon_emoji);
+      // If user offline (WS not connected), fall back to push notification
+      if (!wsDelivered) {
+        this.notifService.notifyPromotion(userId, t.tier_key, t.name, t.icon_emoji)
+          .catch(e => this.logger.error(`Promotion push failed: ${e.message}`));
+      }
     }
   }
 
@@ -887,7 +926,13 @@ export class AdminTierRoomsController {
 @Module({
   imports: [ScheduleModule.forRoot(), AuthModule],
   controllers: [TierRoomsController, AdminTierRoomsController],
-  providers: [TierRoomsService, StudySessionsService, TierRoomsCronService, TierNotificationsService],
-  exports:   [TierRoomsService, StudySessionsService, TierNotificationsService],
+  providers: [
+    TierRoomsService,
+    StudySessionsService,
+    TierRoomsCronService,
+    TierNotificationsService,
+    TierRoomsGateway,         // WebSocket gateway
+  ],
+  exports: [TierRoomsService, StudySessionsService, TierNotificationsService, TierRoomsGateway],
 })
 export class TierRoomsModule {}
