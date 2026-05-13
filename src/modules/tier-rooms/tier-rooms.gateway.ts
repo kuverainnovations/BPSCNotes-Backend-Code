@@ -6,7 +6,7 @@ import {
 } from '@nestjs/websockets';
 import { Server, Socket }       from 'socket.io';
 import { Injectable, Logger }   from '@nestjs/common';
-import { JwtService }           from '@nestjs/jwt';
+import * as jwt from 'jsonwebtoken';
 import { ConfigService }        from '@nestjs/config';
 import { InjectDataSource }     from '@nestjs/typeorm';
 import { DataSource }           from 'typeorm';
@@ -65,8 +65,7 @@ export class TierRoomsGateway
   private readonly socketTier  = new Map<string, string>();
 
   constructor(
-    private readonly jwtService: JwtService,
-    private readonly config:     ConfigService,
+    private readonly config: ConfigService,
     @InjectDataSource() private readonly db: DataSource,
     @Inject(CACHE_MANAGER) private readonly cache: Cache,
   ) {}
@@ -81,9 +80,10 @@ export class TierRoomsGateway
       const token = this.extractToken(client);
       if (!token) throw new WsException('No auth token');
 
-      const payload = this.jwtService.verify(token, {
-        secret: this.config.get<string>('jwt.secret'),
-      }) as { userId: string };
+      const payload = jwt.verify(
+        token,
+        process.env.JWT_SECRET!
+      ) as { userId: string };
 
       if (!payload?.userId) throw new WsException('Invalid token');
 

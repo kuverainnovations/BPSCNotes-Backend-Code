@@ -593,6 +593,6 @@ export class AuthController {
   ],
   controllers: [AuthController],
   providers:   [AuthService, OtpService, UserJwtStrategy, AdminJwtStrategy],
-  exports:     [AuthService, UserJwtStrategy, AdminJwtStrategy,JwtService],
+  exports:     [AuthService, UserJwtStrategy, AdminJwtStrategy],
 })
 export class AuthModule {}
