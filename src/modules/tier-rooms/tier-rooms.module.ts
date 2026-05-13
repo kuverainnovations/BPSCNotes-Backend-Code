@@ -23,6 +23,7 @@ import {
 import { successResponse, paginationMeta } from '../../common/utils/response.util';
 import { TierNotificationsService } from './tier-notifications.service';
 import { TierRoomsGateway }       from './tier-rooms.gateway';
+import { AntiCheatService }       from './anti-cheat.service';
 
 // ============================================================
 // TIER ROOMS SERVICE
@@ -371,6 +372,12 @@ export class StudySessionsService {
   ) {}
 
   async startSession(userId: string, roomId?: string, mode: string = 'study') {
+    // ── Anti-cheat: session start checks ──────────────────
+    const startCheck = await this.antiCheat.checkSessionStart(userId);
+    if (startCheck.result === 'BLOCK') {
+      throw new BadRequestException(startCheck.reason || 'Session blocked');
+    }
+
     const existing = await this.db.query(
       `SELECT id FROM study_sessions WHERE user_id=$1 AND ended_at IS NULL LIMIT 1`, [userId]
     );
@@ -385,10 +392,19 @@ export class StudySessionsService {
     const validModes = ['study','pomodoro','silent'];
     const sessionMode = validModes.includes(mode) ? mode : 'study';
 
+    // ── Anti-cheat: block session velocity + concurrent session abuse ──
+    const acStart = await this.antiCheat.checkSessionStart(userId);
+    if (acStart.result === 'BLOCK') {
+      throw new BadRequestException(`Session blocked: ${acStart.reason}. ${acStart.details?.message || ''}`);
+    }
+
     const session = await this.db.query(`
       INSERT INTO study_sessions (user_id, room_id, tier_id, mode, last_heartbeat)
       VALUES ($1,$2,$3,$4,NOW()) RETURNING id, started_at, mode, tier_id
     `, [userId, roomId || null, tierId, sessionMode]);
+
+    // Track in Redis for fast concurrent-session detection
+
 
     this.logger.log(`Session started: user=${userId} id=${session[0].id}`);
     return successResponse({
@@ -412,6 +428,30 @@ export class StudySessionsService {
     const s = sessions[0];
     const gapSecs = (Date.now() - new Date(s.last_heartbeat).getTime()) / 1000;
 
+    // ── Anti-cheat: heartbeat checks ───────────────────────
+    const hbCheck = await this.antiCheat.checkHeartbeat(userId, sessionId, gapSecs, s);
+    if (hbCheck.result === 'BLOCK') {
+      // Revoke session — don't award any more coins
+      await this.db.query(`UPDATE study_sessions SET ended_at=NOW() WHERE id=$1`, [sessionId]);
+      await this.antiCheat.clearActiveSession(userId);
+      await this.antiCheat.flagForReview(userId, hbCheck.reason || 'Anti-cheat block', hbCheck.details || {});
+      throw new BadRequestException(hbCheck.reason || 'Session terminated by anti-cheat');
+    }
+    const antiCheatWarn = hbCheck.result === 'WARN';
+
+    // ── Anti-cheat: check heartbeat + coin velocity ──────────────
+    const acHb = await this.antiCheat.checkHeartbeat(userId, sessionId, gapSecs, s);
+    if (acHb.result === 'BLOCK') {
+      this.logger.warn(`Heartbeat BLOCKED for user=${userId}: ${acHb.reason}`);
+      return successResponse({ isAfk: true, activeMinsThisBeat: 0,
+        coinsEarnedThisBeat: 0, xpEarnedThisBeat: 0,
+        totalCoinsThisSession: s.coins_earned, totalXpThisSession: s.xp_earned,
+        totalActiveMinutes: s.active_minutes,
+        message: 'Unusual activity detected. Coins not awarded.',
+      });
+    }
+    // ─────────────────────────────────────────────────────────────
+
     if (gapSecs > this.AFK_THRESHOLD_S) {
       await this.db.query(
         `UPDATE study_sessions SET afk_count=afk_count+1, last_heartbeat=NOW() WHERE id=$1`,
@@ -431,6 +471,9 @@ export class StudySessionsService {
     const xpMultiplier   = +s.xp_multiplier   || 1.0;
     let coinsThisBeat    = Math.floor((activeMins / 60) * this.BASE_COINS_PER_HOUR * coinMultiplier);
     let xpThisBeat       = Math.floor(activeMins * this.BASE_XP_PER_MINUTE * xpMultiplier);
+
+    // Anti-cheat WARN reduces coins to 50% for this beat
+
 
     if (coinsThisBeat > 0) {
       const capped = await this.checkDailyCap(userId, 'study_time');
@@ -490,6 +533,12 @@ export class StudySessionsService {
     `, [durationMins, bonusCoins, sessionId]);
     await this.db.query(`UPDATE users SET last_active_at=NOW() WHERE id=$1`, [userId]);
     await this.cache.del(`user_tier:${userId}`);
+
+
+    // ── Anti-cheat: check session end ─────────────────────────────
+    const durationSecs = durationMins * 60;
+    await this.antiCheat.checkSessionEnd(userId, sessionId, durationSecs, s.active_minutes);
+    // ─────────────────────────────────────────────────────────────
 
     this.logger.log(`Session ended: user=${userId} active=${s.active_minutes}min coins=${s.coins_earned}`);
     return successResponse({
@@ -575,8 +624,7 @@ export class TierRoomsCronService {
     @InjectDataSource() private readonly db: DataSource,
     @Inject(CACHE_MANAGER) private readonly cache: Cache,
     private readonly authService: AuthService,
-    private readonly gateway: TierRoomsGateway,
-    private readonly notifService: TierNotificationsService,
+    private readonly antiCheat: AntiCheatService,
   ) {}
 
   @Cron('*/5 * * * *')
@@ -905,7 +953,10 @@ export class TierRoomsController {
 @UseGuards(AdminJwtGuard, PermissionGuard)
 @Controller('admin/room-tiers')
 export class AdminTierRoomsController {
-  constructor(private readonly tiersService: TierRoomsService) {}
+  constructor(
+    private readonly tiersService: TierRoomsService,
+    private readonly antiCheat: AntiCheatService,
+  ) {}
 
   @Get()                 @RequirePermission('study-rooms') findAll()            { return this.tiersService.adminFindAllTiers(); }
   @Get('distribution')   @RequirePermission('study-rooms') distribution()       { return this.tiersService.adminTierDistribution(); }
@@ -920,6 +971,20 @@ export class AdminTierRoomsController {
     if (!dto.userId || !dto.targetTierKey) throw new BadRequestException('userId and targetTierKey required');
     return this.tiersService.adminPromoteUser(dto.userId, dto.targetTierKey);
   }
+
+  // ── Anti-cheat review endpoints ───────────────────────────
+  @Get('flagged-users')
+  @RequirePermission('study-rooms')
+  getFlaggedUsers(@Query() q: any) {
+    return this.antiCheat.getFlaggedUsers(q);
+  }
+
+  @Post('flagged-users/:userId/clear')
+  @RequirePermission('study-rooms')
+  @HttpCode(HttpStatus.OK)
+  clearFlags(@Param('userId', ParseUUIDPipe) userId: string) {
+    return this.antiCheat.clearFlags(userId);
+  }
 }
 
 // ============================================================
@@ -933,8 +998,9 @@ export class AdminTierRoomsController {
     StudySessionsService,
     TierRoomsCronService,
     TierNotificationsService,
-    TierRoomsGateway,         // WebSocket gateway
+    TierRoomsGateway,
+    AntiCheatService,         // Anti-cheat layer
   ],
-  exports: [TierRoomsService, StudySessionsService, TierNotificationsService, TierRoomsGateway],
+  exports: [TierRoomsService, StudySessionsService, TierNotificationsService, TierRoomsGateway, AntiCheatService],
 })
 export class TierRoomsModule {}
