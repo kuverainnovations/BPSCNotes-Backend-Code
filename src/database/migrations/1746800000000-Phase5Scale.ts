@@ -36,8 +36,8 @@ export class Phase5Scale1746800000000 implements MigrationInterface {
 
     // study_sessions: fast daily coin cap check
     await queryRunner.query(`
-      CREATE INDEX IF NOT EXISTS idx_coin_transactions_user_action_date
-        ON coin_transactions(user_id, action, (created_at::date))
+     CREATE INDEX IF NOT EXISTS idx_coin_transactions_user_action_created
+ON coin_transactions(user_id, action, created_at)
     `);
 
     // Weekly challenges: fast period+user lookup
