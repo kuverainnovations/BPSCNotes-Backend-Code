@@ -13,6 +13,9 @@ import { Inject } from '@nestjs/common';
 import { ApiTags, ApiBearerAuth } from '@nestjs/swagger';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { AuthModule, AuthService } from './auth/auth.module';
+// Phase 2 achievements + challenges — imported here to wire into
+// DailyTargets and Quizzes so completions trigger achievement checks
+import { AchievementsService, WeeklyChallengesService } from './achievements/achievements.module';
 
 import { JwtAuthGuard, AdminJwtGuard, PermissionGuard, RequirePermission, Public } from '../common/guards';
 import { PaginationDto } from '../common/dtos/pagination.dto';
@@ -389,6 +392,19 @@ class DailyTargetsService {
         userId,
       ]
     );
+
+    // ── Trigger achievements + challenge progress on completion ──
+    if (nowComplete) {
+      // Fire-and-forget so UI isn't blocked by achievement checks
+      Promise.all([
+        this.achievementsService
+          .checkAndAward(userId, 'goal_complete')
+          .catch(e => console.error('achievement check failed:', e.message)),
+        this.challengesService
+          .updateProgress(userId, 'goal_complete', 1)
+          .catch(e => console.error('challenge update failed:', e.message)),
+      ]);
+    }
 
     // Award coin for first completion (not if toggling back)
     let coinsEarned = 0;

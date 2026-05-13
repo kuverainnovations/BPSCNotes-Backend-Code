@@ -6,6 +6,7 @@ import {
   UseGuards, ParseUUIDPipe,
 } from '@nestjs/common';
 import { InjectDataSource } from '@nestjs/typeorm';
+import { AchievementsService, WeeklyChallengesService, AchievementsModule } from '../achievements/achievements.module';
 import { DataSource } from 'typeorm';
 import { CACHE_MANAGER } from '@nestjs/cache-manager';
 import { Cache } from 'cache-manager';
@@ -23,6 +24,8 @@ class QuizzesService {
     @InjectDataSource() private readonly db: DataSource,
     private readonly authService: AuthService,
     @Inject(CACHE_MANAGER) private readonly cache: Cache,
+    private readonly achievementsService: AchievementsService,
+    private readonly challengesService: WeeklyChallengesService,
   ) {}
 
   // ── GET /quizzes — list with is_attempted flag ──────────────
@@ -218,6 +221,14 @@ class QuizzesService {
 
     let coinsEarned = 0;
     if (isPassed) coinsEarned = await this.authService.awardCoins(userId, 'daily_quiz', attempt[0].id);
+
+    // ── Async achievement + challenge checks (fire-and-forget) ──
+    Promise.all([
+      this.achievementsService.checkAndAward(userId, 'quiz_complete')
+        .catch(e => console.error('quiz achievement:', e.message)),
+      this.challengesService.updateProgress(userId, 'quiz_complete', 1)
+        .catch(e => console.error('quiz challenge:', e.message)),
+    ]);
 
     return successResponse({
       attemptId:    attempt[0].id,
@@ -557,7 +568,7 @@ import { AuthModule } from '../auth/auth.module';
 @Module({
   imports:     [AuthModule],
   controllers: [QuizzesController, AdminQuizzesController, AdminQuestionsController],
-  providers:   [QuizzesService],
+  providers:   [QuizzesService, AchievementsService, WeeklyChallengesService],
   exports:     [QuizzesService],
 })
 export class QuizzesModule {}
