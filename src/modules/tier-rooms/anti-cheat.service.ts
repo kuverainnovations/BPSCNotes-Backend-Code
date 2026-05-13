@@ -34,6 +34,12 @@ export interface AntiCheatCheckResult {
 
 @Injectable()
 export class AntiCheatService {
+  clearActiveSession(userId: string) {
+    throw new Error('Method not implemented.');
+  }
+  flagForReview(userId: string, arg1: string, arg2: Record<string, any>) {
+    throw new Error('Method not implemented.');
+  }
   private readonly logger = new Logger(AntiCheatService.name);
 
   // Thresholds (admin can override via env or DB config in future)

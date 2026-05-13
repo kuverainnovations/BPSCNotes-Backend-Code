@@ -369,6 +369,7 @@ export class StudySessionsService {
     private readonly authService: AuthService,
     private readonly notifService: TierNotificationsService,
     private readonly gateway: TierRoomsGateway,
+    private readonly antiCheat: AntiCheatService,
   ) {}
 
   async startSession(userId: string, roomId?: string, mode: string = 'study') {
@@ -625,6 +626,8 @@ export class TierRoomsCronService {
     @Inject(CACHE_MANAGER) private readonly cache: Cache,
     private readonly authService: AuthService,
     private readonly antiCheat: AntiCheatService,
+    private readonly gateway: TierRoomsGateway,
+    private readonly notifService: TierNotificationsService,
   ) {}
 
   @Cron('*/5 * * * *')
