@@ -21,6 +21,7 @@ import {
   PermissionGuard, RequirePermission, Public,
 } from '../../common/guards';
 import { successResponse, paginationMeta } from '../../common/utils/response.util';
+import { TierNotificationsService } from './tier-notifications.service';
 
 // ============================================================
 // TIER ROOMS SERVICE
@@ -300,6 +301,42 @@ export class TierRoomsService {
     return successResponse({ distribution: rows });
   }
 
+  // ── GET "at risk" demotion status for calling user ──────────
+  // Returns: { isAtRisk, progress, threshold, tierKey, graceUntil }
+  // Called by Android on app resume to show the warning banner.
+  async getAtRiskStatus(userId: string) {
+    const rows = await this.db.query(`
+      SELECT
+        urt.next_tier_progress,
+        urt.demotion_grace_until,
+        ct.tier_key, ct.name AS tier_name, ct.icon_emoji,
+        ct.sort_order,
+        tpr.demotion_threshold_pct
+      FROM user_room_tier urt
+      JOIN room_tiers ct ON ct.id = urt.current_tier_id
+      LEFT JOIN tier_progression_rules tpr
+        ON tpr.from_tier_id = ct.id AND tpr.is_active = TRUE
+      WHERE urt.user_id = $1
+    `, [userId]);
+
+    if (!rows.length) return successResponse({ isAtRisk: false });
+    const row       = rows[0];
+    const progress  = parseFloat(row.next_tier_progress || '0');
+    const threshold = parseFloat(row.demotion_threshold_pct || '50') / 100;
+    const inGrace   = row.demotion_grace_until && new Date(row.demotion_grace_until) > new Date();
+    const isAtRisk  = row.sort_order > 1 && !inGrace && progress < threshold;
+
+    return successResponse({
+      isAtRisk,
+      progress:           parseFloat((progress * 100).toFixed(1)),
+      threshold:          parseFloat((threshold * 100).toFixed(1)),
+      tierKey:            row.tier_key,
+      tierName:           row.tier_name,
+      tierEmoji:          row.icon_emoji,
+      demotionGraceUntil: row.demotion_grace_until,
+    });
+  }
+
   getCurrentPeriodKey(period: string): string {
     const now = new Date();
     if (period === 'weekly') {
@@ -328,6 +365,7 @@ export class StudySessionsService {
     @InjectDataSource() private readonly db: DataSource,
     @Inject(CACHE_MANAGER) private readonly cache: Cache,
     private readonly authService: AuthService,
+    private readonly notifService: TierNotificationsService,
   ) {}
 
   async startSession(userId: string, roomId?: string, mode: string = 'study') {
@@ -602,6 +640,52 @@ export class TierRoomsCronService {
     }
   }
 
+  // ── 1st of month at 01:00 — monthly leaderboard snapshot ──
+  @Cron('0 1 1 * *')
+  async snapshotMonthlyLeaderboard() {
+    this.logger.log('Snapshotting monthly leaderboard...');
+    const now        = new Date();
+    // Previous month
+    const prevMonth  = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+    const periodKey  = `${prevMonth.getFullYear()}-${String(prevMonth.getMonth()+1).padStart(2,'0')}`;
+    const monthStart = prevMonth;
+    const monthEnd   = new Date(now.getFullYear(), now.getMonth(), 1);
+    const tiers      = await this.db.query(`SELECT id, tier_key FROM room_tiers WHERE is_active=TRUE`);
+
+    for (const tier of tiers) {
+      const stats = await this.db.query(`
+        SELECT urt.user_id,
+          COALESCE(SUM(ss.active_minutes),0)::int AS study_minutes,
+          COALESCE(SUM(ss.coins_earned),0)::int   AS coins_earned,
+          COALESCE(SUM(ss.xp_earned),0)::int      AS xp_earned,
+          COALESCE(u.streak,0)::int                AS streak_days
+        FROM user_room_tier urt JOIN users u ON u.id=urt.user_id
+        LEFT JOIN study_sessions ss ON ss.user_id=urt.user_id
+          AND ss.started_at>=$1 AND ss.started_at<$2 AND ss.ended_at IS NOT NULL
+        WHERE urt.current_tier_id=$3 AND u.status='active'
+        GROUP BY urt.user_id, u.streak ORDER BY study_minutes DESC, coins_earned DESC
+      `, [monthStart.toISOString(), monthEnd.toISOString(), tier.id]);
+
+      for (let i = 0; i < stats.length; i++) {
+        const s = stats[i];
+        await this.db.query(`
+          INSERT INTO room_leaderboard
+            (tier_id,user_id,period_type,period_key,study_minutes,coins_earned,xp_earned,streak_days,rank_position)
+          VALUES ($1,$2,'monthly',$3,$4,$5,$6,$7,$8)
+          ON CONFLICT (tier_id,user_id,period_type,period_key) DO UPDATE SET
+            study_minutes=$4,coins_earned=$5,xp_earned=$6,streak_days=$7,rank_position=$8,computed_at=NOW()
+        `, [tier.id,s.user_id,periodKey,s.study_minutes,s.coins_earned,s.xp_earned,s.streak_days,i+1]);
+      }
+      // Top 3 monthly bonus (2× weekly rewards)
+      const rewards = [100, 60, 40];
+      for (let i = 0; i < Math.min(3, stats.length); i++) {
+        await this.authService.awardCoins(stats[i].user_id, 'leaderboard_reward', tier.id);
+      }
+      await this.cache.del(`leaderboard:${tier.tier_key}:monthly:${periodKey}`);
+    }
+    this.logger.log(`Monthly leaderboard snapshotted for ${periodKey}`);
+  }
+
   @Cron('55 23 * * 0')
   async snapshotWeeklyLeaderboard() {
     this.logger.log('Snapshotting weekly leaderboard...');
@@ -678,6 +762,15 @@ export class TierRoomsCronService {
     await this.authService.awardCoins(userId, 'tier_promotion', toTierId);
     await this.cache.del(`user_tier:${userId}`);
     await this.cache.del('tier_rooms:all');
+    // Fire-and-forget push notification
+    const tierInfo = await this.db.query(
+      `SELECT tier_key, name, icon_emoji FROM room_tiers WHERE id=$1 LIMIT 1`, [toTierId]
+    );
+    if (tierInfo.length) {
+      const t = tierInfo[0];
+      this.notifService.notifyPromotion(userId, t.tier_key, t.name, t.icon_emoji)
+        .catch(e => this.logger.error(`Promotion push failed: ${e.message}`));
+    }
   }
 
   private async demoteUser(userId: string, currentTierId: string, graceDays: number) {
@@ -753,6 +846,12 @@ export class TierRoomsController {
   getActiveSession(@Req() r: any) {
     return this.sessionsService.getActiveSession(r.user.id);
   }
+
+  /** GET /rooms/tiers/at-risk — is the user at risk of demotion? */
+  @Get('tiers/at-risk')
+  getAtRiskStatus(@Req() r: any) {
+    return this.tiersService.getAtRiskStatus(r.user.id);
+  }
 }
 
 // ============================================================
@@ -787,7 +886,7 @@ export class AdminTierRoomsController {
 @Module({
   imports: [ScheduleModule.forRoot(), AuthModule],
   controllers: [TierRoomsController, AdminTierRoomsController],
-  providers: [TierRoomsService, StudySessionsService, TierRoomsCronService],
-  exports: [TierRoomsService, StudySessionsService],
+  providers: [TierRoomsService, StudySessionsService, TierRoomsCronService, TierNotificationsService],
+  exports:   [TierRoomsService, StudySessionsService, TierNotificationsService],
 })
 export class TierRoomsModule {}
