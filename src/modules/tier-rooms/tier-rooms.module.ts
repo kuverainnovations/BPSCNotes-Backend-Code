@@ -573,6 +573,7 @@ export class TierRoomsCronService {
     @InjectDataSource() private readonly db: DataSource,
     @Inject(CACHE_MANAGER) private readonly cache: Cache,
     private readonly authService: AuthService,
+    private readonly notifService: TierNotificationsService,
   ) {}
 
   @Cron('*/5 * * * *')
