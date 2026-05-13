@@ -74,21 +74,21 @@ import { TierRoomsModule } from './modules/tier-rooms/tier-rooms.module';
       },
     }),
 
-    // ── Redis Cache ───────────────────────────────────────────
     CacheModule.registerAsync({
       isGlobal: true,
-      inject:   [ConfigService],
+      inject: [ConfigService],
       useFactory: async (config: ConfigService) => ({
         store: await redisStore({
-          host:     config.get<string>('redis.host', 'redis'),
-          port:     config.get<number>('redis.port', 6379),
-          password: config.get<string>('redis.password') || undefined,
-          db:       config.get<number>('redis.db', 0),
-          ttl:      config.get<number>('redis.ttl', 300),
+          host: config.get<string>('REDIS_HOST'),
+          port: config.get<number>('REDIS_PORT'),
+          password: config.get<string>('REDIS_PASSWORD') || undefined,
+          db: config.get<number>('REDIS_DB', 0),
+          ttl: config.get<number>('REDIS_TTL', 300),
         }),
       }),
     }),
 
+    
     // ── Rate Limiting ─────────────────────────────────────────
     ThrottlerModule.forRootAsync({
       inject: [ConfigService],
