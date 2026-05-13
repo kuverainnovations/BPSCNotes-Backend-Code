@@ -61,7 +61,7 @@ import { TierRoomsModule } from './modules/tier-rooms/tier-rooms.module';
           // It runs ALTER TABLE on every restart, can cause data loss and
           // startup race conditions. Use explicit migrations instead.
           synchronize: !isProd,   // true in dev, false in production
-          migrationsRun: isProd,  // auto-run migrations on start in production
+          migrationsRun: false,  // auto-run migrations on start in production
 
           logging:  config.get('database.logging'),
           extra: {
