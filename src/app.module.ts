@@ -28,7 +28,8 @@ import {
   StudyRoomsModule, UsersModule, BannersModule, ExamsModule, DailyTargetsModule,
   FlashcardsModule,
 } from './modules/combined-modules-2.module';
-import { TierRoomsModule } from './modules/tier-rooms/tier-rooms.module';
+import { TierRoomsModule }    from './modules/tier-rooms/tier-rooms.module';
+import { AchievementsModule } from './modules/achievements/achievements.module';
 
 @Module({
   imports: [
@@ -61,7 +62,7 @@ import { TierRoomsModule } from './modules/tier-rooms/tier-rooms.module';
           // It runs ALTER TABLE on every restart, can cause data loss and
           // startup race conditions. Use explicit migrations instead.
           synchronize: !isProd,   // true in dev, false in production
-          migrationsRun: false,  // auto-run migrations on start in production
+          migrationsRun: isProd,  // auto-run migrations on start in production
 
           logging:  config.get('database.logging'),
           extra: {
@@ -74,21 +75,21 @@ import { TierRoomsModule } from './modules/tier-rooms/tier-rooms.module';
       },
     }),
 
+    // ── Redis Cache ───────────────────────────────────────────
     CacheModule.registerAsync({
       isGlobal: true,
-      inject: [ConfigService],
+      inject:   [ConfigService],
       useFactory: async (config: ConfigService) => ({
         store: await redisStore({
-          host: config.get<string>('REDIS_HOST'),
-          port: config.get<number>('REDIS_PORT'),
-          password: config.get<string>('REDIS_PASSWORD') || undefined,
-          db: config.get<number>('REDIS_DB', 0),
-          ttl: config.get<number>('REDIS_TTL', 300),
+          host:     config.get<string>('redis.host', 'redis'),
+          port:     config.get<number>('redis.port', 6379),
+          password: config.get<string>('redis.password') || undefined,
+          db:       config.get<number>('redis.db', 0),
+          ttl:      config.get<number>('redis.ttl', 300),
         }),
       }),
     }),
 
-    
     // ── Rate Limiting ─────────────────────────────────────────
     ThrottlerModule.forRootAsync({
       inject: [ConfigService],
@@ -118,6 +119,7 @@ import { TierRoomsModule } from './modules/tier-rooms/tier-rooms.module';
     DailyTargetsModule,
     FlashcardsModule,
     TierRoomsModule,
+    AchievementsModule,
   ],
 
   controllers: [HealthController],
