@@ -196,6 +196,8 @@ class DailyTargetsService {
   constructor(
     @InjectDataSource() private readonly db: DataSource,
     @Inject(CACHE_MANAGER) private readonly cache: Cache,
+    private readonly achievementsService: AchievementsService,
+    private readonly challengesService: WeeklyChallengesService,
   ) {}
 
   // ── GET /users/daily-targets ──────────────────────────────
@@ -523,9 +525,13 @@ class DailyTargetsController {
 }
 
 @Module({
-  imports:     [AuthModule],
-  controllers: [DailyTargetsController],   // StudyRooms controllers live in StudyRoomsModule only
-  providers:   [DailyTargetsService],
+  imports: [AuthModule],
+  controllers: [DailyTargetsController],
+  providers: [
+    DailyTargetsService,
+    AchievementsService,
+    WeeklyChallengesService,
+  ],
 })
 
 export class DailyTargetsModule {}
