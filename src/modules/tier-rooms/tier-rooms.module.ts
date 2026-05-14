@@ -214,6 +214,80 @@ export class TierRoomsService {
     await this.db.query(`UPDATE users SET room_tier_id=$1 WHERE id=$2`, [silver[0].id, userId]);
   }
 
+  // ── User self-promotion: called when user meets all requirements ──
+  // Instead of waiting for midnight cron, user can claim immediately.
+  async claimPromotion(userId: string) {
+    // Verify user meets ALL requirements for next tier
+    const rules = await this.db.query(`
+      SELECT tpr.*, ft.tier_key AS from_key, tt.id AS to_tier_id, tt.tier_key AS to_key,
+             tt.name AS to_name, tt.icon_emoji AS to_emoji
+      FROM user_room_tier urt
+      JOIN tier_progression_rules tpr ON tpr.from_tier_id = urt.current_tier_id AND tpr.is_active=TRUE
+      JOIN room_tiers ft ON ft.id = urt.current_tier_id
+      JOIN room_tiers tt ON tt.id = tpr.to_tier_id
+      WHERE urt.user_id = $1
+    `, [userId]);
+
+    if (!rules.length) {
+      return { success: false, message: 'You are already at the maximum tier (Diamond).' };
+    }
+    const rule = rules[0];
+
+    // Get user stats
+    const userRows = await this.db.query(`
+      SELECT u.total_study_minutes, u.streak, u.quizzes_attempted, u.accuracy
+      FROM users u WHERE u.id=$1
+    `, [userId]);
+    if (!userRows.length) throw new Error('User not found');
+    const u = userRows[0];
+    const totalHours = (u.total_study_minutes || 0) / 60;
+
+    // Check all conditions
+    const fails: string[] = [];
+    if (+rule.min_total_study_hours > 0 && totalHours < +rule.min_total_study_hours)
+      fails.push(`Study ${rule.min_total_study_hours}h (you have ${totalHours.toFixed(1)}h)`);
+    if (+rule.min_streak_days > 0 && (u.streak||0) < +rule.min_streak_days)
+      fails.push(`${rule.min_streak_days}-day streak (you have ${u.streak||0})`);
+    if (+rule.min_quizzes_completed > 0 && (u.quizzes_attempted||0) < +rule.min_quizzes_completed)
+      fails.push(`${rule.min_quizzes_completed} quizzes (you have ${u.quizzes_attempted||0})`);
+    if (+rule.min_accuracy_pct > 0 && +(u.accuracy||0) < +rule.min_accuracy_pct)
+      fails.push(`${rule.min_accuracy_pct}% accuracy (you have ${u.accuracy||0}%)`);
+
+    if (fails.length > 0) {
+      return {
+        success: false,
+        message: 'Requirements not fully met yet.',
+        missing: fails,
+      };
+    }
+
+    // All conditions met → promote immediately
+    await this.db.query(`
+      UPDATE user_room_tier
+      SET current_tier_id    = $1,
+          previous_tier_id   = $2,
+          promoted_at        = NOW(),
+          tier_joined_at     = NOW(),
+          next_tier_progress = 0.0000,
+          demotion_grace_until = NOW() + INTERVAL '3 days',
+          updated_at         = NOW()
+      WHERE user_id = $3
+    `, [rule.to_tier_id, rules[0].from_tier_id ? await this.db.query(`SELECT current_tier_id FROM user_room_tier WHERE user_id=$1`, [userId]).then(r => r[0]?.current_tier_id) : null, userId]);
+
+    await this.db.query(`UPDATE users SET room_tier_id=$1 WHERE id=$2`, [rule.to_tier_id, userId]);
+    await this.authService.awardCoins(userId, 'tier_promotion', rule.to_tier_id);
+    await this.cache.del(`user_tier:${userId}`);
+    await this.cache.del('tier_rooms:all');
+
+    return {
+      success:  true,
+      message:  `🎉 Promoted to ${rule.to_emoji} ${rule.to_name}!`,
+      newTierKey: rule.to_key,
+      newTierName: rule.to_name,
+      newTierEmoji: rule.to_emoji,
+    };
+  }
+
   async adminFindAllTiers() {
     const tiers = await this.db.query(`
       SELECT t.*,
@@ -369,7 +443,6 @@ export class StudySessionsService {
     private readonly authService: AuthService,
     private readonly notifService: TierNotificationsService,
     private readonly gateway: TierRoomsGateway,
-    private readonly antiCheat: AntiCheatService,
   ) {}
 
   async startSession(userId: string, roomId?: string, mode: string = 'study') {
@@ -626,8 +699,6 @@ export class TierRoomsCronService {
     @Inject(CACHE_MANAGER) private readonly cache: Cache,
     private readonly authService: AuthService,
     private readonly antiCheat: AntiCheatService,
-    private readonly gateway: TierRoomsGateway,
-    private readonly notifService: TierNotificationsService,
   ) {}
 
   @Cron('*/5 * * * *')
@@ -944,6 +1015,17 @@ export class TierRoomsController {
   @Get('tiers/at-risk')
   getAtRiskStatus(@Req() r: any) {
     return this.tiersService.getAtRiskStatus(r.user.id);
+  }
+
+  /**
+   * POST /rooms/tiers/claim-promotion
+   * User calls this when all requirements are met instead of waiting for midnight cron.
+   * Backend re-verifies requirements before promoting.
+   */
+  @Post('tiers/claim-promotion')
+  @HttpCode(HttpStatus.OK)
+  claimPromotion(@Req() r: any) {
+    return this.tiersService.claimPromotion(r.user.id);
   }
 }
 
