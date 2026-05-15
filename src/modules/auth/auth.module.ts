@@ -515,7 +515,7 @@ export class AuthController {
   @Public()
   @Post('send-otp')
   @HttpCode(HttpStatus.OK)
-  @Throttle({ default: { limit: 5, ttl: 900000 } })
+  @Throttle({ default: { limit: 30, ttl: 900000 } })
   async sendOtp(@Body() dto: SendOtpDto) {
     const data = await this.authService.sendOtp(dto.mobile);
     return successResponse(data, `OTP sent to ${dto.mobile}`);
