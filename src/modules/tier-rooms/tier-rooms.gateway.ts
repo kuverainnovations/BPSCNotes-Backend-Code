@@ -6,7 +6,7 @@ import {
 } from '@nestjs/websockets';
 import { Server, Socket }       from 'socket.io';
 import { Injectable, Logger }   from '@nestjs/common';
-import * as jwt from 'jsonwebtoken';
+import { JwtService }           from '@nestjs/jwt';
 import { ConfigService }        from '@nestjs/config';
 import { InjectDataSource }     from '@nestjs/typeorm';
 import { DataSource }           from 'typeorm';
@@ -65,7 +65,8 @@ export class TierRoomsGateway
   private readonly socketTier  = new Map<string, string>();
 
   constructor(
-    private readonly config: ConfigService,
+    private readonly jwtService: JwtService,
+    private readonly config:     ConfigService,
     @InjectDataSource() private readonly db: DataSource,
     @Inject(CACHE_MANAGER) private readonly cache: Cache,
   ) {}
@@ -80,10 +81,9 @@ export class TierRoomsGateway
       const token = this.extractToken(client);
       if (!token) throw new WsException('No auth token');
 
-      const payload = jwt.verify(
-        token,
-        process.env.JWT_SECRET!
-      ) as { userId: string };
+      const payload = this.jwtService.verify(token, {
+        secret: this.config.get<string>('jwt.secret'),
+      }) as { userId: string };
 
       if (!payload?.userId) throw new WsException('Invalid token');
 
@@ -175,6 +175,59 @@ export class TierRoomsGateway
     this.socketTier.delete(client.id);
     this.broadcastPresenceUpdate(tierKey);
     return { event: 'tier:left' };
+  }
+
+  // ── CLIENT: send chat message ────────────────────────────────
+  @SubscribeMessage('room:send_message')
+  async handleSendMessage(
+    @ConnectedSocket() client: Socket,
+    @MessageBody() data: { message: string },
+  ) {
+    const userId  = (client as any).userId as string;
+    const tierKey = this.socketTier.get(client.id);
+    if (!userId || !tierKey) throw new WsException('Not in a room.');
+
+    const msg = data?.message?.trim();
+    if (!msg) return;
+    if (msg.length > 500) throw new WsException('Max 500 characters.');
+
+    // Rate limit: 1 msg/sec per user (in-memory)
+    const last = this.lastMsgTime.get(userId) ?? 0;
+    if (Date.now() - last < 1000) throw new WsException('Too fast. Slow down.');
+    this.lastMsgTime.set(userId, Date.now());
+
+    // Persist to DB
+    const saved = await this.db.query(`
+      INSERT INTO room_messages (tier_key, sender_id, sender_name, message)
+      SELECT $1, $2, u.name, $3 FROM users u WHERE u.id=$2
+      RETURNING id, sender_name, message, created_at
+    `, [tierKey, userId, msg]);
+    if (!saved.length) return;
+
+    const row = saved[0];
+    // Broadcast to everyone in this tier room (including sender for confirmation)
+    this.server.to(`tier:${tierKey}`).emit('room:new_message', {
+      id:         row.id,
+      senderId:   userId,
+      senderName: row.sender_name,
+      message:    row.message,
+      tierKey,
+      createdAt:  row.created_at,
+    });
+  }
+
+  private readonly lastMsgTime = new Map<string, number>();
+
+  // ── SERVER: get chat history (called from REST controller) ───
+  async getChatHistory(tierKey: string, limit = 50): Promise<any[]> {
+    return this.db.query(`
+      SELECT id, sender_id AS "senderId", sender_name AS "senderName",
+             message, tier_key AS "tierKey", created_at AS "createdAt"
+      FROM room_messages
+      WHERE tier_key = $1
+      ORDER BY created_at DESC
+      LIMIT $2
+    `, [tierKey, limit]);
   }
 
   // ── CLIENT: WebSocket heartbeat ───────────────────────────

@@ -31,7 +31,6 @@ import { AntiCheatService }       from './anti-cheat.service';
 @Injectable()
 export class TierRoomsService {
   private readonly logger = new Logger(TierRoomsService.name);
-  authService: any;
 
   constructor(
     @InjectDataSource() private readonly db: DataSource,
@@ -437,7 +436,6 @@ export class StudySessionsService {
   private readonly BASE_XP_PER_MINUTE  = 1;
   private readonly HEARTBEAT_INTERVAL_S = 300;
   private readonly AFK_THRESHOLD_S     = 420;
-  antiCheat: any;
 
   constructor(
     @InjectDataSource() private readonly db: DataSource,
@@ -695,8 +693,6 @@ export class StudySessionsService {
 @Injectable()
 export class TierRoomsCronService {
   private readonly logger = new Logger(TierRoomsCronService.name);
-  gateway: any;
-  notifService: any;
 
   constructor(
     @InjectDataSource() private readonly db: DataSource,
@@ -704,6 +700,15 @@ export class TierRoomsCronService {
     private readonly authService: AuthService,
     private readonly antiCheat: AntiCheatService,
   ) {}
+
+  // Daily 03:00 — delete chat messages older than 24h (keep storage lean)
+  @Cron('0 3 * * *')
+  async cleanupOldChatMessages() {
+    const res = await this.db.query(
+      `DELETE FROM room_messages WHERE created_at < NOW() - INTERVAL '24 hours' RETURNING id`
+    );
+    if (res.length) this.logger.log(`Purged ${res.length} old chat messages`);
+  }
 
   @Cron('*/5 * * * *')
   async closeExpiredSessions() {
@@ -971,6 +976,7 @@ export class TierRoomsController {
   constructor(
     private readonly tiersService:    TierRoomsService,
     private readonly sessionsService: StudySessionsService,
+    private readonly gateway:         TierRoomsGateway,
   ) {}
 
   @Get('tiers')
@@ -1019,6 +1025,16 @@ export class TierRoomsController {
   @Get('tiers/at-risk')
   getAtRiskStatus(@Req() r: any) {
     return this.tiersService.getAtRiskStatus(r.user.id);
+  }
+
+  /** GET /rooms/tiers/:tierKey/messages?limit=50 — chat history */
+  @Get('tiers/:tierKey/messages')
+  async getChatHistory(
+    @Param('tierKey') tierKey: string,
+    @Query('limit')   limit: string = '50',
+  ) {
+    const rows = await this.gateway.getChatHistory(tierKey, Math.min(+limit, 100));
+    return successResponse({ messages: rows.reverse() });  // oldest-first for UI
   }
 
   /**
