@@ -24,6 +24,7 @@ import { successResponse, paginationMeta } from '../../common/utils/response.uti
 import { TierNotificationsService } from './tier-notifications.service';
 import { TierRoomsGateway }       from './tier-rooms.gateway';
 import { AntiCheatService }       from './anti-cheat.service';
+import { JwtModule } from '@nestjs/jwt';
 
 // ============================================================
 // TIER ROOMS SERVICE
@@ -1100,7 +1101,7 @@ export class AdminTierRoomsController {
 // MODULE
 // ============================================================
 @Module({
-  imports: [ScheduleModule.forRoot(), AuthModule],
+  imports: [ScheduleModule.forRoot(), AuthModule,JwtModule],
   controllers: [TierRoomsController, AdminTierRoomsController],
   providers: [
     TierRoomsService,
