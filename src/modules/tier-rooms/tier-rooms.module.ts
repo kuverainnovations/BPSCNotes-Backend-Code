@@ -438,7 +438,6 @@ export class StudySessionsService {
   private readonly BASE_XP_PER_MINUTE  = 1;
   private readonly HEARTBEAT_INTERVAL_S = 300;
   private readonly AFK_THRESHOLD_S     = 420;
-  antiCheat: any;
 
   constructor(
     @InjectDataSource() private readonly db: DataSource,
@@ -446,6 +445,7 @@ export class StudySessionsService {
     private readonly authService: AuthService,
     private readonly notifService: TierNotificationsService,
     private readonly gateway: TierRoomsGateway,
+    private readonly antiCheat: AntiCheatService,
   ) {}
 
   async startSession(userId: string, roomId?: string, mode: string = 'study') {
