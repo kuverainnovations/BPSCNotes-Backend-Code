@@ -30,6 +30,7 @@ import {
 } from './modules/combined-modules-2.module';
 import { TierRoomsModule }    from './modules/tier-rooms/tier-rooms.module';
 import { AchievementsModule } from './modules/achievements/achievements.module';
+import { StudyMaterialsModule } from '@modules/study-materials/study-materials.module';
 
 @Module({
   imports: [
@@ -120,6 +121,7 @@ import { AchievementsModule } from './modules/achievements/achievements.module';
     FlashcardsModule,
     TierRoomsModule,
     AchievementsModule,
+    StudyMaterialsModule,
   ],
 
   controllers: [HealthController],
