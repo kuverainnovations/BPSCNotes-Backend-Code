@@ -298,7 +298,7 @@ export class CoinsService {
           streak = $2,
           last_check_in_date = NOW()
       WHERE id = $3
-      RETURNING coins, total_coins_earned, streak
+      RETURNING COALESCE(coins, 0) AS coins, total_coins_earned, streak
     `, [coinsEarned, newStreak, userId]);
 
     const balance = updated.coins;
@@ -344,7 +344,7 @@ export class CoinsService {
       UPDATE users
       SET coins = coins + $1, total_coins_earned = total_coins_earned + $1
       WHERE id = $2
-      RETURNING coins
+      RETURNING COALESCE(coins, 0) AS coins
     `, [task.coinsReward, userId]);
 
     await this.db.query(`
