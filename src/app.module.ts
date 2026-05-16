@@ -122,6 +122,7 @@ import { StudyMaterialsModule } from '@modules/study-materials/study-materials.m
     TierRoomsModule,
     AchievementsModule,
     StudyMaterialsModule,
+    CoinsModule
   ],
 
   controllers: [HealthController],
