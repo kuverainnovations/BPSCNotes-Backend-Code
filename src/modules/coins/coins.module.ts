@@ -293,12 +293,12 @@ export class CoinsService {
     // Award coins + update streak atomically
     const [updated] = await this.db.query(`
       UPDATE users
-      SET coins = coins + $1,
-          total_coins_earned = total_coins_earned + $1,
-          streak = $2,
-          last_check_in_date = NOW()
-      WHERE id = $3
-      RETURNING COALESCE(coins, 0) AS coins, total_coins_earned, streak
+SET coins = COALESCE(coins, 0) + $1,
+    total_coins_earned = COALESCE(total_coins_earned, 0) + $1,
+    streak = $2,
+    last_check_in_date = NOW()
+WHERE id = $3
+RETURNING COALESCE(coins, 0) AS coins, total_coins_earned, streak
     `, [coinsEarned, newStreak, userId]);
 
     const balance = updated.coins;
@@ -342,9 +342,10 @@ export class CoinsService {
 
     const [updated] = await this.db.query(`
       UPDATE users
-      SET coins = coins + $1, total_coins_earned = total_coins_earned + $1
-      WHERE id = $2
-      RETURNING COALESCE(coins, 0) AS coins
+SET coins = COALESCE(coins, 0) + $1,
+    total_coins_earned = COALESCE(total_coins_earned, 0) + $1
+WHERE id = $2
+RETURNING COALESCE(coins, 0) AS coins
     `, [task.coinsReward, userId]);
 
     await this.db.query(`
