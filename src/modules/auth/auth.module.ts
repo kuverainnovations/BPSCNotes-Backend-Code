@@ -5,6 +5,8 @@ import {
   Module, Injectable, Controller, Post, Get, Body, Req,
   HttpCode, HttpStatus, UnauthorizedException, BadRequestException,
   ConflictException,
+  Patch,
+  Delete,
 } from '@nestjs/common';
 import { InjectRepository, TypeOrmModule } from '@nestjs/typeorm';
 import { Repository, LessThan, MoreThan } from 'typeorm';
@@ -323,6 +325,57 @@ export class AuthService {
     };
   }
 
+   // ── PATCH /users/profile ─────────────────────────────────────
+  // Updates name, email, bio, district, state, target_year, prep_level.
+  // Clears user cache so next getMe() returns fresh data.
+  async updateProfile(userId: string, dto: {
+    name?: string; email?: string; bio?: string;
+    district?: string; state?: string; target_year?: number; prep_level?: string;
+  }) {
+    const sets: string[] = [];
+    const vals: any[]    = [];
+    let i = 1;
+
+    if (dto.name?.trim())      { sets.push(`name=$${i++}`);        vals.push(dto.name.trim()); }
+    if (dto.email !== undefined){ sets.push(`email=$${i++}`);       vals.push(dto.email?.trim() || null); }
+    if (dto.bio   !== undefined){ sets.push(`bio=$${i++}`);         vals.push(dto.bio?.trim()   || null); }
+    if (dto.district !== undefined){ sets.push(`district=$${i++}`); vals.push(dto.district?.trim() || null); }
+    if (dto.state !== undefined){ sets.push(`state=$${i++}`);       vals.push(dto.state?.trim()   || null); }
+    if (dto.target_year)        { sets.push(`target_year=$${i++}`); vals.push(dto.target_year); }
+    if (dto.prep_level)         { sets.push(`prep_level=$${i++}`);  vals.push(dto.prep_level); }
+
+    if (!sets.length) throw new BadRequestException('No fields to update');
+
+    sets.push(`updated_at=NOW()`);
+    vals.push(userId);
+
+    await this.db.query(
+      `UPDATE users SET ${sets.join(', ')} WHERE id=$${i} AND deleted_at IS NULL`,
+      vals
+    );
+
+    // Invalidate user cache so next /auth/me returns updated data
+    await this.cache.del(`user:${userId}`);
+    await this.cache.del(`profile:${userId}`);
+
+    // Return fresh user data
+    const user = await this.getMe(userId);
+    return successResponse({ user }, 'Profile updated successfully');
+  }
+
+  // ── DELETE /users/account ─────────────────────────────────────
+  // Soft-delete: sets deleted_at so user cannot log in again.
+  // Hard-deletes happen via a scheduled job after 30 days.
+  async deleteAccount(userId: string) {
+    await this.db.query(
+      `UPDATE users SET deleted_at=NOW(), status='deleted', refresh_token=NULL WHERE id=$1`,
+      [userId]
+    );
+    await this.cache.del(`user:${userId}`);
+    return successResponse(null, 'Account deleted successfully');
+  }
+
+
   async examSelection(userId: string, dto: ExamSelectionDto) {
     await this.db.query(
       `UPDATE users SET primary_exam=$1, secondary_exam=$2, prep_level=$3, target_year=$4, updated_at=NOW() WHERE id=$5`,
@@ -576,6 +629,26 @@ export class AuthController {
     const user = await this.authService.getMe(req.user.id);
     return successResponse({ user });
   }
+
+
+ // ── PATCH /users/profile ─────────────────────────────────────
+ @Patch('users/profile')
+ @UseGuards(JwtAuthGuard)
+ @HttpCode(HttpStatus.OK)
+ async updateProfile(@Req() req: any, @Body() dto: any) {
+   return this.authService.updateProfile(req.user.id, dto);
+ }
+
+ // ── DELETE /users/account ────────────────────────────────────
+ @Delete('users/account')
+ @UseGuards(JwtAuthGuard)
+ @HttpCode(HttpStatus.OK)
+ async deleteAccount(@Req() req: any) {
+   return this.authService.deleteAccount(req.user.id);
+ }
+
+ // ── POST /auth/logout ────────────────────────────────────────
+ // Already has logout() but adding alias for /auth/logout path
 }
 
 // ── Auth Module ───────────────────────────────────────────────

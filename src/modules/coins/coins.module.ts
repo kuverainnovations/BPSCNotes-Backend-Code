@@ -166,11 +166,11 @@ export class CoinsService {
     const streak = checkedInToday ? user.streak : Math.max(0, user.streak - 1);
 
     return successResponse({
-      balance:        user.coins ?? 0,
-      totalEarned:    user.total_coins_earned ?? 0,
-      totalSpent:     totalSpent[0]?.spent ?? 0,
-      checkInStreak:  streak,
-      checkedInToday,
+      balance:           user.coins ?? 0,
+      totalEarned:       user.total_coins_earned ?? 0,
+      totalSpent:        totalSpent[0]?.spent ?? 0,
+      check_in_streak:   streak,        // snake_case → matches Android @SerializedName("check_in_streak")
+      checked_in_today:  checkedInToday,// snake_case → matches Android @SerializedName("checked_in_today")
       checkInDays,
     });
   }
@@ -266,11 +266,11 @@ export class CoinsService {
         SELECT coins, total_coins_earned, streak FROM users WHERE id=$1
       `, [userId]);
       return successResponse({
-        balance:       user.coins,
-        totalEarned:   user.total_coins_earned,
-        checkInStreak: user.streak,
-        checkedInToday: true,
-        alreadyCheckedIn: true,
+        balance:           user.coins,
+        totalEarned:       user.total_coins_earned,
+        check_in_streak:   user.streak,
+        checked_in_today:  true,
+        alreadyCheckedIn:  true,
       }, 'Already checked in today! Come back tomorrow.');
     }
 
@@ -315,9 +315,9 @@ export class CoinsService {
 
     return successResponse({
       balance,
-      totalEarned:    updated.total_coins_earned,
-      checkInStreak:  newStreak,
-      checkedInToday: true,
+      totalEarned:       updated.total_coins_earned,
+      check_in_streak:   newStreak,   // snake_case → Android @SerializedName("check_in_streak")
+      checked_in_today:  true,        // snake_case → Android @SerializedName("checked_in_today")
       coinsEarned,
     }, message);
   }
@@ -371,11 +371,11 @@ export class CoinsController {
 
   /** GET /coins/balance */
   @Get('balance')
-  getBalance(@Req() r: any) { return this.svc.getBalance(r.user.userId); }
+  getBalance(@Req() r: any) { return this.svc.getBalance(r.user.id); }
 
   /** GET /coins/tasks */
   @Get('tasks')
-  getTasks(@Req() r: any) { return this.svc.getEarnTasks(r.user.userId); }
+  getTasks(@Req() r: any) { return this.svc.getEarnTasks(r.user.id); }
 
   /** GET /coins/transactions?page=1&limit=20 */
   @Get('transactions')
@@ -383,18 +383,18 @@ export class CoinsController {
     @Req() r: any,
     @Query('limit') limit = 20,
     @Query('page')  page  = 1
-  ) { return this.svc.getTransactions(r.user.userId, +limit, +page); }
+  ) { return this.svc.getTransactions(r.user.id, +limit, +page); }
 
   /** POST /coins/check-in */
   @Post('check-in')
   @HttpCode(HttpStatus.OK)
-  checkIn(@Req() r: any) { return this.svc.checkIn(r.user.userId); }
+  checkIn(@Req() r: any) { return this.svc.checkIn(r.user.id); }
 
   /** POST /coins/tasks/:id/claim */
   @Post('tasks/:id/claim')
   @HttpCode(HttpStatus.OK)
   claimTask(@Param('id') id: string, @Req() r: any) {
-    return this.svc.claimTask(id, r.user.userId);
+    return this.svc.claimTask(id, r.user.id);
   }
 }
 

@@ -24,7 +24,6 @@ import { successResponse, paginationMeta } from '../../common/utils/response.uti
 import { TierNotificationsService } from './tier-notifications.service';
 import { TierRoomsGateway }       from './tier-rooms.gateway';
 import { AntiCheatService }       from './anti-cheat.service';
-import { JwtModule } from '@nestjs/jwt';
 
 // ============================================================
 // TIER ROOMS SERVICE
@@ -32,7 +31,6 @@ import { JwtModule } from '@nestjs/jwt';
 @Injectable()
 export class TierRoomsService {
   private readonly logger = new Logger(TierRoomsService.name);
-  authService: any;
 
   constructor(
     @InjectDataSource() private readonly db: DataSource,
@@ -214,80 +212,6 @@ export class TierRoomsService {
       [userId, silver[0].id]
     );
     await this.db.query(`UPDATE users SET room_tier_id=$1 WHERE id=$2`, [silver[0].id, userId]);
-  }
-
-  // ── User self-promotion: called when user meets all requirements ──
-  // Instead of waiting for midnight cron, user can claim immediately.
-  async claimPromotion(userId: string) {
-    // Verify user meets ALL requirements for next tier
-    const rules = await this.db.query(`
-      SELECT tpr.*, ft.tier_key AS from_key, tt.id AS to_tier_id, tt.tier_key AS to_key,
-             tt.name AS to_name, tt.icon_emoji AS to_emoji
-      FROM user_room_tier urt
-      JOIN tier_progression_rules tpr ON tpr.from_tier_id = urt.current_tier_id AND tpr.is_active=TRUE
-      JOIN room_tiers ft ON ft.id = urt.current_tier_id
-      JOIN room_tiers tt ON tt.id = tpr.to_tier_id
-      WHERE urt.user_id = $1
-    `, [userId]);
-
-    if (!rules.length) {
-      return { success: false, message: 'You are already at the maximum tier (Diamond).' };
-    }
-    const rule = rules[0];
-
-    // Get user stats
-    const userRows = await this.db.query(`
-      SELECT u.total_study_minutes, u.streak, u.quizzes_attempted, u.accuracy
-      FROM users u WHERE u.id=$1
-    `, [userId]);
-    if (!userRows.length) throw new Error('User not found');
-    const u = userRows[0];
-    const totalHours = (u.total_study_minutes || 0) / 60;
-
-    // Check all conditions
-    const fails: string[] = [];
-    if (+rule.min_total_study_hours > 0 && totalHours < +rule.min_total_study_hours)
-      fails.push(`Study ${rule.min_total_study_hours}h (you have ${totalHours.toFixed(1)}h)`);
-    if (+rule.min_streak_days > 0 && (u.streak||0) < +rule.min_streak_days)
-      fails.push(`${rule.min_streak_days}-day streak (you have ${u.streak||0})`);
-    if (+rule.min_quizzes_completed > 0 && (u.quizzes_attempted||0) < +rule.min_quizzes_completed)
-      fails.push(`${rule.min_quizzes_completed} quizzes (you have ${u.quizzes_attempted||0})`);
-    if (+rule.min_accuracy_pct > 0 && +(u.accuracy||0) < +rule.min_accuracy_pct)
-      fails.push(`${rule.min_accuracy_pct}% accuracy (you have ${u.accuracy||0}%)`);
-
-    if (fails.length > 0) {
-      return {
-        success: false,
-        message: 'Requirements not fully met yet.',
-        missing: fails,
-      };
-    }
-
-    // All conditions met → promote immediately
-    await this.db.query(`
-      UPDATE user_room_tier
-      SET current_tier_id    = $1,
-          previous_tier_id   = $2,
-          promoted_at        = NOW(),
-          tier_joined_at     = NOW(),
-          next_tier_progress = 0.0000,
-          demotion_grace_until = NOW() + INTERVAL '3 days',
-          updated_at         = NOW()
-      WHERE user_id = $3
-    `, [rule.to_tier_id, rules[0].from_tier_id ? await this.db.query(`SELECT current_tier_id FROM user_room_tier WHERE user_id=$1`, [userId]).then(r => r[0]?.current_tier_id) : null, userId]);
-
-    await this.db.query(`UPDATE users SET room_tier_id=$1 WHERE id=$2`, [rule.to_tier_id, userId]);
-    await this.authService.awardCoins(userId, 'tier_promotion', rule.to_tier_id);
-    await this.cache.del(`user_tier:${userId}`);
-    await this.cache.del('tier_rooms:all');
-
-    return {
-      success:  true,
-      message:  `🎉 Promoted to ${rule.to_emoji} ${rule.to_name}!`,
-      newTierKey: rule.to_key,
-      newTierName: rule.to_name,
-      newTierEmoji: rule.to_emoji,
-    };
   }
 
   async adminFindAllTiers() {
@@ -608,8 +532,58 @@ export class StudySessionsService {
       SET ended_at=NOW(), duration_minutes=$1, coins_earned=coins_earned+$2
       WHERE id=$3
     `, [durationMins, bonusCoins, sessionId]);
-    await this.db.query(`UPDATE users SET last_active_at=NOW() WHERE id=$1`, [userId]);
+    // ── Update streak + last_study_date ─────────────────────────
+    // Only count study days with at least 1 active minute to prevent
+    // AFK-only sessions from counting as a study day.
+    if (s.active_minutes >= 1) {
+      const todayUTC = new Date().toISOString().slice(0, 10);
+      const [lastStudy] = await this.db.query(
+        `SELECT last_study_date FROM users WHERE id=$1`, [userId]
+      );
+      const lastDate = lastStudy?.last_study_date
+        ? new Date(lastStudy.last_study_date).toISOString().slice(0, 10)
+        : null;
+      const yesterdayUTC = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
+
+      // Streak logic:
+      // - Same day as last study → keep current streak (no double-count)
+      // - Yesterday → increment streak
+      // - Anything else (gap) → reset to 1
+      let streakSql = '';
+      if (lastDate === todayUTC) {
+        // Already counted today — only update last_active_at
+        streakSql = `
+          UPDATE users SET last_active_at=NOW(), last_study_date=CURRENT_DATE WHERE id=$1
+        `;
+      } else if (lastDate === yesterdayUTC) {
+        // Consecutive day — increment streak
+        streakSql = `
+          UPDATE users SET
+            last_active_at=NOW(),
+            last_study_date=CURRENT_DATE,
+            streak = streak + 1,
+            longest_streak = GREATEST(longest_streak, streak + 1)
+          WHERE id=$1
+        `;
+      } else {
+        // Gap or first session ever — reset to 1
+        streakSql = `
+          UPDATE users SET
+            last_active_at=NOW(),
+            last_study_date=CURRENT_DATE,
+            streak = 1,
+            longest_streak = GREATEST(longest_streak, 1)
+          WHERE id=$1
+        `;
+      }
+      await this.db.query(streakSql, [userId]);
+    } else {
+      await this.db.query(`UPDATE users SET last_active_at=NOW() WHERE id=$1`, [userId]);
+    }
+
     await this.cache.del(`user_tier:${userId}`);
+    await this.cache.del(`user:${userId}`);       // invalidate getMe() cache
+    await this.cache.del(`profile:${userId}`);    // invalidate profile cache
 
 
     // ── Anti-cheat: check session end ─────────────────────────────
@@ -696,24 +670,15 @@ export class StudySessionsService {
 @Injectable()
 export class TierRoomsCronService {
   private readonly logger = new Logger(TierRoomsCronService.name);
-  gateway: any;
-  notifService: any;
 
   constructor(
     @InjectDataSource() private readonly db: DataSource,
     @Inject(CACHE_MANAGER) private readonly cache: Cache,
     private readonly authService: AuthService,
     private readonly antiCheat: AntiCheatService,
+    private readonly gateway: TierRoomsGateway,
+    private readonly notifService: TierNotificationsService,
   ) {}
-
-  // Daily 03:00 — delete chat messages older than 24h (keep storage lean)
-  @Cron('0 3 * * *')
-  async cleanupOldChatMessages() {
-    const res = await this.db.query(
-      `DELETE FROM room_messages WHERE created_at < NOW() - INTERVAL '24 hours' RETURNING id`
-    );
-    if (res.length) this.logger.log(`Purged ${res.length} old chat messages`);
-  }
 
   @Cron('*/5 * * * *')
   async closeExpiredSessions() {
@@ -981,7 +946,6 @@ export class TierRoomsController {
   constructor(
     private readonly tiersService:    TierRoomsService,
     private readonly sessionsService: StudySessionsService,
-    private readonly gateway:         TierRoomsGateway,
   ) {}
 
   @Get('tiers')
@@ -1030,27 +994,6 @@ export class TierRoomsController {
   @Get('tiers/at-risk')
   getAtRiskStatus(@Req() r: any) {
     return this.tiersService.getAtRiskStatus(r.user.id);
-  }
-
-  /** GET /rooms/tiers/:tierKey/messages?limit=50 — chat history */
-  @Get('tiers/:tierKey/messages')
-  async getChatHistory(
-    @Param('tierKey') tierKey: string,
-    @Query('limit')   limit: string = '50',
-  ) {
-    const rows = await this.gateway.getChatHistory(tierKey, Math.min(+limit, 100));
-    return successResponse({ messages: rows.reverse() });  // oldest-first for UI
-  }
-
-  /**
-   * POST /rooms/tiers/claim-promotion
-   * User calls this when all requirements are met instead of waiting for midnight cron.
-   * Backend re-verifies requirements before promoting.
-   */
-  @Post('tiers/claim-promotion')
-  @HttpCode(HttpStatus.OK)
-  claimPromotion(@Req() r: any) {
-    return this.tiersService.claimPromotion(r.user.id);
   }
 }
 
@@ -1101,7 +1044,7 @@ export class AdminTierRoomsController {
 // MODULE
 // ============================================================
 @Module({
-  imports: [ScheduleModule.forRoot(), AuthModule,JwtModule],
+  imports: [ScheduleModule.forRoot(), AuthModule],
   controllers: [TierRoomsController, AdminTierRoomsController],
   providers: [
     TierRoomsService,
