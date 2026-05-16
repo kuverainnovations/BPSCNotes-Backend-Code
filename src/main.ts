@@ -1,111 +1,113 @@
 import { NestFactory } from '@nestjs/core';
-import { ValidationPipe, VersioningType, Logger } from '@nestjs/common';
+import { ValidationPipe, Logger } from '@nestjs/common';
 import { SwaggerModule, DocumentBuilder } from '@nestjs/swagger';
 import { ConfigService } from '@nestjs/config';
 import * as helmet from 'helmet';
 import * as compression from 'compression';
 import * as morgan from 'morgan';
-import { AppModule }    from './app.module';
-// import { IoAdapter }    from '@nestjs/platform-socket.io';
-// import { ServerOptions } from 'socket.io';
+import { AppModule } from './app.module';
 
-// Custom IoAdapter that passes CORS config to Socket.IO
-// class CorsIoAdapter extends IoAdapter {
-//   createIOServer(port: number, options?: ServerOptions) {
-//     return super.createIOServer(port, {
-//       ...options,
-//       cors: {
-//         origin: [
-//           'http://localhost:3000',
-//           'https://admin.bpscnotes.in',
-//         ],
-//         credentials: true,
-//       },
-//       pingTimeout:  20000,
-//       pingInterval: 25000,
-//     });
-//   }
-// }
+// ════════════════════════════════════════════════════════════
+// main.ts — Production
+//
+// BUG 5 FIX: REMOVED DOUBLE CORS MIDDLEWARE
+//
+// The previous main.ts had BOTH of these, in this order:
+//
+//   1. app.enableCors({ origin: ['https://admin.bpscnotes.in', ...] })
+//   2. app.use((req, res, next) => {
+//        res.header('Access-Control-Allow-Origin', 'https://admin.bpscnotes.in')
+//        ...
+//      })
+//
+// Why this breaks CORS intermittently:
+//
+//   app.enableCors() works correctly for the first pass — it reads the
+//   incoming `Origin` header and echoes it back if it's in the allowed list.
+//   Example: request from admin.bpscnotes.in gets:
+//     Access-Control-Allow-Origin: https://admin.bpscnotes.in  ← correct
+//
+//   Then app.use() runs AFTER enableCors and OVERWRITES the header:
+//     Access-Control-Allow-Origin: https://admin.bpscnotes.in  ← same value, OK for admin
+//
+//   But for preflight OPTIONS requests from the browser:
+//     enableCors() handles OPTIONS and calls next() with preflightContinue:false
+//     THEN app.use() intercepts it AGAIN and sends sendStatus(204) a second time
+//     → double response → nginx sees malformed response → 502/503 intermittently
+//
+//   For any origin that isn't exactly 'https://admin.bpscnotes.in':
+//     enableCors() correctly echoes the allowed origin
+//     app.use() overwrites it with 'https://admin.bpscnotes.in' (hardcoded)
+//     → CORS header is wrong → browser blocks the request
+//
+// FIX: Use ONLY app.enableCors() with function-form origin validator.
+//      Delete the manual app.use() CORS block entirely.
+//      Nginx adds ZERO CORS headers (see proxy_params.conf).
+// ════════════════════════════════════════════════════════════
 
 async function bootstrap() {
   const logger = new Logger('Bootstrap');
 
   const app = await NestFactory.create(AppModule, {
-    logger: ['error', 'warn', 'log', 'debug'],
+    logger: ['error', 'warn', 'log'],
     bufferLogs: true,
   });
 
   const config = app.get(ConfigService);
 
-  const port      = config.get<number>('app.port', 5000);
-  const prefix    = config.get<string>('app.apiPrefix', 'api/v1');
-  const env       = config.get<string>('app.env', 'development');
-  const appUrl    = config.get<string>('app.url', 'http://localhost:5000');
+  const port   = config.get<number>('app.port', 5000);
+  const prefix = config.get<string>('app.apiPrefix', 'api/v1');
+  const env    = config.get<string>('app.env', 'development');
+  const appUrl = config.get<string>('app.url', 'http://localhost:5000');
 
-  // ── Security ──────────────────────────────────────────────
+  // ── Security ───────────────────────────────────────────────
   app.use(
     helmet.default({
-      contentSecurityPolicy: false,
+      contentSecurityPolicy:     false,
       crossOriginEmbedderPolicy: false,
       crossOriginResourcePolicy: false,
     }),
   );
 
-  // ── CORS ───────────────────────────────────────────────
+  // ── CORS — single source of truth, function-form origin ───
+  // FIX BUG 5: Only this block. No manual app.use() after this.
   app.enableCors({
-    origin: [
-      'https://admin.bpscnotes.in',
-      'https://api.bpscnotes.in',
-      'http://localhost:3000',
-    ],
-    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-    allowedHeaders: [
-      'Content-Type',
-      'Authorization',
-      'Accept',
-      'Origin',
-      'X-Requested-With',
-    ],
-    credentials: true,
-    preflightContinue: false,
+    origin: (requestOrigin: string | undefined, callback) => {
+      const allowed = [
+        'https://admin.bpscnotes.in',
+        'https://api.bpscnotes.in',
+        'http://localhost:3000',
+        'http://localhost:3001',
+      ];
+      // No origin = mobile app, Postman, curl → allow
+      if (!requestOrigin || allowed.includes(requestOrigin)) {
+        callback(null, true);
+      } else {
+        callback(new Error(`CORS blocked: ${requestOrigin}`));
+      }
+    },
+    methods:              ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+    allowedHeaders:       ['Content-Type', 'Authorization', 'Accept', 'Origin', 'X-Requested-With'],
+    credentials:          true,
+    preflightContinue:    false,   // NestJS handles OPTIONS, returns 204
     optionsSuccessStatus: 204,
   });
 
+  // ── NO manual app.use() CORS middleware ────────────────────
+  // That was the bug. Deleted.
 
-  app.use((req, res, next) => {
-    res.header('Access-Control-Allow-Origin', 'https://admin.bpscnotes.in')
-    res.header(
-      'Access-Control-Allow-Headers',
-      'Origin, X-Requested-With, Content-Type, Accept, Authorization',
-    )
-    res.header(
-      'Access-Control-Allow-Methods',
-      'GET, POST, PUT, PATCH, DELETE, OPTIONS',
-    )
-  
-    if (req.method === 'OPTIONS') {
-      return res.sendStatus(204)
-    }
-  
-    next()
-  })
-
-  // ── WebSocket adapter ────────────────────────────────────
-  // Must be done before app.listen() and after app.create()
-  // app.useWebSocketAdapter(new CorsIoAdapter(app));
-
-  // ── Compression ───────────────────────────────────────────
+  // ── Compression ────────────────────────────────────────────
   app.use(compression());
 
-  // ── HTTP Logging ──────────────────────────────────────────
+  // ── HTTP Logging ───────────────────────────────────────────
   if (env !== 'test') {
-    app.use(morgan(env === 'development' ? 'dev' : 'combined'));
+    app.use(morgan(env === 'production' ? 'combined' : 'dev'));
   }
 
-  // ── Global prefix ─────────────────────────────────────────
+  // ── Global prefix ──────────────────────────────────────────
   app.setGlobalPrefix(prefix);
 
-  // ── Global Validation ─────────────────────────────────────
+  // ── Validation ─────────────────────────────────────────────
   app.useGlobalPipes(
     new ValidationPipe({
       whitelist:            true,
@@ -116,91 +118,38 @@ async function bootstrap() {
     }),
   );
 
-  // ── Swagger API Docs ──────────────────────────────────────
+  // ── Swagger (non-production only) ──────────────────────────
   if (env !== 'production') {
     const swaggerConfig = new DocumentBuilder()
       .setTitle('BPSCNotes API')
-      .setDescription(`
-## BPSCNotes Backend API
-
-**Mobile App APIs** — Authentication, Courses, Quizzes, Library, Current Affairs, Jobs, Subscriptions
-
-**Admin Panel APIs** — All CRUD operations. Changes reflect **instantly** in the mobile app via shared PostgreSQL database.
-
-### Authentication
-- **Mobile users**: \`Authorization: Bearer <accessToken>\`
-- **Admin panel**: \`Authorization: Bearer <adminToken>\`
-
-### How Admin → Mobile Sync Works
-The admin panel and mobile app share the same PostgreSQL database. When an admin creates/updates/publishes any content, it's immediately available in the mobile app on the next API call. No cache invalidation needed for content updates (Redis cache has short TTL).
-      `)
       .setVersion('1.0.0')
       .addBearerAuth({ type: 'http', scheme: 'bearer', bearerFormat: 'JWT' })
       .addServer(appUrl, 'Current Server')
-      .addTag('Auth', 'Mobile authentication — OTP, register, login, refresh, logout')
-      .addTag('Courses', 'Course listing, enrollment, progress tracking')
-      .addTag('Quizzes', 'Daily quizzes, topic tests, mock tests')
-      .addTag('Library', 'E-Library — PDF notes, PYQs, books, video notes')
-      .addTag('Current Affairs', 'Daily current affairs content')
-      .addTag('Jobs', 'Government job vacancies')
-      .addTag('Subscriptions', 'Plans, payments, coupon codes')
-      .addTag('Notifications', 'User notification inbox')
-      .addTag('Coins', 'Coin balance and transaction history')
-      .addTag('Study Rooms', 'Group study room management')
-      .addTag('Users', 'User profile, stats, leaderboard')
-      .addTag('Admin — Auth', 'Admin login')
-      .addTag('Admin — Dashboard', 'Stats, analytics, charts')
-      .addTag('Admin — Users', 'User management — ban, verify, award coins')
-      .addTag('Admin — Courses', 'Course CRUD — reflects in mobile instantly')
-      .addTag('Admin — Settings', 'App settings — maintenance mode, coin value, etc.')
-      .addTag('App Config', 'Public app configuration for mobile')
       .build();
-
     const document = SwaggerModule.createDocument(app, swaggerConfig);
     SwaggerModule.setup('docs', app, document, {
-      swaggerOptions: {
-        persistAuthorization: true,
-        docExpansion: 'none',
-        filter: true,
-      },
-      customSiteTitle: 'BPSCNotes API Docs',
-      customCss: `.swagger-ui .topbar { background: #1565C0 }`,
+      swaggerOptions: { persistAuthorization: true },
     });
-
     logger.log(`📚 Swagger: ${appUrl}/docs`);
   }
 
-  // ── Health endpoint (before global prefix) ────────────────
-  const httpAdapter = app.getHttpAdapter();
-  httpAdapter.get('/health', async (req: any, res: any) => {
+  // ── Health endpoints (registered BEFORE global prefix) ─────
+  const adapter = app.getHttpAdapter();
+  adapter.get('/health', (_req: any, res: any) => {
     res.json({
-      status:    'ok',
-      env,
+      status: 'ok', env,
       version:   process.env.npm_package_version || '1.0.0',
       timestamp: new Date().toISOString(),
       uptime:    process.uptime(),
     });
   });
-
-  httpAdapter.get('/health/ready', async (req: any, res: any) => {
-    // Could add DB ping here
+  adapter.get('/health/ready', (_req: any, res: any) => {
     res.json({ status: 'ready' });
   });
 
-  // ── Start ─────────────────────────────────────────────────
+  // ── Start ──────────────────────────────────────────────────
   await app.listen(port, '0.0.0.0');
-
-  logger.log(`
-  ╔══════════════════════════════════════════════════╗
-  ║        BPSCNotes Backend — Running               ║
-  ║   ${appUrl}${' '.repeat(Math.max(0, 38 - appUrl.length))}║
-  ║   ENV: ${env}${' '.repeat(Math.max(0, 43 - env.length))}║
-  ╚══════════════════════════════════════════════════╝
-
-  🌐 API:    ${appUrl}/${prefix}/
-  📚 Docs:   ${appUrl}/docs
-  ❤️  Health: ${appUrl}/health
-  `);
+  logger.log(`🚀 ${appUrl}/${prefix}/ [${env}]`);
 }
 
 bootstrap().catch(err => {
