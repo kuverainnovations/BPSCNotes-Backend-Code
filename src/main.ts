@@ -43,31 +43,32 @@ async function bootstrap() {
   const appUrl    = config.get<string>('app.url', 'http://localhost:5000');
 
   // ── Security ──────────────────────────────────────────────
-  app.use(helmet.default({
-    contentSecurityPolicy: env === 'production',
-    crossOriginEmbedderPolicy: false,
-  }));
+  app.use(
+    helmet.default({
+      contentSecurityPolicy: false,
+      crossOriginEmbedderPolicy: false,
+      crossOriginResourcePolicy: false,
+    }),
+  );
 
   // ── CORS ───────────────────────────────────────────────
   app.enableCors({
-  origin: (origin, callback) => {
-    const allowedOrigins = [
-      'http://admin.bpscnotes.in',
+    origin: [
       'https://admin.bpscnotes.in',
+      'https://api.bpscnotes.in',
       'http://localhost:3000',
       'http://localhost:5173',
-    ];
-
-    if (!origin || allowedOrigins.includes(origin)) {
-      callback(null, true);
-    } else {
-      callback(null, true); // allow all (safe for now)
-    }
-  },
-  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
-  credentials: true,
-});
+    ],
+    methods: 'GET,HEAD,PUT,PATCH,POST,DELETE,OPTIONS',
+    credentials: true,
+    allowedHeaders: [
+      'Content-Type',
+      'Authorization',
+      'Accept',
+      'Origin',
+      'X-Requested-With',
+    ],
+  });
 
   // ── WebSocket adapter ────────────────────────────────────
   // Must be done before app.listen() and after app.create()
