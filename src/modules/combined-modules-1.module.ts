@@ -675,4 +675,4 @@ class AdminCoinsController {
   @Get('top-earners') @RequirePermission('coins') getTopEarners() { return this.s.getTopEarners(); }
 }
 
-//export class CoinsModule {}
+export class CoinsModule {}
