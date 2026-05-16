@@ -20,9 +20,13 @@ import { LibraryModule }     from './modules/library/library.module';
 import { HealthController }  from './health.controller';
 
 import {
-  CurrentAffairsModule, JobsModule, SubscriptionsModule,
-  NotificationsModule, CoinsModule,
+  CurrentAffairsModule,
+  JobsModule,
+  SubscriptionsModule,
+  NotificationsModule,
 } from './modules/combined-modules-1.module';
+
+import { CoinsModule } from './modules/coins/coins.module';
 
 import {
   StudyRoomsModule, UsersModule, BannersModule, ExamsModule, DailyTargetsModule,
