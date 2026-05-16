@@ -57,10 +57,8 @@ async function bootstrap() {
       'https://admin.bpscnotes.in',
       'https://api.bpscnotes.in',
       'http://localhost:3000',
-      'http://localhost:5173',
     ],
-    methods: 'GET,HEAD,PUT,PATCH,POST,DELETE,OPTIONS',
-    credentials: true,
+    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
     allowedHeaders: [
       'Content-Type',
       'Authorization',
@@ -68,7 +66,29 @@ async function bootstrap() {
       'Origin',
       'X-Requested-With',
     ],
+    credentials: true,
+    preflightContinue: false,
+    optionsSuccessStatus: 204,
   });
+
+
+  app.use((req, res, next) => {
+    res.header('Access-Control-Allow-Origin', 'https://admin.bpscnotes.in')
+    res.header(
+      'Access-Control-Allow-Headers',
+      'Origin, X-Requested-With, Content-Type, Accept, Authorization',
+    )
+    res.header(
+      'Access-Control-Allow-Methods',
+      'GET, POST, PUT, PATCH, DELETE, OPTIONS',
+    )
+  
+    if (req.method === 'OPTIONS') {
+      return res.sendStatus(204)
+    }
+  
+    next()
+  })
 
   // ── WebSocket adapter ────────────────────────────────────
   // Must be done before app.listen() and after app.create()
