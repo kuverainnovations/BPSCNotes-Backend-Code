@@ -59,36 +59,53 @@ export class JwtAuthGuard extends AuthGuard('jwt') {
 
 // ── Admin JWT Guard ───────────────────────────────────────────
 // Applied per-controller on admin routes
+// @Injectable()
+// export class AdminJwtGuard extends AuthGuard('admin-jwt') {
+
+//   async canActivate(context: ExecutionContext) {
+//     const result = await super.canActivate(context);
+
+//     const request = context.switchToHttp().getRequest();
+
+//     // 🔍 DEBUG LOGS
+//     console.log('🔐 AdminJwtGuard HIT');
+//     console.log('👉 request.user:', request.user);
+
+//     const admin = request.user; // Passport puts decoded + validated user here
+
+//     if (!admin) {
+//       console.log('❌ No admin found on request');
+//       throw new UnauthorizedException('Admin authentication required');
+//     }
+
+//     if (admin.status !== 'active') {
+//       console.log('❌ Admin inactive:', admin);
+//       throw new ForbiddenException('Admin account is inactive');
+//     }
+
+//     // ✅ Normalize for your app
+//     request.admin = admin;
+
+//     console.log('✅ request.admin set:', request.admin);
+
+//     return true;
+//   }
+// }
+
+
 @Injectable()
 export class AdminJwtGuard extends AuthGuard('admin-jwt') {
 
   async canActivate(context: ExecutionContext) {
-    const result = await super.canActivate(context);
+    const result = await super.canActivate(context)
+    const request = context.switchToHttp().getRequest()
+    const admin   = request.user
 
-    const request = context.switchToHttp().getRequest();
+    if (!admin) throw new UnauthorizedException('Admin authentication required')
+    if (admin.status !== 'active') throw new ForbiddenException('Admin account is inactive')
 
-    // 🔍 DEBUG LOGS
-    console.log('🔐 AdminJwtGuard HIT');
-    console.log('👉 request.user:', request.user);
-
-    const admin = request.user; // Passport puts decoded + validated user here
-
-    if (!admin) {
-      console.log('❌ No admin found on request');
-      throw new UnauthorizedException('Admin authentication required');
-    }
-
-    if (admin.status !== 'active') {
-      console.log('❌ Admin inactive:', admin);
-      throw new ForbiddenException('Admin account is inactive');
-    }
-
-    // ✅ Normalize for your app
-    request.admin = admin;
-
-    console.log('✅ request.admin set:', request.admin);
-
-    return true;
+    request.admin = admin
+    return true
   }
 }
 
