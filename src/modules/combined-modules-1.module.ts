@@ -17,7 +17,6 @@ import { JwtAuthGuard, AdminJwtGuard, PermissionGuard, RequirePermission, Public
 import { PaginationDto } from '../common/dtos/pagination.dto';
 import { successResponse, paginationMeta } from '../common/utils/response.util';
 import { AuthService } from './auth/auth.module';
-import { CoinsModule } from './coins/coins.module';
 
 // ════════════════════════════════════════════════════════════
 // CURRENT AFFAIRS MODULE
@@ -660,31 +659,12 @@ class CoinsController {
   constructor(private s: CoinsService) {}
   @Get('balance') getBalance(@Req() r: any) { return this.s.getBalance(r.user.id); }
   @Get('history') getHistory(@Query() q: any, @Req() r: any) { return this.s.getHistory(r.user.id, q); }
-  @Get('tasks')
-getTasks() {
-  return successResponse({
-    tasks: []
-  });
+  
 }
-
-@Get('transactions')
-getTransactions(@Query() q: any, @Req() r: any) {
-  return this.s.getHistory(r.user.id, q);
-}
-}
-
 
 
 @Module({ imports:[ConfigModule], controllers:[CoinsController, AdminCoinsController], providers:[CoinsService] })
 
-@Module({
-  imports: [
-    CoinsModule
-  ],
-  exports: [
-    CoinsModule
-  ]
-})
 
 @ApiTags('Admin — Coins') @ApiBearerAuth() @Public()
 @UseGuards(AdminJwtGuard, PermissionGuard) @Controller('admin/coins')
@@ -694,3 +674,5 @@ class AdminCoinsController {
   @Put('rules/:id') @RequirePermission('coins') updateRule(@Param('id', ParseUUIDPipe) id: string, @Body() dto: any) { return this.s.updateRule(id, dto); }
   @Get('top-earners') @RequirePermission('coins') getTopEarners() { return this.s.getTopEarners(); }
 }
+
+//export class CoinsModule {}
