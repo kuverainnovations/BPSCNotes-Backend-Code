@@ -371,11 +371,11 @@ export class CoinsController {
 
   /** GET /coins/balance */
   @Get('balance')
-  getBalance(@Req() r: any) { return this.svc.getBalance(r.user.id); }
+  getBalance(@Req() r: any) { return this.svc.getBalance(r.user.userId); }
 
   /** GET /coins/tasks */
   @Get('tasks')
-  getTasks(@Req() r: any) { return this.svc.getEarnTasks(r.user.id); }
+  getTasks(@Req() r: any) { return this.svc.getEarnTasks(r.user.userId); }
 
   /** GET /coins/transactions?page=1&limit=20 */
   @Get('transactions')
@@ -383,18 +383,18 @@ export class CoinsController {
     @Req() r: any,
     @Query('limit') limit = 20,
     @Query('page')  page  = 1
-  ) { return this.svc.getTransactions(r.user.id, +limit, +page); }
+  ) { return this.svc.getTransactions(r.user.userId, +limit, +page); }
 
   /** POST /coins/check-in */
   @Post('check-in')
   @HttpCode(HttpStatus.OK)
-  checkIn(@Req() r: any) { return this.svc.checkIn(r.user.id); }
+  checkIn(@Req() r: any) { return this.svc.checkIn(r.user.userId); }
 
   /** POST /coins/tasks/:id/claim */
   @Post('tasks/:id/claim')
   @HttpCode(HttpStatus.OK)
   claimTask(@Param('id') id: string, @Req() r: any) {
-    return this.svc.claimTask(id, r.user.id);
+    return this.svc.claimTask(id, r.user.userId);
   }
 }
 
