@@ -624,38 +624,38 @@ export class InitialSchema1700000000000 implements MigrationInterface {
     // ═══════════════════════════════════════════════════════════
     // INDEXES — Critical for performance
     // ═══════════════════════════════════════════════════════════
-    await queryRunner.query(`CREATE INDEX CONCURRENTLY idx_users_mobile       ON users(mobile)`);
-    await queryRunner.query(`CREATE INDEX CONCURRENTLY idx_users_exam         ON users(primary_exam)`);
-    await queryRunner.query(`CREATE INDEX CONCURRENTLY idx_users_status       ON users(status)`);
-    await queryRunner.query(`CREATE INDEX CONCURRENTLY idx_users_last_active  ON users(last_active_at DESC)`);
-    await queryRunner.query(`CREATE INDEX CONCURRENTLY idx_users_rank         ON users(rank ASC NULLS LAST)`);
-    await queryRunner.query(`CREATE INDEX CONCURRENTLY idx_otps_mobile        ON otps(mobile, is_used)`);
-    await queryRunner.query(`CREATE INDEX CONCURRENTLY idx_courses_status     ON courses(status)`);
-    await queryRunner.query(`CREATE INDEX CONCURRENTLY idx_courses_subject    ON courses(subject)`);
-    await queryRunner.query(`CREATE INDEX CONCURRENTLY idx_courses_exam_tags  ON courses USING gin(exam_tags)`);
-    await queryRunner.query(`CREATE INDEX CONCURRENTLY idx_library_status     ON library_notes(status)`);
-    await queryRunner.query(`CREATE INDEX CONCURRENTLY idx_library_type       ON library_notes(type)`);
-    await queryRunner.query(`CREATE INDEX CONCURRENTLY idx_library_exam_tags  ON library_notes USING gin(exam_tags)`);
-    await queryRunner.query(`CREATE INDEX CONCURRENTLY idx_quizzes_type       ON quizzes(type, status)`);
-    await queryRunner.query(`CREATE INDEX CONCURRENTLY idx_quizzes_scheduled  ON quizzes(scheduled_for)`);
-    await queryRunner.query(`CREATE INDEX CONCURRENTLY idx_affairs_date       ON current_affairs(date DESC, status)`);
-    await queryRunner.query(`CREATE INDEX CONCURRENTLY idx_affairs_category   ON current_affairs(category)`);
-    await queryRunner.query(`CREATE INDEX CONCURRENTLY idx_jobs_status        ON job_vacancies(status, last_date)`);
-    await queryRunner.query(`CREATE INDEX CONCURRENTLY idx_subs_user          ON subscriptions(user_id, status)`);
-    await queryRunner.query(`CREATE INDEX CONCURRENTLY idx_subs_ends_at       ON subscriptions(ends_at)`);
-    await queryRunner.query(`CREATE INDEX CONCURRENTLY idx_coin_txns_user     ON coin_transactions(user_id, created_at DESC)`);
-    await queryRunner.query(`CREATE INDEX CONCURRENTLY idx_notifs_user        ON user_notifications(user_id, is_read, created_at DESC)`);
-    await queryRunner.query(`CREATE INDEX CONCURRENTLY idx_enrollments_user   ON user_enrollments(user_id, status)`);
-    await queryRunner.query(`CREATE INDEX CONCURRENTLY idx_attempts_user      ON quiz_attempts(user_id, attempted_at DESC)`);
-    await queryRunner.query(`CREATE INDEX CONCURRENTLY idx_rooms_status       ON study_rooms(status)`);
-    await queryRunner.query(`CREATE INDEX CONCURRENTLY idx_banners_active     ON banners(is_active, sort_order)`);
-    await queryRunner.query(`CREATE INDEX CONCURRENTLY idx_live_classes_sched ON live_classes(scheduled_at, status)`);
+    await queryRunner.query(`CREATE INDEX idx_users_mobile       ON users(mobile)`);
+    await queryRunner.query(`CREATE INDEX idx_users_exam         ON users(primary_exam)`);
+    await queryRunner.query(`CREATE INDEX idx_users_status       ON users(status)`);
+    await queryRunner.query(`CREATE INDEX idx_users_last_active  ON users(last_active_at DESC)`);
+    await queryRunner.query(`CREATE INDEX idx_users_rank         ON users(rank ASC NULLS LAST)`);
+    await queryRunner.query(`CREATE INDEX idx_otps_mobile        ON otps(mobile, is_used)`);
+    await queryRunner.query(`CREATE INDEX idx_courses_status     ON courses(status)`);
+    await queryRunner.query(`CREATE INDEX idx_courses_subject    ON courses(subject)`);
+    await queryRunner.query(`CREATE INDEX idx_courses_exam_tags  ON courses USING gin(exam_tags)`);
+    await queryRunner.query(`CREATE INDEX idx_library_status     ON library_notes(status)`);
+    await queryRunner.query(`CREATE INDEX idx_library_type       ON library_notes(type)`);
+    await queryRunner.query(`CREATE INDEX idx_library_exam_tags  ON library_notes USING gin(exam_tags)`);
+    await queryRunner.query(`CREATE INDEX idx_quizzes_type       ON quizzes(type, status)`);
+    await queryRunner.query(`CREATE INDEX idx_quizzes_scheduled  ON quizzes(scheduled_for)`);
+    await queryRunner.query(`CREATE INDEX idx_affairs_date       ON current_affairs(date DESC, status)`);
+    await queryRunner.query(`CREATE INDEX idx_affairs_category   ON current_affairs(category)`);
+    await queryRunner.query(`CREATE INDEX idx_jobs_status        ON job_vacancies(status, last_date)`);
+    await queryRunner.query(`CREATE INDEX idx_subs_user          ON subscriptions(user_id, status)`);
+    await queryRunner.query(`CREATE INDEX idx_subs_ends_at       ON subscriptions(ends_at)`);
+    await queryRunner.query(`CREATE INDEX idx_coin_txns_user     ON coin_transactions(user_id, created_at DESC)`);
+    await queryRunner.query(`CREATE INDEX idx_notifs_user        ON user_notifications(user_id, is_read, created_at DESC)`);
+    await queryRunner.query(`CREATE INDEX idx_enrollments_user   ON user_enrollments(user_id, status)`);
+    await queryRunner.query(`CREATE INDEX idx_attempts_user      ON quiz_attempts(user_id, attempted_at DESC)`);
+    await queryRunner.query(`CREATE INDEX idx_rooms_status       ON study_rooms(status)`);
+    await queryRunner.query(`CREATE INDEX idx_banners_active     ON banners(is_active, sort_order)`);
+    await queryRunner.query(`CREATE INDEX idx_live_classes_sched ON live_classes(scheduled_at, status)`);
 
     // Full-text search indexes
-    await queryRunner.query(`CREATE INDEX CONCURRENTLY idx_courses_fts   ON courses USING gin(to_tsvector('english', title || ' ' || COALESCE(description,'')))`);
-    await queryRunner.query(`CREATE INDEX CONCURRENTLY idx_affairs_fts   ON current_affairs USING gin(to_tsvector('english', title || ' ' || summary))`);
-    await queryRunner.query(`CREATE INDEX CONCURRENTLY idx_library_fts   ON library_notes USING gin(to_tsvector('english', title || ' ' || COALESCE(description,'')))`);
-    await queryRunner.query(`CREATE INDEX CONCURRENTLY idx_library_tags  ON library_notes USING gin(tags)`);
+    await queryRunner.query(`CREATE INDEX idx_courses_fts   ON courses USING gin(to_tsvector('english', title || ' ' || COALESCE(description,'')))`);
+    await queryRunner.query(`CREATE INDEX idx_affairs_fts   ON current_affairs USING gin(to_tsvector('english', title || ' ' || summary))`);
+    await queryRunner.query(`CREATE INDEX idx_library_fts   ON library_notes USING gin(to_tsvector('english', title || ' ' || COALESCE(description,'')))`);
+    await queryRunner.query(`CREATE INDEX idx_library_tags  ON library_notes USING gin(tags)`);
   }
 
   public async down(queryRunner: QueryRunner): Promise<void> {
