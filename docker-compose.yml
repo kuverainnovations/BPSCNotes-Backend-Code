@@ -161,7 +161,7 @@ services:
       # BUG FIX 4: use named volumes shared with certbot — not bind mounts.
       # Previously nginx used bind mount ./nginx/html but certbot used
       # named volume nginx-html for the same path — they never shared files.
-      - letsencrypt-data:/etc/letsencrypt:ro   # read certs written by certbot
+      - /etc/letsencrypt:/etc/letsencrypt:ro   # read certs written by certbot
       - certbot-webroot:/var/www/certbot:ro     # serve ACME challenges written by certbot
       - ./nginx/logs:/var/log/nginx
     depends_on:
@@ -187,7 +187,7 @@ services:
     restart: unless-stopped
     volumes:
       # BUG FIX 4 (continued): certbot WRITES here — no :ro
-      - letsencrypt-data:/etc/letsencrypt
+      - /etc/letsencrypt:/etc/letsencrypt
       - certbot-webroot:/var/www/certbot
     entrypoint: >
       /bin/sh -c '
