@@ -112,7 +112,6 @@ import { StudyMaterialsModule } from '@modules/study-materials/study-materials.m
     JobsModule,
     SubscriptionsModule,
     NotificationsModule,
-    CoinsModule,
     StudyRoomsModule,
     UsersModule,
     BannersModule,

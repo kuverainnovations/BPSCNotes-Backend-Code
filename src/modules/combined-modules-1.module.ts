@@ -17,6 +17,7 @@ import { JwtAuthGuard, AdminJwtGuard, PermissionGuard, RequirePermission, Public
 import { PaginationDto } from '../common/dtos/pagination.dto';
 import { successResponse, paginationMeta } from '../common/utils/response.util';
 import { AuthService } from './auth/auth.module';
+import { CoinsModule } from './coins/coins.module';
 
 // ════════════════════════════════════════════════════════════
 // CURRENT AFFAIRS MODULE
@@ -672,6 +673,19 @@ getTransactions(@Query() q: any, @Req() r: any) {
 }
 }
 
+
+
+@Module({ imports:[ConfigModule], controllers:[CoinsController, AdminCoinsController], providers:[CoinsService] })
+
+@Module({
+  imports: [
+    CoinsModule
+  ],
+  exports: [
+    CoinsModule
+  ]
+})
+
 @ApiTags('Admin — Coins') @ApiBearerAuth() @Public()
 @UseGuards(AdminJwtGuard, PermissionGuard) @Controller('admin/coins')
 class AdminCoinsController {
@@ -680,6 +694,3 @@ class AdminCoinsController {
   @Put('rules/:id') @RequirePermission('coins') updateRule(@Param('id', ParseUUIDPipe) id: string, @Body() dto: any) { return this.s.updateRule(id, dto); }
   @Get('top-earners') @RequirePermission('coins') getTopEarners() { return this.s.getTopEarners(); }
 }
-
-@Module({ imports:[ConfigModule], controllers:[CoinsController, AdminCoinsController], providers:[CoinsService] })
-export class CoinsModule {}
