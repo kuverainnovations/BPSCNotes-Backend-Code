@@ -659,6 +659,17 @@ class CoinsController {
   constructor(private s: CoinsService) {}
   @Get('balance') getBalance(@Req() r: any) { return this.s.getBalance(r.user.id); }
   @Get('history') getHistory(@Query() q: any, @Req() r: any) { return this.s.getHistory(r.user.id, q); }
+  @Get('tasks')
+getTasks() {
+  return successResponse({
+    tasks: []
+  });
+}
+
+@Get('transactions')
+getTransactions(@Query() q: any, @Req() r: any) {
+  return this.s.getHistory(r.user.id, q);
+}
 }
 
 @ApiTags('Admin — Coins') @ApiBearerAuth() @Public()
