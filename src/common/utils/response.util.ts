@@ -32,14 +32,32 @@ export function successResponse<T>(
   };
 }
 
-export function paginationMeta(total: number, page: number, limit: number): PaginationMeta {
-  const totalPages = Math.ceil(total / limit);
+// export function paginationMeta(total: number, page: number, limit: number): PaginationMeta {
+//   const totalPages = Math.ceil(total / limit);
+//   return {
+//     total,
+//     page,
+//     limit,
+//     totalPages,
+//     hasNext: page < totalPages,
+//     hasPrev: page > 1,
+//   };
+// }
+
+export const paginationMeta = (
+  total: number,
+  page: number | string,
+  limit: number | string,
+) => {
+  const pageNum = Number(page);
+  const limitNum = Number(limit);
+
   return {
     total,
-    page,
-    limit,
-    totalPages,
-    hasNext: page < totalPages,
-    hasPrev: page > 1,
+    page: pageNum,
+    limit: limitNum,
+    totalPages: Math.ceil(total / limitNum),
+    hasNext: pageNum < Math.ceil(total / limitNum),
+    hasPrev: pageNum > 1,
   };
-}
+};
