@@ -90,22 +90,7 @@ export class CoursesRepository {
 
     const where = conditions.join(' AND ');
     const userSubQuery = userId
-      ? `, (
-          SELECT json_build_object(
-            'id',              ue.id,
-            'status',          ue.status,
-            'completed_lessons', ue.completed_lessons,
-            'total_minutes',   ue.total_minutes,
-            'studied_minutes', ue.studied_minutes,
-            'last_studied_at', ue.last_studied_at,
-            'enrolled_at',     ue.enrolled_at,
-            'completed_at',    ue.completed_at,
-            'last_lesson_id',  ue.last_lesson_id
-          )
-          FROM user_enrollments ue
-          WHERE ue.course_id = c.id AND ue.user_id = $${params.length + 1}
-          LIMIT 1
-        ) AS enrollment`
+      ? `, (SELECT TRUE FROM user_enrollments ue WHERE ue.course_id = c.id AND ue.user_id = $${params.length + 1}) AS is_enrolled`
       : '';
     if (userId) params.push(userId);
 
@@ -114,7 +99,8 @@ export class CoursesRepository {
         `SELECT c.id, c.title, c.instructor, c.subject, c.price, c.original_price, c.is_paid,
                 c.is_featured, c.is_limited_offer, c.offer_ends_at, c.thumbnail_url, c.total_lessons,
                 c.total_hours, c.rating, c.review_count, c.enrollment_count, c.bpsc_relevance,
-                c.exam_tags, c.language, c.status, c.created_at, c.trial_lesson_title${userSubQuery}
+                c.exam_tags, c.language, c.status, c.created_at, c.trial_lesson_title,
+                c.what_you_learn, c.has_certificate, c.instructor_students, c.instructor_courses${userSubQuery}
          FROM courses c
          WHERE ${where}
          ORDER BY c.is_featured DESC, c.enrollment_count DESC, c.created_at DESC
@@ -129,8 +115,35 @@ export class CoursesRepository {
 
   async findOneById(courseId: string, userId?: string) {
     const result = await this.db.query(
-      `SELECT c.*,
-         ${userId ? `(SELECT row_to_json(ue) FROM user_enrollments ue WHERE ue.user_id = $2 AND ue.course_id = c.id LIMIT 1) AS enrollment,` : ''}
+      `SELECT
+         c.id, c.title, c.slug, c.description, c.instructor, c.instructor_bio,
+         c.instructor_students, c.instructor_courses,
+         c.subject, c.price, c.original_price, c.is_paid, c.is_featured,
+         c.is_limited_offer, c.offer_ends_at, c.thumbnail_url,
+         c.total_lessons, c.total_hours, c.rating, c.review_count,
+         c.enrollment_count, c.bpsc_relevance, c.syllabus_coverage,
+         c.language, c.trial_lesson_title, c.exam_tags, c.status,
+         c.what_you_learn, c.has_certificate,
+         c.created_at, c.updated_at,
+
+         -- Enrollment object with all progress fields
+         ${userId ? `(
+           SELECT json_build_object(
+             'id',               ue.id,
+             'status',           ue.status,
+             'completed_lessons',ue.completed_lessons,
+             'total_minutes',    ue.total_minutes,
+             'studied_minutes',  ue.studied_minutes,
+             'last_studied_at',  ue.last_studied_at,
+             'enrolled_at',      ue.enrolled_at,
+             'completed_at',     ue.completed_at,
+             'last_lesson_id',   ue.last_lesson_id
+           )
+           FROM user_enrollments ue
+           WHERE ue.user_id = $2 AND ue.course_id = c.id LIMIT 1
+         ) AS enrollment,` : ''}
+
+         -- Chapters with lessons + is_completed per user
          (
            SELECT json_agg(
              json_build_object(
@@ -138,25 +151,56 @@ export class CoursesRepository {
                'lessons', (
                  SELECT json_agg(
                    json_build_object(
-                     'id', l.id, 'title', l.title, 'duration_mins', l.duration_mins,
-                     'type', l.type, 'is_free_preview', l.is_free_preview,
-                     'is_locked', l.is_locked, 'sort_order', l.sort_order
+                     'id',             l.id,
+                     'title',          l.title,
+                     'duration_mins',  l.duration_mins,
+                     'type',           l.type,
+                     'is_free_preview',l.is_free_preview,
+                     'is_locked',      l.is_locked,
+                     'sort_order',     l.sort_order,
+                     'is_completed',   ${userId
+                       ? `(SELECT lp.is_completed FROM lesson_progress lp WHERE lp.user_id=$2 AND lp.lesson_id=l.id LIMIT 1)`
+                       : 'FALSE'}
                    ) ORDER BY l.sort_order
                  ) FROM course_lessons l WHERE l.chapter_id = ch.id
                )
              ) ORDER BY ch.sort_order
            ) FROM course_chapters ch WHERE ch.course_id = c.id
          ) AS chapters,
+
+         -- Reviews with full user data
          (
-           SELECT json_agg(row_to_json(r) ORDER BY r.created_at DESC)
-           FROM (
-             SELECT cr.rating, cr.comment, cr.is_verified, cr.created_at,
-                    u.name AS reviewer_name, u.avatar_url
-             FROM course_reviews cr JOIN users u ON cr.user_id = u.id
-             WHERE cr.course_id = c.id LIMIT 10
-           ) r
-         ) AS reviews
-       FROM courses c WHERE c.id = $1 AND c.status = 'published'`,
+           SELECT json_agg(
+             json_build_object(
+               'id',            cr.id,
+               'rating',        cr.rating,
+               'comment',       cr.comment,
+               'is_verified',   cr.is_verified,
+               'created_at',    cr.created_at,
+               'reviewer_name', u.name,
+               'avatar_url',    u.avatar_url
+             ) ORDER BY cr.created_at DESC
+           )
+           FROM course_reviews cr
+           JOIN users u ON cr.user_id = u.id
+           WHERE cr.course_id = c.id
+           LIMIT 20
+         ) AS reviews,
+
+         -- Rating distribution (for the 5★ bar chart)
+         (
+           SELECT json_build_object(
+             '5', COUNT(*) FILTER (WHERE cr.rating = 5),
+             '4', COUNT(*) FILTER (WHERE cr.rating = 4),
+             '3', COUNT(*) FILTER (WHERE cr.rating = 3),
+             '2', COUNT(*) FILTER (WHERE cr.rating = 2),
+             '1', COUNT(*) FILTER (WHERE cr.rating = 1)
+           )
+           FROM course_reviews cr WHERE cr.course_id = c.id
+         ) AS rating_distribution
+
+       FROM courses c
+       WHERE c.id = $1 AND c.status = 'published'`,
       userId ? [courseId, userId] : [courseId]
     );
     return result[0] || null;
@@ -284,9 +328,7 @@ export class CoursesService {
     }
 
     await this.db.query(
-      `INSERT INTO user_enrollments (user_id, course_id, total_minutes)
-       VALUES ($1, $2, COALESCE((SELECT (total_hours * 60)::int FROM courses WHERE id=$2), 0))
-       ON CONFLICT (user_id, course_id) DO NOTHING`,
+      `INSERT INTO user_enrollments (user_id, course_id) VALUES ($1,$2) ON CONFLICT (user_id, course_id) DO NOTHING`,
       [userId, courseId]
     );
     await this.db.query(`UPDATE courses SET enrollment_count = enrollment_count + 1 WHERE id = $1`, [courseId]);
@@ -315,18 +357,9 @@ export class CoursesService {
     const isCompleted  = completedLessons >= totalLessons;
 
     await this.db.query(
-      `UPDATE user_enrollments SET
-         completed_lessons = $1,
-         last_lesson_id    = $2,
-         studied_minutes   = COALESCE((
-           SELECT ROUND(SUM(lp.watch_time_secs) / 60.0)::int
-           FROM lesson_progress lp
-           JOIN course_lessons cl ON lp.lesson_id = cl.id
-           WHERE cl.course_id = $5 AND lp.user_id = $4
-         ), 0),
-         last_studied_at   = NOW(),
-         status = CASE WHEN $1 >= $3 THEN 'completed' ELSE 'active' END
-       WHERE user_id = $4 AND course_id = $5`,
+      `UPDATE user_enrollments SET completed_lessons=$1, last_lesson_id=$2,
+       status = CASE WHEN $1 >= $3 THEN 'completed' ELSE 'active' END
+       WHERE user_id=$4 AND course_id=$5`,
       [completedLessons, lessonId, totalLessons, userId, courseId]
     );
 
