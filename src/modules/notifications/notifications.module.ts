@@ -1,3 +1,4 @@
+
 import {
   Module, Injectable, Controller,
   Get, Post, Param, Query, Req, Body,
@@ -12,23 +13,20 @@ import { successResponse }        from '../../common/utils/response.util';
 // ════════════════════════════════════════════════════════════
 // FILE: backend/src/modules/notifications/notifications.module.ts
 //
-// FIX — Android shows empty list:
-//   The Android app calls GET /api/v1/notifications and reads
-//   response.data.notifications[] (an array).
-//   The old query returned {notifications, total, unread_count}
-//   but the Android DTO expects: {notifications[], unreadCount}.
-//   Key mismatch: "unread_count" (snake_case) vs "unreadCount" (camelCase).
-//   NestJS GlobalInterceptor usually handles camelCase transform,
-//   but this response was built manually via successResponse({})
-//   so the snake_case key bypassed it.
+// ROOT CAUSE OF EMPTY INBOX:
 //
-//   Also: the Android response DTO expects:
-//     data.notifications  (array)
-//     data.unreadCount    (camelCase)
-//     meta.total          (total pages)
+// Admin send() flow:
+//   1. INSERT INTO notifications (global record, no user_id)
+//   2. INSERT INTO user_notifications (per-user inbox rows)
 //
-//   Fix: align response shape to what Android expects AND what
-//   the admin panel already shows (it was displaying correctly).
+// Old GET /notifications query:
+//   SELECT FROM notifications WHERE user_id=$1 OR user_id IS NULL
+//   ← WRONG: `notifications` table has NO `user_id` column.
+//     It has `target_user_id`. The user-specific rows are in
+//     `user_notifications`, not `notifications`.
+//
+// FIX: Query `user_notifications` table (the per-user inbox).
+//      This is what admin send() actually writes to.
 // ════════════════════════════════════════════════════════════
 
 @Injectable()
@@ -39,25 +37,33 @@ export class NotificationsService {
 
   async getForUser(userId: string, page: number, limit: number) {
     const offset = (page - 1) * limit;
+
+    // FIX: Query user_notifications (per-user inbox rows that admin send() creates).
+    // The `notifications` table is the global admin record — user_notifications is the inbox.
     const [rows, countRow] = await Promise.all([
       this.db.query(`
-        SELECT id, title, body, type, data, created_at
-        FROM notifications
-        WHERE target_user_id = $1
-           OR target = 'all'
-           OR target_user_id IS NULL
-        ORDER BY created_at DESC
+        SELECT
+          un.id,
+          un.title,
+          un.body,
+          COALESCE(un.type, n.type, 'system') AS type,
+          un.is_read,
+          COALESCE(n.data, '{}') AS data,
+          un.created_at,
+          n.id AS notification_id
+        FROM user_notifications un
+        LEFT JOIN notifications n ON n.id = un.notification_id
+        WHERE un.user_id = $1
+        ORDER BY un.created_at DESC
         LIMIT $2 OFFSET $3
       `, [userId, limit, offset]),
-    
+
       this.db.query(`
         SELECT
           COUNT(*)::int AS total,
-          0::int AS unread_count
-        FROM notifications
-        WHERE target_user_id = $1
-           OR target = 'all'
-           OR target_user_id IS NULL
+          COUNT(*) FILTER (WHERE is_read = FALSE)::int AS unread_count
+        FROM user_notifications
+        WHERE user_id = $1
       `, [userId]),
     ]);
 
@@ -65,24 +71,21 @@ export class NotificationsService {
     const totalPages = Math.ceil(total / limit);
 
     const notifications = rows.map((n: any) => ({
-      id:         n.id,
-      title:      n.title,
-      body:       n.body,
-      type:       n.type,
-      isRead:     n.is_read,     // FIX: camelCase so Android @SerializedName("isRead") works
-      data:       n.data,
-      createdAt:  n.created_at,  // FIX: camelCase
+      id:        n.id,
+      title:     n.title,
+      body:      n.body,
+      type:      n.type,
+      isRead:    n.is_read,
+      data:      n.data,
+      createdAt: n.created_at,
     }));
 
-    // FIX: return BOTH camelCase keys (Android) AND include meta block (admin panel).
-    // Android reads: response.data.notifications + response.data.unreadCount
-    // Admin reads:   response.data.notifications + response.meta.total
     return {
       success: true,
       message: 'Success',
       data: {
         notifications,
-        unreadCount: unread_count,   // camelCase — Android DTO key
+        unreadCount: unread_count,
       },
       meta: {
         total,
@@ -96,19 +99,23 @@ export class NotificationsService {
   }
 
   async markRead(notifId: string, userId: string) {
+    // FIX: mark in user_notifications, not notifications
     const rows = await this.db.query(
-      `SELECT id FROM notifications WHERE id=$1 AND (user_id=$2 OR user_id IS NULL)`,
+      `SELECT id FROM user_notifications WHERE id=$1 AND user_id=$2`,
       [notifId, userId]
     );
     if (!rows.length) throw new NotFoundException('Notification not found');
-    await this.db.query(`UPDATE notifications SET is_read=TRUE WHERE id=$1`, [notifId]);
+    await this.db.query(
+      `UPDATE user_notifications SET is_read=TRUE, read_at=NOW() WHERE id=$1`,
+      [notifId]
+    );
     return successResponse(null, 'Marked as read');
   }
 
   async markAllRead(userId: string) {
     await this.db.query(
-      `UPDATE notifications SET is_read=TRUE
-       WHERE (user_id=$1 OR user_id IS NULL) AND is_read=FALSE`,
+      `UPDATE user_notifications SET is_read=TRUE, read_at=NOW()
+       WHERE user_id=$1 AND is_read=FALSE`,
       [userId]
     );
     return successResponse(null, 'All notifications marked as read');
