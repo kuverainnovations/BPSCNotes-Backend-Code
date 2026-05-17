@@ -90,17 +90,34 @@ export class CoursesRepository {
 
     const where = conditions.join(' AND ');
     const userSubQuery = userId
-      ? `, (SELECT TRUE FROM user_enrollments ue WHERE ue.course_id = c.id AND ue.user_id = $${params.length + 1}) AS is_enrolled`
+      ? `, (
+          SELECT json_build_object(
+            'id',                ue.id,
+            'status',            ue.status,
+            'completed_lessons', ue.completed_lessons,
+            'total_minutes',     ue.total_minutes,
+            'studied_minutes',   ue.studied_minutes,
+            'last_studied_at',   ue.last_studied_at,
+            'enrolled_at',       ue.enrolled_at,
+            'completed_at',      ue.completed_at,
+            'last_lesson_id',    ue.last_lesson_id
+          )
+          FROM user_enrollments ue
+          WHERE ue.course_id = c.id AND ue.user_id = $${params.length + 1}
+          LIMIT 1
+        ) AS enrollment`
       : '';
     if (userId) params.push(userId);
 
     const [rows, countResult] = await Promise.all([
       this.db.query(
-        `SELECT c.id, c.title, c.instructor, c.subject, c.price, c.original_price, c.is_paid,
+        `SELECT c.id, c.title, c.description, c.instructor, c.instructor_bio,
+                c.instructor_students, c.instructor_courses,
+                c.subject, c.price, c.original_price, c.is_paid,
                 c.is_featured, c.is_limited_offer, c.offer_ends_at, c.thumbnail_url, c.total_lessons,
                 c.total_hours, c.rating, c.review_count, c.enrollment_count, c.bpsc_relevance,
                 c.exam_tags, c.language, c.status, c.created_at, c.trial_lesson_title,
-                c.what_you_learn, c.has_certificate, c.instructor_students, c.instructor_courses${userSubQuery}
+                c.what_you_learn, c.has_certificate${userSubQuery}
          FROM courses c
          WHERE ${where}
          ORDER BY c.is_featured DESC, c.enrollment_count DESC, c.created_at DESC
@@ -332,7 +349,9 @@ export class CoursesService {
       [userId, courseId]
     );
     await this.db.query(`UPDATE courses SET enrollment_count = enrollment_count + 1 WHERE id = $1`, [courseId]);
-    await this.cache.del(`courses:*`); // bust course cache
+    // Bust all course cache keys so enrollment shows immediately in list
+    const keys = await this.cache.store.keys('courses:*');
+    for (const k of keys) await this.cache.del(k);
     return successResponse(null, 'Enrolled successfully! Start learning 🚀');
   }
 
