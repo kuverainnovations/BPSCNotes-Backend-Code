@@ -119,9 +119,22 @@ class QuizzesService {
     const q = quiz[0];
 
     // Validate scheduled_for (quiz should be available now)
-    if (q.scheduled_for && new Date(q.scheduled_for) > new Date()) {
-      throw new BadRequestException('This quiz is not yet available');
-    }
+    // if (q.scheduled_for && new Date(q.scheduled_for) > new Date()) {
+    //   throw new BadRequestException('This quiz is not yet available');
+    // }
+
+    const now = new Date();
+
+if (q.scheduled_for) {
+  const scheduledDate = new Date(q.scheduled_for);
+
+  scheduledDate.setHours(0,0,0,0);
+  now.setHours(0,0,0,0);
+
+  if (scheduledDate > now) {
+    throw new BadRequestException('This quiz is not yet available');
+  }
+}
 
     // Fetch questions — THIS is the only place questions are returned
     const questions = await this.db.query(
