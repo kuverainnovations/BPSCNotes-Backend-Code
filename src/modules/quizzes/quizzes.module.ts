@@ -141,7 +141,7 @@ class QuizzesService {
     await this.db.query(
       `INSERT INTO quiz_attempts (user_id, quiz_id, started_at)
        VALUES ($1, $2, NOW())
-       ON CONFLICT DO NOTHING`,
+       `,  // FIX: removed ON CONFLICT — no unique constraint on quiz_attempts(user_id,quiz_id)
       [userId, quizId]
     );
 

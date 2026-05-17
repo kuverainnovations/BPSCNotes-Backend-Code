@@ -1,6 +1,6 @@
 import {
   Module, Injectable, Controller,
-  Get, Post, Param, Query, Req,
+  Get, Post, Param, Query, Req, Body,
   UseGuards, HttpCode, HttpStatus, Logger, NotFoundException,
 } from '@nestjs/common';
 import { InjectDataSource }       from '@nestjs/typeorm';
@@ -11,23 +11,25 @@ import { successResponse }        from '../../common/utils/response.util';
 
 // ════════════════════════════════════════════════════════════
 // FILE: backend/src/modules/notifications/notifications.module.ts
-// Endpoints:
-//   GET  /notifications?page=1&limit=30
-//   POST /notifications/:id/read
-//   POST /notifications/read-all
+//
+// FIX — Android shows empty list:
+//   The Android app calls GET /api/v1/notifications and reads
+//   response.data.notifications[] (an array).
+//   The old query returned {notifications, total, unread_count}
+//   but the Android DTO expects: {notifications[], unreadCount}.
+//   Key mismatch: "unread_count" (snake_case) vs "unreadCount" (camelCase).
+//   NestJS GlobalInterceptor usually handles camelCase transform,
+//   but this response was built manually via successResponse({})
+//   so the snake_case key bypassed it.
+//
+//   Also: the Android response DTO expects:
+//     data.notifications  (array)
+//     data.unreadCount    (camelCase)
+//     meta.total          (total pages)
+//
+//   Fix: align response shape to what Android expects AND what
+//   the admin panel already shows (it was displaying correctly).
 // ════════════════════════════════════════════════════════════
-// Migration needed (add to existing migration or create new):
-// CREATE TABLE IF NOT EXISTS notifications (
-//   id              UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-//   title           VARCHAR(255) NOT NULL,
-//   body            TEXT NOT NULL,
-//   type            VARCHAR(50) NOT NULL DEFAULT 'system',
-//   user_id         UUID REFERENCES users(id) ON DELETE CASCADE,
-//   is_read         BOOLEAN NOT NULL DEFAULT FALSE,
-//   data            JSONB NOT NULL DEFAULT '{}',
-//   created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
-// );
-// CREATE INDEX IF NOT EXISTS idx_notif_user ON notifications(user_id, created_at DESC);
 
 @Injectable()
 export class NotificationsService {
@@ -41,48 +43,69 @@ export class NotificationsService {
       this.db.query(`
         SELECT id, title, body, type, is_read, data, created_at
         FROM notifications
-        WHERE user_id = $1 OR user_id IS NULL   -- NULL = broadcast to all users
+        WHERE user_id = $1 OR user_id IS NULL
         ORDER BY created_at DESC
         LIMIT $2 OFFSET $3
       `, [userId, limit, offset]),
       this.db.query(`
-        SELECT COUNT(*)::int AS total,
-               COUNT(*) FILTER (WHERE (user_id=$1 OR user_id IS NULL) AND NOT is_read)::int AS unread_count
+        SELECT
+          COUNT(*)::int AS total,
+          COUNT(*) FILTER (
+            WHERE (user_id = $1 OR user_id IS NULL) AND NOT is_read
+          )::int AS unread_count
         FROM notifications
         WHERE user_id = $1 OR user_id IS NULL
       `, [userId]),
     ]);
 
     const { total, unread_count } = countRow[0];
-    return successResponse({
-      notifications: rows.map((n: any) => ({
-        id:         n.id,
-        title:      n.title,
-        body:       n.body,
-        type:       n.type,
-        is_read:    n.is_read,
-        data:       n.data,
-        created_at: n.created_at,
-      })),
-      total,
-      unread_count,
-    });
+    const totalPages = Math.ceil(total / limit);
+
+    const notifications = rows.map((n: any) => ({
+      id:         n.id,
+      title:      n.title,
+      body:       n.body,
+      type:       n.type,
+      isRead:     n.is_read,     // FIX: camelCase so Android @SerializedName("isRead") works
+      data:       n.data,
+      createdAt:  n.created_at,  // FIX: camelCase
+    }));
+
+    // FIX: return BOTH camelCase keys (Android) AND include meta block (admin panel).
+    // Android reads: response.data.notifications + response.data.unreadCount
+    // Admin reads:   response.data.notifications + response.meta.total
+    return {
+      success: true,
+      message: 'Success',
+      data: {
+        notifications,
+        unreadCount: unread_count,   // camelCase — Android DTO key
+      },
+      meta: {
+        total,
+        page,
+        limit,
+        totalPages,
+        hasNext: page < totalPages,
+        hasPrev: page > 1,
+      },
+    };
   }
 
   async markRead(notifId: string, userId: string) {
     const rows = await this.db.query(
-      `SELECT id FROM notifications WHERE id=$1 AND (user_id=$2 OR user_id IS NULL)`, [notifId, userId]
+      `SELECT id FROM notifications WHERE id=$1 AND (user_id=$2 OR user_id IS NULL)`,
+      [notifId, userId]
     );
     if (!rows.length) throw new NotFoundException('Notification not found');
-    await this.db.query(
-      `UPDATE notifications SET is_read=TRUE WHERE id=$1`, [notifId]
-    );
+    await this.db.query(`UPDATE notifications SET is_read=TRUE WHERE id=$1`, [notifId]);
     return successResponse(null, 'Marked as read');
   }
 
   async markAllRead(userId: string) {
     await this.db.query(
-      `UPDATE notifications SET is_read=TRUE WHERE (user_id=$1 OR user_id IS NULL) AND is_read=FALSE`,
+      `UPDATE notifications SET is_read=TRUE
+       WHERE (user_id=$1 OR user_id IS NULL) AND is_read=FALSE`,
       [userId]
     );
     return successResponse(null, 'All notifications marked as read');
@@ -96,10 +119,12 @@ export class NotificationsController {
 
   @Get()
   getNotifications(
-    @Req() r: any,
+    @Req()          r:     any,
     @Query('page')  page  = 1,
-    @Query('limit') limit = 30
-  ) { return this.svc.getForUser(r.user.id, +page, +limit); }
+    @Query('limit') limit = 30,
+  ) {
+    return this.svc.getForUser(r.user.id, +page, +limit);
+  }
 
   @Post(':id/read')
   @HttpCode(HttpStatus.OK)
@@ -109,7 +134,9 @@ export class NotificationsController {
 
   @Post('read-all')
   @HttpCode(HttpStatus.OK)
-  markAllRead(@Req() r: any) { return this.svc.markAllRead(r.user.id); }
+  markAllRead(@Req() r: any) {
+    return this.svc.markAllRead(r.user.id);
+  }
 }
 
 @Module({

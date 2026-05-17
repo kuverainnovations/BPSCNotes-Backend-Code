@@ -126,6 +126,21 @@ export class CoinsService {
 
     if (!user) throw new NotFoundException('User not found');
 
+    // Bootstrap: if user has coins but zero transaction records,
+    // create an initial_grant row so History tab shows their existing balance.
+    const userCoins = user.coins ?? 0;
+    if (userCoins > 0) {
+      const [txnCount] = await this.db.query(
+        `SELECT COUNT(*)::int AS cnt FROM coin_transactions WHERE user_id = $1`, [userId]
+      );
+      if (txnCount.cnt === 0) {
+        await this.db.query(`
+          INSERT INTO coin_transactions (user_id, type, amount, description, action, balance)
+          VALUES ($1, 'earned', $2, 'Initial coins balance', 'initial_grant', $2)
+        `, [userId, userCoins]).catch(() => {});  // best-effort
+      }
+    }
+
     const totalSpent = await this.db.query(`
       SELECT COALESCE(SUM(amount), 0)::int AS spent
       FROM coin_transactions WHERE user_id = $1 AND type = 'spent'
@@ -291,19 +306,24 @@ export class CoinsService {
     const coinsEarned = CHECKIN_REWARDS[dayIndex];
 
     // Award coins + update streak atomically
-    const [updated] = await this.db.query(`
+    // FIX: separate UPDATE then SELECT — RETURNING COALESCE returns NULL
+    // when the coins column was NULL before update (Postgres returns pre-update value).
+    await this.db.query(`
       UPDATE users
-SET coins = COALESCE(coins, 0) + $1,
-    total_coins_earned = COALESCE(total_coins_earned, 0) + $1,
-    streak = $2,
-    last_check_in_date = NOW()
-WHERE id = $3
-RETURNING COALESCE(coins, 0) AS coins, total_coins_earned, streak
+      SET coins              = COALESCE(coins, 0) + $1,
+          total_coins_earned = COALESCE(total_coins_earned, 0) + $1,
+          streak             = $2,
+          last_check_in_date = NOW()
+      WHERE id = $3
     `, [coinsEarned, newStreak, userId]);
 
-    const balance = updated.coins;
+    const [updated] = await this.db.query(
+      `SELECT coins, total_coins_earned, streak FROM users WHERE id = $1`,
+      [userId]
+    );
+    const balance = updated.coins ?? 0;
 
-    // Record transaction
+    // Record transaction (balance is now guaranteed non-null)
     await this.db.query(`
       INSERT INTO coin_transactions (user_id, type, amount, description, action, balance)
       VALUES ($1, 'earned', $2, $3, 'daily_checkin', $4)
@@ -340,21 +360,26 @@ RETURNING COALESCE(coins, 0) AS coins, total_coins_earned, streak
       return successResponse({ balance: u.coins, alreadyClaimed: true }, 'Already claimed today!');
     }
 
-    const [updated] = await this.db.query(`
+    // FIX: separate UPDATE then SELECT — same null bug as checkIn
+    await this.db.query(`
       UPDATE users
-SET coins = COALESCE(coins, 0) + $1,
-    total_coins_earned = COALESCE(total_coins_earned, 0) + $1
-WHERE id = $2
-RETURNING COALESCE(coins, 0) AS coins
+      SET coins              = COALESCE(coins, 0) + $1,
+          total_coins_earned = COALESCE(total_coins_earned, 0) + $1
+      WHERE id = $2
     `, [task.coinsReward, userId]);
+
+    const [updated] = await this.db.query(
+      `SELECT coins FROM users WHERE id = $1`, [userId]
+    );
+    const balance = updated.coins ?? 0;
 
     await this.db.query(`
       INSERT INTO coin_transactions (user_id, type, amount, description, action, balance)
       VALUES ($1, 'earned', $2, $3, $4, $5)
-    `, [userId, task.coinsReward, task.title, task.action, updated.coins]);
+    `, [userId, task.coinsReward, task.title, task.action, balance]);
 
     return successResponse({
-      balance:     updated.coins,
+      balance,
       coinsEarned: task.coinsReward,
     }, `+${task.coinsReward} coins earned!`);
   }
