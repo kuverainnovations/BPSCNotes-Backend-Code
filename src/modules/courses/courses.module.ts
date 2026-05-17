@@ -90,7 +90,22 @@ export class CoursesRepository {
 
     const where = conditions.join(' AND ');
     const userSubQuery = userId
-      ? `, (SELECT TRUE FROM user_enrollments ue WHERE ue.course_id = c.id AND ue.user_id = $${params.length + 1}) AS is_enrolled`
+      ? `, (
+          SELECT json_build_object(
+            'id',              ue.id,
+            'status',          ue.status,
+            'completed_lessons', ue.completed_lessons,
+            'total_minutes',   ue.total_minutes,
+            'studied_minutes', ue.studied_minutes,
+            'last_studied_at', ue.last_studied_at,
+            'enrolled_at',     ue.enrolled_at,
+            'completed_at',    ue.completed_at,
+            'last_lesson_id',  ue.last_lesson_id
+          )
+          FROM user_enrollments ue
+          WHERE ue.course_id = c.id AND ue.user_id = $${params.length + 1}
+          LIMIT 1
+        ) AS enrollment`
       : '';
     if (userId) params.push(userId);
 
@@ -269,7 +284,9 @@ export class CoursesService {
     }
 
     await this.db.query(
-      `INSERT INTO user_enrollments (user_id, course_id) VALUES ($1,$2) ON CONFLICT (user_id, course_id) DO NOTHING`,
+      `INSERT INTO user_enrollments (user_id, course_id, total_minutes)
+       VALUES ($1, $2, COALESCE((SELECT (total_hours * 60)::int FROM courses WHERE id=$2), 0))
+       ON CONFLICT (user_id, course_id) DO NOTHING`,
       [userId, courseId]
     );
     await this.db.query(`UPDATE courses SET enrollment_count = enrollment_count + 1 WHERE id = $1`, [courseId]);
@@ -298,9 +315,18 @@ export class CoursesService {
     const isCompleted  = completedLessons >= totalLessons;
 
     await this.db.query(
-      `UPDATE user_enrollments SET completed_lessons=$1, last_lesson_id=$2,
-       status = CASE WHEN $1 >= $3 THEN 'completed' ELSE 'active' END
-       WHERE user_id=$4 AND course_id=$5`,
+      `UPDATE user_enrollments SET
+         completed_lessons = $1,
+         last_lesson_id    = $2,
+         studied_minutes   = COALESCE((
+           SELECT ROUND(SUM(lp.watch_time_secs) / 60.0)::int
+           FROM lesson_progress lp
+           JOIN course_lessons cl ON lp.lesson_id = cl.id
+           WHERE cl.course_id = $5 AND lp.user_id = $4
+         ), 0),
+         last_studied_at   = NOW(),
+         status = CASE WHEN $1 >= $3 THEN 'completed' ELSE 'active' END
+       WHERE user_id = $4 AND course_id = $5`,
       [completedLessons, lessonId, totalLessons, userId, courseId]
     );
 
