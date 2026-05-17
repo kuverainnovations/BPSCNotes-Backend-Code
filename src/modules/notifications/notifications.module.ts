@@ -41,22 +41,23 @@ export class NotificationsService {
     const offset = (page - 1) * limit;
     const [rows, countRow] = await Promise.all([
       this.db.query(`
-        SELECT id, title, body, type, is_read, data, created_at
+        SELECT id, title, body, type, data, created_at
         FROM notifications
         WHERE target_user_id = $1
-        OR target = 'all'
-        OR target_user_id IS NULL
+           OR target = 'all'
+           OR target_user_id IS NULL
         ORDER BY created_at DESC
         LIMIT $2 OFFSET $3
       `, [userId, limit, offset]),
+    
       this.db.query(`
         SELECT
           COUNT(*)::int AS total,
-          COUNT(*) FILTER (
-            WHERE (user_id = $1 OR user_id IS NULL) AND NOT is_read
-          )::int AS unread_count
+          0::int AS unread_count
         FROM notifications
-        WHERE user_id = $1 OR user_id IS NULL
+        WHERE target_user_id = $1
+           OR target = 'all'
+           OR target_user_id IS NULL
       `, [userId]),
     ]);
 
