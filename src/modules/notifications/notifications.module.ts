@@ -43,7 +43,9 @@ export class NotificationsService {
       this.db.query(`
         SELECT id, title, body, type, is_read, data, created_at
         FROM notifications
-        WHERE user_id = $1 OR user_id IS NULL
+        WHERE target_user_id = $1
+        OR target = 'all'
+        OR target_user_id IS NULL
         ORDER BY created_at DESC
         LIMIT $2 OFFSET $3
       `, [userId, limit, offset]),
