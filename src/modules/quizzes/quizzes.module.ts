@@ -139,7 +139,7 @@ class QuizzesService {
 
     // Create an attempt record (startedAt only — submittedAt set on submit)
     await this.db.query(
-      `INSERT INTO quiz_attempts (user_id, quiz_id, started_at)
+      `INSERT INTO quiz_attempts (user_id, quiz_id, attempted_at)
        VALUES ($1, $2, NOW())
        `,  // FIX: removed ON CONFLICT — no unique constraint on quiz_attempts(user_id,quiz_id)
       [userId, quizId]
