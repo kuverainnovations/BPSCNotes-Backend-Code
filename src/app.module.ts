@@ -13,6 +13,7 @@ import { TransformInterceptor, LoggingInterceptor } from './common/interceptors'
 import { JwtAuthGuard } from './common/guards';
 
 import { AuthModule }        from './modules/auth/auth.module';
+import { SubjectsModule } from './modules/subjects/subjects.module';
 import { CoursesModule }     from './modules/courses/courses.module';
 import { AdminModule }       from './modules/admin/admin.module';
 import { QuizzesModule }     from './modules/quizzes/quizzes.module';
@@ -110,6 +111,7 @@ import { StudyMaterialsModule } from '@modules/study-materials/study-materials.m
     AuthModule,
     AdminModule,
     CoursesModule,
+    SubjectsModule,
     QuizzesModule,
     LibraryModule,
     CurrentAffairsModule,
