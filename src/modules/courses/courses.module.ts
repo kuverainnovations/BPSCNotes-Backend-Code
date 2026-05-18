@@ -368,13 +368,27 @@ export class CoursesService {
 
   async completeLesson(courseId: string, lessonId: string, userId: string, dto: CompleteLessonDto) {
     await this.db.query(
-      `INSERT INTO lesson_progress (user_id, lesson_id, is_completed, watch_time_secs, completed_at)
-       VALUES ($1,$2,TRUE,$3,NOW())
-       ON CONFLICT (user_id, lesson_id)
-       DO UPDATE SET is_completed=TRUE, watch_time_secs = GREATEST(
-  lesson_progress.watch_time_secs,
-  $3::integer
-), completed_at=NOW()`,
+      `
+      INSERT INTO lesson_progress (
+        user_id,
+        lesson_id,
+        is_completed,
+        watch_time_secs,
+        completed_at
+      )
+      VALUES ($1::uuid, $2::uuid, TRUE, $3::integer, NOW())
+    
+      ON CONFLICT (user_id, lesson_id)
+      DO UPDATE SET
+        is_completed = TRUE,
+        watch_time_secs =
+          CASE
+            WHEN lesson_progress.watch_time_secs > EXCLUDED.watch_time_secs
+            THEN lesson_progress.watch_time_secs
+            ELSE EXCLUDED.watch_time_secs
+          END,
+        completed_at = NOW()
+      `,
       [userId, lessonId, dto.watchTimeSecs || 0]
     );
 
@@ -390,10 +404,27 @@ export class CoursesService {
     const isCompleted  = completedLessons >= totalLessons;
 
     await this.db.query(
-      `UPDATE user_enrollments SET completed_lessons=$1, last_lesson_id=$2,
-       status = CASE WHEN $1 >= $3 THEN 'completed' ELSE 'active' END
-       WHERE user_id=$4 AND course_id=$5`,
-      [completedLessons, lessonId, totalLessons, userId, courseId]
+      `
+      UPDATE user_enrollments
+      SET
+        completed_lessons = $1::integer,
+        last_lesson_id = $2::uuid,
+        status =
+          CASE
+            WHEN $1::integer >= $3::integer
+            THEN 'completed'
+            ELSE 'active'
+          END
+      WHERE user_id = $4::uuid
+        AND course_id = $5::uuid
+      `,
+      [
+        completedLessons,
+        lessonId,
+        totalLessons,
+        userId,
+        courseId,
+      ]
     );
 
     if (isCompleted) {
