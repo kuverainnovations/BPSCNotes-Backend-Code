@@ -371,7 +371,10 @@ export class CoursesService {
       `INSERT INTO lesson_progress (user_id, lesson_id, is_completed, watch_time_secs, completed_at)
        VALUES ($1,$2,TRUE,$3,NOW())
        ON CONFLICT (user_id, lesson_id)
-       DO UPDATE SET is_completed=TRUE, watch_time_secs=GREATEST(lesson_progress.watch_time_secs,$3), completed_at=NOW()`,
+       DO UPDATE SET is_completed=TRUE, watch_time_secs = GREATEST(
+  lesson_progress.watch_time_secs,
+  $3::integer
+), completed_at=NOW()`,
       [userId, lessonId, dto.watchTimeSecs || 0]
     );
 
