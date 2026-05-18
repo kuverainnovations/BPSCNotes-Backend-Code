@@ -250,16 +250,20 @@ export class CoursesRepository {
   async create(data: CreateCourseDto, adminId: string) {
     const slug = data.title.toLowerCase().replace(/[^a-z0-9]+/g, '-') + '-' + Date.now();
     const result = await this.db.query(
-      `INSERT INTO courses (title, slug, description, instructor, instructor_bio, subject, price,
-        original_price, is_paid, is_featured, total_lessons, total_hours, bpsc_relevance,
-        language, trial_lesson_title, exam_tags, status, created_by)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18) RETURNING *`,
+      `INSERT INTO courses (title, slug, description, instructor, instructor_bio,
+        instructor_students, instructor_courses,
+        subject, price, original_price, is_paid, is_featured, total_lessons, total_hours,
+        bpsc_relevance, language, trial_lesson_title, exam_tags, status,
+        what_you_learn, has_certificate, created_by)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22) RETURNING *`,
       [
-        data.title, slug, data.description, data.instructor, data.instructorBio, data.subject,
-        data.price || 0, data.originalPrice || data.price || 0, data.isPaid || false,
-        data.isFeatured || false, data.totalLessons || 0, data.totalHours || 0,
-        data.bpscRelevance || 0, data.language || 'Hindi + English',
-        data.trialLessonTitle, data.examTags || [], data.status || 'draft', adminId,
+        data.title, slug, data.description, data.instructor, data.instructorBio,
+        data.instructorStudents || '0', data.instructorCourses || 1,
+        data.subject, data.price || 0, data.originalPrice || data.price || 0,
+        data.isPaid || false, data.isFeatured || false, data.totalLessons || 0,
+        data.totalHours || 0, data.bpscRelevance || 0, data.language || 'Hindi + English',
+        data.trialLessonTitle, data.examTags || [], data.status || 'draft',
+        data.whatYouLearn || [], data.hasCertificate !== false, adminId,
       ]
     );
     return result[0];
@@ -272,11 +276,14 @@ export class CoursesRepository {
 
     const map: Record<string, string> = {
       title: 'title', description: 'description', instructor: 'instructor',
-      instructorBio: 'instructor_bio', subject: 'subject', price: 'price',
+      instructorBio: 'instructor_bio',
+      instructorStudents: 'instructor_students', instructorCourses: 'instructor_courses',
+      subject: 'subject', price: 'price',
       originalPrice: 'original_price', isPaid: 'is_paid', isFeatured: 'is_featured',
       totalLessons: 'total_lessons', totalHours: 'total_hours', bpscRelevance: 'bpsc_relevance',
       language: 'language', trialLessonTitle: 'trial_lesson_title',
       examTags: 'exam_tags', status: 'status',
+      whatYouLearn: 'what_you_learn', hasCertificate: 'has_certificate',
     };
 
     for (const [key, col] of Object.entries(map)) {
@@ -392,6 +399,93 @@ export class CoursesService {
     return successResponse({ completedLessons, totalLessons, isCompleted });
   }
 
+  async createChapter(courseId: string, data: { title: string; sortOrder?: number }) {
+    const [maxRow] = await this.db.query(`SELECT COALESCE(MAX(sort_order),0)+1 AS next FROM course_chapters WHERE course_id=$1`, [courseId]);
+    const [row] = await this.db.query(`INSERT INTO course_chapters (course_id,title,sort_order) VALUES ($1,$2,$3) RETURNING *`,
+      [courseId, data.title, data.sortOrder ?? maxRow.next]);
+    await this.db.query(`UPDATE courses SET updated_at=NOW() WHERE id=$1`,[courseId]);
+    return successResponse({ chapter: row }, 'Chapter created');
+  }
+
+  async updateChapter(chapterId: string, data: { title?: string; sortOrder?: number }) {
+    const fields:string[]=[], vals:any[]=[];
+    if (data.title!=null){fields.push(`title=$${fields.length+1}`);vals.push(data.title);}
+    if (data.sortOrder!=null){fields.push(`sort_order=$${fields.length+1}`);vals.push(data.sortOrder);}
+    if (!fields.length) return successResponse(null,'Nothing to update');
+    await this.db.query(`UPDATE course_chapters SET ${fields.join(',')} WHERE id=$${fields.length+1}`,[...vals,chapterId]);
+    return successResponse(null,'Chapter updated');
+  }
+
+  async deleteChapter(chapterId: string) {
+    await this.db.query(`DELETE FROM course_chapters WHERE id=$1`,[chapterId]);
+    return successResponse(null,'Chapter deleted');
+  }
+
+  async createLesson(courseId: string, chapterId: string, data: {
+    title:string; durationMins?:number; type?:string; videoUrl?:string;
+    notesUrl?:string; isFreePreview?:boolean; isLocked?:boolean; sortOrder?:number;
+  }) {
+    const [maxRow] = await this.db.query(`SELECT COALESCE(MAX(sort_order),0)+1 AS next FROM course_lessons WHERE chapter_id=$1`,[chapterId]);
+    const [row] = await this.db.query(
+      `INSERT INTO course_lessons (chapter_id,course_id,title,duration_mins,type,video_url,notes_url,is_free_preview,is_locked,sort_order)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,
+      [chapterId,courseId,data.title,data.durationMins||0,data.type||'pdf',
+       data.videoUrl||null,data.notesUrl||null,data.isFreePreview||false,
+       data.isLocked!==false,data.sortOrder??maxRow.next]
+    );
+    await this.db.query(`UPDATE courses SET total_lessons=(SELECT COUNT(*) FROM course_lessons WHERE course_id=$1),updated_at=NOW() WHERE id=$1`,[courseId]);
+    return successResponse({ lesson: row },'Lesson created');
+  }
+
+  async updateLesson(lessonId: string, data: {
+    title?:string; durationMins?:number; type?:string; videoUrl?:string;
+    notesUrl?:string; isFreePreview?:boolean; isLocked?:boolean; sortOrder?:number;
+  }) {
+    const map:Record<string,string>={title:'title',durationMins:'duration_mins',type:'type',
+      videoUrl:'video_url',notesUrl:'notes_url',isFreePreview:'is_free_preview',
+      isLocked:'is_locked',sortOrder:'sort_order'};
+    const fields:string[]=[], vals:any[]=[];
+    for (const [k,col] of Object.entries(map)) {
+      if (data[k]!==undefined){fields.push(`${col}=$${fields.length+1}`);vals.push(data[k]);}
+    }
+    if (!fields.length) return successResponse(null,'Nothing to update');
+    await this.db.query(`UPDATE course_lessons SET ${fields.join(',')} WHERE id=$${fields.length+1}`,[...vals,lessonId]);
+    return successResponse(null,'Lesson updated');
+  }
+
+  async deleteLesson(lessonId: string) {
+    const rows = await this.db.query(`SELECT course_id FROM course_lessons WHERE id=$1`,[lessonId]);
+    await this.db.query(`DELETE FROM course_lessons WHERE id=$1`,[lessonId]);
+    if (rows[0]) await this.db.query(`UPDATE courses SET total_lessons=(SELECT COUNT(*) FROM course_lessons WHERE course_id=$1) WHERE id=$1`,[rows[0].course_id]);
+    return successResponse(null,'Lesson deleted');
+  }
+
+  async getChapters(courseId: string) {
+    const chapters = await this.db.query(`
+      SELECT ch.id,ch.title,ch.sort_order,
+        json_agg(json_build_object('id',l.id,'title',l.title,'duration_mins',l.duration_mins,
+          'type',l.type,'video_url',l.video_url,'notes_url',l.notes_url,
+          'is_free_preview',l.is_free_preview,'is_locked',l.is_locked,'sort_order',l.sort_order
+        ) ORDER BY l.sort_order) FILTER (WHERE l.id IS NOT NULL) AS lessons
+      FROM course_chapters ch
+      LEFT JOIN course_lessons l ON l.chapter_id=ch.id
+      WHERE ch.course_id=$1 GROUP BY ch.id ORDER BY ch.sort_order
+    `,[courseId]);
+    return successResponse({ chapters });
+  }
+
+  async getLessonDetail(lessonId: string, userId: string) {
+    const rows = await this.db.query(`
+      SELECT l.*,
+        (SELECT lp.is_completed FROM lesson_progress lp WHERE lp.user_id=$2 AND lp.lesson_id=l.id) AS is_completed,
+        (SELECT lp.watch_time_secs FROM lesson_progress lp WHERE lp.user_id=$2 AND lp.lesson_id=l.id) AS watch_time_secs
+      FROM course_lessons l WHERE l.id=$1
+    `,[lessonId, userId]);
+    if (!rows[0]) throw new NotFoundException('Lesson not found');
+    return successResponse({ lesson: rows[0] });
+  }
+
+
   async submitReview(courseId: string, userId: string, dto: SubmitReviewDto) {
     await this.db.query(
       `INSERT INTO course_reviews (course_id, user_id, rating, comment, is_verified) VALUES ($1,$2,$3,$4,TRUE)
@@ -493,6 +587,11 @@ export class CoursesController {
     return this.service.completeLesson(courseId, lessonId, req.user.id, dto);
   }
 
+  @Get(':courseId/lessons/:lessonId')
+  getLessonDetail(@Param('courseId', ParseUUIDPipe) courseId: string,@Param('lessonId', ParseUUIDPipe) lessonId: string, @Req() req: any) {
+    return this.service.getLessonDetail(lessonId, req.user.id);
+  }
+
   @Post(':id/review')
   @HttpCode(HttpStatus.CREATED)
   submitReview(
@@ -543,6 +642,48 @@ export class AdminCoursesController {
   @UseInterceptors(FileInterceptor('thumbnail'))
   uploadThumbnail(@Param('id', ParseUUIDPipe) id: string, @UploadedFile() file: Express.Multer.File) {
     return this.service.uploadThumbnail(id, file);
+  }
+
+  @Get(':id/chapters')
+  @RequirePermission('courses')
+  getChapters(@Param('id', ParseUUIDPipe) id: string) { return this.service.getChapters(id); }
+
+  @Post(':id/chapters')
+  @RequirePermission('courses')
+  createChapter(@Param('id', ParseUUIDPipe) id: string, @Body() dto: any) {
+    return this.service.createChapter(id, dto);
+  }
+
+  @Put(':id/chapters/:chapterId')
+  @RequirePermission('courses')
+  updateChapter(@Param('chapterId', ParseUUIDPipe) chapterId: string, @Body() dto: any) {
+    return this.service.updateChapter(chapterId, dto);
+  }
+
+  @Delete(':id/chapters/:chapterId')
+  @RequirePermission('courses')
+  @HttpCode(HttpStatus.OK)
+  deleteChapter(@Param('chapterId', ParseUUIDPipe) chapterId: string) {
+    return this.service.deleteChapter(chapterId);
+  }
+
+  @Post(':id/chapters/:chapterId/lessons')
+  @RequirePermission('courses')
+  createLesson(@Param('id', ParseUUIDPipe) courseId: string, @Param('chapterId', ParseUUIDPipe) chapterId: string, @Body() dto: any) {
+    return this.service.createLesson(courseId, chapterId, dto);
+  }
+
+  @Put(':id/lessons/:lessonId')
+  @RequirePermission('courses')
+  updateLesson(@Param('lessonId', ParseUUIDPipe) lessonId: string, @Body() dto: any) {
+    return this.service.updateLesson(lessonId, dto);
+  }
+
+  @Delete(':id/lessons/:lessonId')
+  @RequirePermission('courses')
+  @HttpCode(HttpStatus.OK)
+  deleteLesson(@Param('lessonId', ParseUUIDPipe) lessonId: string) {
+    return this.service.deleteLesson(lessonId);
   }
 }
 
