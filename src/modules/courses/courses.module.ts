@@ -45,6 +45,8 @@ class CreateCourseDto {
   @ApiPropertyOptional() @IsOptional() @IsString() description?: string;
   @ApiPropertyOptional() @IsOptional() @IsString() instructor?: string;
   @ApiPropertyOptional() @IsOptional() @IsString() instructorBio?: string;
+  @ApiPropertyOptional() @IsOptional() @IsString() instructorStudents?: string;
+  @ApiPropertyOptional() @IsOptional() @Type(() => Number) @IsNumber() instructorCourses?: number;
   @ApiProperty() @IsString() @IsNotEmpty() subject: string;
   @ApiPropertyOptional() @IsOptional() @Type(() => Number) @IsNumber() price?: number;
   @ApiPropertyOptional() @IsOptional() @Type(() => Number) @IsNumber() originalPrice?: number;
@@ -57,21 +59,8 @@ class CreateCourseDto {
   @ApiPropertyOptional() @IsOptional() @IsString() language?: string;
   @ApiPropertyOptional() @IsOptional() @IsString() trialLessonTitle?: string;
   @ApiPropertyOptional() @IsOptional() @IsEnum(['draft','published','review']) status?: string;
-  @IsOptional()
-  @IsString()
-  instructorStudents?: string;
-
-  @IsOptional()
-  @IsNumber()
-  instructorCourses?: number;
-
-  @IsOptional()
-  @IsArray()
-  whatYouLearn?: string[];
-
-  @IsOptional()
-  @IsBoolean()
-  hasCertificate?: boolean;
+  @ApiPropertyOptional() @IsOptional() @IsArray() whatYouLearn?: string[];
+  @ApiPropertyOptional() @IsOptional() @IsBoolean() hasCertificate?: boolean;
 }
 
 class SubmitReviewDto {
