@@ -137,7 +137,6 @@ export class StudyMaterialsService {
     const sortMap: Record<string, string> = {
       newest:    'sm.created_at DESC',
       downloads: 'sm.download_count DESC',
-      rating:    'sm.rating DESC',
     };
     const orderBy = sortMap[query.sort ?? 'downloads'] ?? sortMap.downloads;
 
@@ -150,7 +149,7 @@ export class StudyMaterialsService {
       this.db.query(
         `SELECT sm.id, sm.title, sm.description, sm.subject, sm.material_type,
                 sm.author, sm.tags, sm.file_key, sm.file_size_bytes, sm.page_count,
-                sm.download_count, sm.rating, sm.rating_count, sm.is_featured, sm.is_trending,
+                sm.download_count, sm.is_featured, sm.is_trending,
                 sm.created_at, sm.uploader_id, sm.thumbnail_key,
                 ${bookmarkSubq}
                 sm.status
@@ -348,9 +347,9 @@ export class StudyMaterialsService {
     const conditions: string[] = ['1=1'];
     const params: any[] = [];
     let pi = 1;
-    if (query.status)  { conditions.push(`status=$${pi++}`);       params.push(query.status); }
-    if (query.subject) { conditions.push(`subject=$${pi++}`);      params.push(query.subject); }
-    if (query.search)  { conditions.push(`title ILIKE $${pi++}`);  params.push(`%${query.search}%`); }
+    if (query.status)  { conditions.push(`sm.status=$${pi++}`);      params.push(query.status); }
+    if (query.subject) { conditions.push(`sm.subject=$${pi++}`);      params.push(query.subject); }
+    if (query.search)  { conditions.push(`sm.title ILIKE $${pi++}`);  params.push(`%${query.search}%`); }
     const where = conditions.join(' AND ');
     const [rows, [cnt]] = await Promise.all([
       this.db.query(
