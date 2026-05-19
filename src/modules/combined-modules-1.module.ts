@@ -177,17 +177,17 @@ class JobsService {
            j.notification_date::TEXT             AS apply_start_date,
            j.last_date::TEXT                     AS apply_end_date,
            j.exam_date::TEXT                     AS exam_date,
-           j.is_featured,
-           j.view_count,
-           j.save_count,
            j.created_at,
-           -- Derived fields Android expects
+           -- Columns that don't exist in table — use safe literals
+           FALSE                                 AS is_featured,
            FALSE                                 AS is_new,
-           CASE WHEN j.last_date <= NOW() + INTERVAL '3 days' THEN TRUE ELSE FALSE END AS is_urgent,
-           '{}' ::TEXT[]                         AS nearby_districts,
+           CASE WHEN j.last_date <= NOW() + INTERVAL '3 days'
+                THEN TRUE ELSE FALSE END         AS is_urgent,
+           '{}'::TEXT[]                          AS nearby_districts,
            ''                                    AS location,
            ''                                    AS salary_range,
-           (SELECT TRUE FROM job_saves js WHERE js.user_id=$${params.length+1} AND js.job_id=j.id) AS is_saved
+           (SELECT TRUE FROM job_saves js
+            WHERE js.user_id=$${params.length+1} AND js.job_id=j.id) AS is_saved
          FROM job_vacancies j WHERE ${where}
          ORDER BY j.last_date ASC LIMIT $${params.length+2} OFFSET $${params.length+3}`,
         [...params, userId, limit, offset]
