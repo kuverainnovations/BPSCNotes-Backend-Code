@@ -1,4 +1,6 @@
 import { NestFactory } from '@nestjs/core';
+import { NestExpressApplication } from '@nestjs/platform-express';
+import { join } from 'path';
 import { ValidationPipe, Logger } from '@nestjs/common';
 import { SwaggerModule, DocumentBuilder } from '@nestjs/swagger';
 import { ConfigService } from '@nestjs/config';
@@ -48,12 +50,18 @@ import { AppModule } from './app.module';
 async function bootstrap() {
   const logger = new Logger('Bootstrap');
 
-  const app = await NestFactory.create(AppModule, {
+  const app = await NestFactory.create<NestExpressApplication>(AppModule, {
     logger: ['error', 'warn', 'log'],
     bufferLogs: true,
   });
 
   const config = app.get(ConfigService);
+
+  // ── Serve uploaded files statically ──────────────────────
+  // This makes https://api.bpscnotes.in/uploads/<file> work
+  // without needing nginx /uploads/ location block.
+  const uploadDir = config.get<string>('UPLOAD_DIR') ?? join(process.cwd(), 'uploads');
+  app.useStaticAssets(uploadDir, { prefix: '/uploads' });
 
   const port   = config.get<number>('app.port', 5000);
   const prefix = config.get<string>('app.apiPrefix', 'api/v1');
