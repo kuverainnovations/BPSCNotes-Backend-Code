@@ -614,11 +614,25 @@ class UsersService {
         [userId]
       ),
       this.db.query(
-        `SELECT DATE(qa.attempted_at) AS date, COUNT(*) AS activity
-FROM quiz_attempts qa
-WHERE qa.user_id=$1 AND qa.attempted_at >= NOW() - INTERVAL '28 days'
-GROUP BY DATE(qa.attempted_at)
-ORDER BY date ASC`,
+        /* Generate last 7 days always, joining with actual quiz activity.
+           This guarantees 7 rows even when user has zero activity,
+           so the Android weekly chart always renders instead of showing "No data". */
+        `WITH days AS (
+           SELECT generate_series(
+             CURRENT_DATE - INTERVAL '6 days',
+             CURRENT_DATE,
+             INTERVAL '1 day'
+           )::DATE AS day
+         ),
+         activity AS (
+           SELECT DATE(qa.attempted_at) AS date, COUNT(*) AS cnt
+           FROM quiz_attempts qa
+           WHERE qa.user_id=$1 AND qa.attempted_at >= NOW() - INTERVAL '7 days'
+           GROUP BY DATE(qa.attempted_at)
+         )
+         SELECT d.day AS date, COALESCE(a.cnt, 0) AS activity
+         FROM days d LEFT JOIN activity a ON a.date = d.day
+         ORDER BY d.day ASC`,
         [userId]
       ),
     ]);
@@ -1004,13 +1018,15 @@ class FlashcardsService {
       `SELECT
          f.id,
          f.subject,
-         f.subject AS topic,       -- topic derives from subject (table has no separate topic column)
-         f.front   AS question,    -- front → question (Android expects "question")
-         f.back    AS answer,      -- back  → answer   (Android expects "answer")
-         ''        AS hint,
-         ''        AS example,
+         COALESCE(NULLIF(f.topic,''), f.subject) AS topic,
+         f.front     AS question,
+         f.back      AS answer,
+         COALESCE(f.hint,'')    AS hint,
+         COALESCE(f.example,'') AS example,
          f.difficulty,
-         NULL      AS related_mcq,
+         COALESCE(f.card_type,'text') AS card_type,
+         f.image_url,
+         NULL        AS related_mcq,
          f.exam_tags
        FROM flashcards f
        WHERE ${conditions.join(' AND ')}
@@ -1041,18 +1057,25 @@ class FlashcardsService {
   }
 
   async create(data: any, adminId: string) {
-    if (!data.front || !data.back) {
-      throw new BadRequestException('front (question) and back (answer) are required');
-    }
+    const front = data.front || data.question;
+    const back  = data.back  || data.answer;
+    if (!front || !back) throw new BadRequestException('front (question) and back (answer) are required');
+    const cardType = data.cardType || data.card_type || 'text';
+    const imageUrl = cardType === 'image' ? (data.imageUrl || data.image_url || null) : null;
     const result = await this.db.query(
-      `INSERT INTO flashcards (front, back, subject, exam_tags, difficulty, created_by)
-       VALUES ($1, $2, $3, $4, $5, $6) RETURNING *`,
+      `INSERT INTO flashcards
+         (front, back, subject, exam_tags, difficulty, card_type, image_url, topic, hint, example, created_by)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *`,
       [
-        data.front || data.question,
-        data.back  || data.answer,
+        front, back,
         data.subject || 'General',
         data.examTags || data.exam_tags || [],
         data.difficulty || 'medium',
+        cardType,
+        imageUrl,
+        data.topic || data.subject || 'General',
+        data.hint || '',
+        data.example || '',
         adminId,
       ]
     );
@@ -1068,11 +1091,20 @@ class FlashcardsService {
     const map: any = {
       front: 'front', back: 'back', question: 'front', answer: 'back',
       subject: 'subject', difficulty: 'difficulty', isActive: 'is_active',
+      topic: 'topic', hint: 'hint', example: 'example',
     };
     for (const [key, col] of Object.entries(map)) {
       if (data[key] !== undefined) { fields.push(`${col}=$${i++}`); vals.push(data[key]); }
     }
-    if (data.examTags) { fields.push(`exam_tags=$${i++}`); vals.push(data.examTags); }
+    if (data.examTags)  { fields.push(`exam_tags=$${i++}`);  vals.push(data.examTags); }
+    if (data.cardType || data.card_type) {
+      const ct = data.cardType || data.card_type;
+      fields.push(`card_type=$${i++}`); vals.push(ct);
+      if (ct === 'image' && (data.imageUrl || data.image_url)) {
+        fields.push(`image_url=$${i++}`); vals.push(data.imageUrl || data.image_url);
+      }
+      if (ct === 'text') { fields.push(`image_url=$${i++}`); vals.push(null); }
+    }
     if (!fields.length) throw new BadRequestException('No fields to update');
     await this.db.query(`UPDATE flashcards SET ${fields.join(',')} WHERE id=$${i}`, [...vals, id]);
     await this.invalidateCache();

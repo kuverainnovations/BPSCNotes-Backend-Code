@@ -636,6 +636,24 @@ class CoinsService {
     return successResponse({ rules });
   }
 
+  async createRule(data: any) {
+    const { action, description, coinsAwarded, maxPerDay, isActive } = data;
+    if (!action || !description) throw new BadRequestException('action and description are required');
+    const [existing] = await this.db.query(`SELECT id FROM coin_rules WHERE action=$1`, [action]);
+    if (existing) {
+      await this.db.query(
+        `UPDATE coin_rules SET description=$1, coins_awarded=$2, max_per_day=$3, is_active=$4, updated_at=NOW() WHERE action=$5`,
+        [description, coinsAwarded ?? 5, maxPerDay ?? 1, isActive !== false, action]
+      );
+      return successResponse(null, 'Coin rule updated');
+    }
+    const [row] = await this.db.query(
+      `INSERT INTO coin_rules (action, description, coins_awarded, max_per_day, is_active) VALUES ($1,$2,$3,$4,$5) RETURNING *`,
+      [action, description, coinsAwarded ?? 5, maxPerDay ?? 1, isActive !== false]
+    );
+    return successResponse({ rule: row }, 'Coin rule created ✅');
+  }
+
   async updateRule(ruleId: string, data: any) {
     const fields: string[] = [], vals: any[] = [];
     let i = 1;
@@ -644,6 +662,11 @@ class CoinsService {
     if (data.isActive     !== undefined) { fields.push(`is_active=$${i++}`);     vals.push(data.isActive); }
     if (fields.length) { fields.push('updated_at=NOW()'); await this.db.query(`UPDATE coin_rules SET ${fields.join(',')} WHERE id=$${i}`, [...vals, ruleId]); }
     return successResponse(null, 'Coin rule updated — effective immediately ✅');
+  }
+
+  async deleteRule(ruleId: string) {
+    await this.db.query(`DELETE FROM coin_rules WHERE id=$1`, [ruleId]);
+    return successResponse(null, 'Coin rule deleted');
   }
 
   async getTopEarners() {
@@ -659,20 +682,23 @@ class CoinsController {
   constructor(private s: CoinsService) {}
   @Get('balance') getBalance(@Req() r: any) { return this.s.getBalance(r.user.id); }
   @Get('history') getHistory(@Query() q: any, @Req() r: any) { return this.s.getHistory(r.user.id, q); }
-  
 }
 
-
-@Module({ imports:[ConfigModule], controllers:[CoinsController, AdminCoinsController], providers:[CoinsService] })
-
-
+// NOTE: AdminCoinsController must be declared BEFORE the @Module that references it
 @ApiTags('Admin — Coins') @ApiBearerAuth() @Public()
 @UseGuards(AdminJwtGuard, PermissionGuard) @Controller('admin/coins')
 class AdminCoinsController {
   constructor(private s: CoinsService) {}
-  @Get('rules') @RequirePermission('coins') getRules() { return this.s.getRules(); }
-  @Put('rules/:id') @RequirePermission('coins') updateRule(@Param('id', ParseUUIDPipe) id: string, @Body() dto: any) { return this.s.updateRule(id, dto); }
-  @Get('top-earners') @RequirePermission('coins') getTopEarners() { return this.s.getTopEarners(); }
+  @Get('rules')        @RequirePermission('coins') getRules()    { return this.s.getRules(); }
+  @Post('rules')       @RequirePermission('coins') @HttpCode(HttpStatus.CREATED)
+    createRule(@Body() dto: any) { return this.s.createRule(dto); }
+  @Put('rules/:id')    @RequirePermission('coins')
+    updateRule(@Param('id', ParseUUIDPipe) id: string, @Body() dto: any) { return this.s.updateRule(id, dto); }
+  @Delete('rules/:id') @RequirePermission('coins') @HttpCode(HttpStatus.OK)
+    deleteRule(@Param('id', ParseUUIDPipe) id: string) { return this.s.deleteRule(id); }
+  @Get('top-earners')  @RequirePermission('coins') getTopEarners() { return this.s.getTopEarners(); }
 }
 
+// ⚠️ @Module MUST be directly above the class it decorates
+@Module({ imports: [ConfigModule], controllers: [CoinsController, AdminCoinsController], providers: [CoinsService] })
 export class CoinsModule {}
