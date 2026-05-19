@@ -465,12 +465,25 @@ export class StudyMaterialsController {
   @HttpCode(HttpStatus.CREATED)
   @UseInterceptors(FileInterceptor('file', {
     storage: diskStorage({
-      destination: (req, _file, cb) => {
-        const uploadDir = process.env.UPLOAD_DIR ?? join(process.cwd(), 'uploads');
+      destination: (_req, _file, cb) => {
+        const uploadDir = './uploads';
+      
         const now = new Date();
-        const subDir = join(uploadDir, 'materials', `${now.getFullYear()}`, String(now.getMonth() + 1).padStart(2, '0'));
-        fs.mkdirSync(subDir, { recursive: true });
-        cb(null, subDir);
+      
+        const subDir = join(
+          uploadDir,
+          'materials',
+          `${now.getFullYear()}`,
+          String(now.getMonth() + 1).padStart(2, '0')
+        );
+      
+        try {
+          fs.mkdirSync(subDir, { recursive: true });
+          cb(null, subDir);
+        } catch (e) {
+          console.error('Upload dir creation failed:', e);
+          cb(e as Error, subDir);
+        }
       },
       filename: (_req, file, cb) => {
         const ext = extname(file.originalname).toLowerCase() || '.pdf';
