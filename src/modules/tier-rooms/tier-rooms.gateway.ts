@@ -127,7 +127,7 @@ export class TierRoomsGateway
         this.socketTier.delete(client.id);
         // Use async count from DB so disconnect shows accurate active session count
         this.getActiveSessionCount(tierKey).then(count => {
-          this.broadcastPresenceUpdateWithCount(tierKey, count);
+          this.broadcastPresenceUpdate(tierKey);
         });
       }
     }
@@ -137,7 +137,7 @@ export class TierRoomsGateway
   // ── CLIENT: joins a tier room view ────────────────────────
   // Client sends this when they open RoomsHubScreen or TierRoomScreen
   @SubscribeMessage('tier:join_room')
-  handleJoinRoom(
+  async handleJoinRoom(
     @ConnectedSocket() client: Socket,
     @MessageBody() data: { tierKey: string },
   ) {
@@ -165,7 +165,7 @@ export class TierRoomsGateway
     // but the broadcast count comes from DB active sessions, not socket set.
     // This stops the "1 online" bug when user just opens the page.
     const activeCount = await this.getActiveSessionCount(tierKey);
-    this.broadcastPresenceUpdateWithCount(tierKey, activeCount);
+    this.broadcastPresenceUpdate(tierKey);
 
     // Acknowledge
     return { event: 'tier:joined', tierKey, activeNow: activeCount };
@@ -199,7 +199,7 @@ export class TierRoomsGateway
     if (!userId || !tierKey) throw new WsException('Not in a room.');
     // Also register in socketTier if it was resolved from payload
     if (!this.socketTier.has(client.id) && data?.tierKey) {
-      client.join(\`tier:\${tierKey}\`);
+      client.join(`tier:${tierKey}`);
       this.socketTier.set(client.id, tierKey);
     }
 
