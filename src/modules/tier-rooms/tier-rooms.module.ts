@@ -387,7 +387,7 @@ export class StudySessionsService {
       throw new ConflictException(`Active session exists (${existing[0].id}). End it first.`);
     }
     const tierRow = await this.db.query(`
-      SELECT t.id AS tier_id FROM user_room_tier urt
+      SELECT t.id AS tier_id, t.tier_key FROM user_room_tier urt
       JOIN room_tiers t ON t.id=urt.current_tier_id WHERE urt.user_id=$1
     `, [userId]);
     const tierId = tierRow[0]?.tier_id || null;
@@ -409,6 +409,22 @@ export class StudySessionsService {
 
 
     this.logger.log(`Session started: user=${userId} id=${session[0].id}`);
+
+    // Broadcast presence update + member_joined event so other users see
+    // the new member immediately (without waiting 30s for polling refresh)
+    if (tierRow[0]?.tier_key) {
+      const tierKey = tierRow[0].tier_key;
+      // Get user's name for the member_joined broadcast
+      const [userRow] = await this.db.query(`SELECT name FROM users WHERE id=$1`, [userId]);
+      const userName  = userRow?.name ?? 'Member';
+      // Emit presence update (updates count in lobby)
+      this.gateway['broadcastPresenceUpdate'](tierKey);
+      // Emit member_joined (updates members list in StudyFocusScreen immediately)
+      this.gateway.server?.to(`tier:${tierKey}`).emit('room:member_joined', {
+        tierKey, userId, userName,
+      });
+    }
+
     return successResponse({
       sessionId: session[0].id, startedAt: session[0].started_at,
       mode: session[0].mode, tierId: session[0].tier_id,
@@ -593,6 +609,16 @@ export class StudySessionsService {
     // ─────────────────────────────────────────────────────────────
 
     this.logger.log(`Session ended: user=${userId} active=${s.active_minutes}min coins=${s.coins_earned}`);
+
+    // Broadcast member_left + presence update so lobby and room members list
+    // update immediately when a user ends their session
+    if (s.tier_key) {
+      this.gateway['broadcastPresenceUpdate'](s.tier_key);
+      this.gateway.server?.to(`tier:${s.tier_key}`).emit('room:member_left', {
+        tierKey: s.tier_key, userId,
+      });
+    }
+
     return successResponse({
       sessionId, durationMinutes: durationMins, activeMinutes: s.active_minutes,
       totalCoins: s.coins_earned + bonusCoins, totalXp: s.xp_earned, bonusCoins,

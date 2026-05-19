@@ -47,7 +47,7 @@ import { Inject }               from '@nestjs/common';
 export class TierRoomsGateway
   implements OnGatewayInit, OnGatewayConnection, OnGatewayDisconnect
 {
-  @WebSocketServer() server!: Server;
+  @WebSocketServer() server!: Server;   // public — used by StudySessionsService for member events
 
   private readonly logger = new Logger(TierRoomsGateway.name);
 
@@ -394,7 +394,7 @@ export class TierRoomsGateway
     } catch { return 0; }
   }
 
-  private broadcastPresenceUpdate(tierKey: string) {
+  broadcastPresenceUpdate(tierKey: string) {  // public — called from StudySessionsService
     // FIX: Use DB session count not socket connection count.
     // Viewing the lobby emits tier:join_room which adds to socket presence,
     // but should NOT increment "studying" count until a session is started.
