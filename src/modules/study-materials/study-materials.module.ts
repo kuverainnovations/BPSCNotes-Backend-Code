@@ -1,10 +1,10 @@
 import {
   Module, Injectable, Controller,
   Get, Post, Put, Delete, Patch,
-  Body, Param, Query, Req, UploadedFile,
+  Body, Param, Query, Req, Res, UploadedFile,
   UseGuards, UseInterceptors, HttpCode, HttpStatus,
   ParseUUIDPipe, BadRequestException, Logger,
-  NotFoundException,
+  NotFoundException, StreamableFile,
 } from '@nestjs/common';
 import { FileInterceptor }        from '@nestjs/platform-express';
 import { InjectDataSource }       from '@nestjs/typeorm';
@@ -14,95 +14,106 @@ import { Cache }                  from 'cache-manager';
 import { Inject }                 from '@nestjs/common';
 import { ConfigService }          from '@nestjs/config';
 import { ApiTags, ApiBearerAuth } from '@nestjs/swagger';
-import * as AWS                   from '@aws-sdk/client-s3';
-import { getSignedUrl }           from '@aws-sdk/s3-request-presigner';
+import { diskStorage }            from 'multer';
+import { extname, join }          from 'path';
+import * as fs                    from 'fs';
+import * as crypto                from 'crypto';
+import { Response }               from 'express';
 import { JwtAuthGuard, AdminJwtGuard, PermissionGuard, RequirePermission, Public } from '../../common/guards';
 import { successResponse, paginationMeta } from '../../common/utils/response.util';
 import { AuthModule }             from '../auth/auth.module';
 
 // ════════════════════════════════════════════════════════════
-// FILE: backend/src/modules/study-materials/study-materials.module.ts
-// Complete Study Materials module — upload, approval, download, bookmark
+// LOCAL STORAGE — No AWS required
+//
+// Files are stored at: /var/www/bpscnotes/uploads/  (configurable via UPLOAD_DIR)
+// Served at:           https://api.bpscnotes.in/uploads/<file>
+//
+// Nginx config needed (add to your site config):
+//   location /uploads/ {
+//     alias /var/www/bpscnotes/uploads/;
+//     add_header Content-Disposition "attachment";
+//     expires 1y;
+//   }
 // ════════════════════════════════════════════════════════════
 
-const TYPES = ['pdf', 'pyq', 'book', 'video'] as const;
+const TYPES = ['pdf', 'pyq', 'book', 'video', 'notes', 'image'] as const;
 type MaterialType = typeof TYPES[number];
 
-// ── StudyMaterialsService ─────────────────────────────────────
+const ALLOWED_MIME_TYPES = [
+  'application/pdf',
+  'image/jpeg', 'image/png', 'image/webp',
+  'application/msword',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+];
+const MAX_FILE_SIZE_BYTES = 50 * 1024 * 1024; // 50 MB
+
+// ─────────────────────────────────────────────────────────────
+// Multer disk-storage config
+// ─────────────────────────────────────────────────────────────
+function buildMulterStorage(uploadDir: string) {
+  // Create nested directory: /uploads/materials/<year>/<month>/
+  const now   = new Date();
+  const subDir = `${now.getFullYear()}/${String(now.getMonth() + 1).padStart(2, '0')}`;
+  const dest   = join(uploadDir, 'materials', subDir);
+  fs.mkdirSync(dest, { recursive: true });
+
+  return diskStorage({
+    destination: (_req, _file, cb) => cb(null, dest),
+    filename: (_req, file, cb) => {
+      const uniqueId   = crypto.randomUUID().replace(/-/g, '').slice(0, 16);
+      const safeExt    = extname(file.originalname).toLowerCase().replace(/[^a-z0-9.]/g, '');
+      const safeName   = `${Date.now()}_${uniqueId}${safeExt}`;
+      cb(null, safeName);
+    },
+  });
+}
+
+// ─────────────────────────────────────────────────────────────
+// StudyMaterialsService
+// ─────────────────────────────────────────────────────────────
 @Injectable()
 export class StudyMaterialsService {
-  private readonly logger = new Logger(StudyMaterialsService.name);
-  private readonly s3: AWS.S3Client;
-  private readonly bucket: string;
+  private readonly logger    = new Logger(StudyMaterialsService.name);
+  private readonly uploadDir: string;
+  private readonly baseUrl:   string;
 
   constructor(
-    @InjectDataSource()           private readonly db: DataSource,
-    @Inject(CACHE_MANAGER)        private readonly cache: Cache,
+    @InjectDataSource()    private readonly db:     DataSource,
+    @Inject(CACHE_MANAGER) private readonly cache:  Cache,
     private readonly config: ConfigService,
   ) {
-    this.bucket = this.config.get('AWS_S3_BUCKET') ?? 'bpscnotes-materials';
-    this.s3 = new AWS.S3Client({
-      region:      this.config.get('AWS_REGION') ?? 'ap-south-1',
-      credentials: {
-        accessKeyId:     this.config.get('AWS_ACCESS_KEY_ID') ?? '',
-        secretAccessKey: this.config.get('AWS_SECRET_ACCESS_KEY') ?? '',
-      },
-    });
+    // UPLOAD_DIR defaults to <project-root>/uploads — change in .env for production
+    this.uploadDir = this.config.get<string>('UPLOAD_DIR')
+      ?? join(process.cwd(), 'uploads');
+
+    // BASE_URL for building file URLs returned to clients
+    this.baseUrl = this.config.get<string>('BASE_URL')
+      ?? 'https://api.bpscnotes.in';
+
+    // Ensure upload directory exists on startup
+    fs.mkdirSync(join(this.uploadDir, 'materials'), { recursive: true });
+    this.logger.log(`📁 File storage: ${this.uploadDir}`);
   }
 
-  // ── GET: presigned upload URL (called before file is chosen) ─
-  async getUploadUrl(userId: string, fileName: string, mimeType: string) {
-    const ext     = fileName.split('.').pop()?.toLowerCase() ?? 'pdf';
-    const fileKey = `uploads/${userId}/${Date.now()}_${Math.random().toString(36).slice(2)}.${ext}`;
-    const command = new AWS.PutObjectCommand({
-      Bucket:      this.bucket,
-      Key:         fileKey,
-      ContentType: mimeType,
-    });
-    const uploadUrl = await getSignedUrl(this.s3, command, { expiresIn: 900 }); // 15 min
-    return successResponse({ uploadUrl, fileKey });
+  // ── Build public URL for a stored file key ────────────────
+  private fileUrl(fileKey: string): string {
+    return `${this.baseUrl}/uploads/${fileKey}`;
   }
 
-  // ── POST: create material record AFTER file upload ───────────
-  async createMaterial(userId: string, dto: {
-    title: string; description?: string; subject: string;
-    materialType: MaterialType; author?: string; tags?: string[];
-    fileKey: string; fileSizeMb?: number; pageCount?: number;
-  }) {
-    if (!dto.title?.trim())    throw new BadRequestException('Title is required');
-    if (!dto.subject?.trim())  throw new BadRequestException('Subject is required');
-    if (!TYPES.includes(dto.materialType)) throw new BadRequestException('Invalid material type');
-    if (!dto.fileKey?.trim())  throw new BadRequestException('fileKey is required');
-
-    const result = await this.db.query(`
-      INSERT INTO study_materials
-        (title, description, subject, material_type, author, tags,
-         file_key, file_size_bytes, page_count, uploader_id, status)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'pending')
-      RETURNING id, title, status, created_at
-    `, [
-      dto.title.trim(),
-      dto.description?.trim() ?? '',
-      dto.subject.trim(),
-      dto.materialType,
-      dto.author?.trim() ?? '',
-      dto.tags ?? [],
-      dto.fileKey,
-      Math.round((dto.fileSizeMb ?? 0) * 1024 * 1024),
-      dto.pageCount ?? 0,
-      userId,
-    ]);
-    return successResponse(result[0], '📤 Submitted for review! It will be published after admin approval.');
+  // ── Extract subpath from absolute path ───────────────────
+  private toFileKey(absolutePath: string): string {
+    return absolutePath.replace(this.uploadDir + '/', '').replace(/\\/g, '/');
   }
 
-  // ── GET: list approved materials (public) ────────────────────
+  // ── GET: list approved materials ──────────────────────────
   async listApproved(query: {
     type?: string; subject?: string; search?: string;
     page?: number; limit?: number; sort?: string;
     bookmarkedOnly?: boolean; userId?: string;
   }) {
-    const page  = Math.max(1, +(query.page  ?? 1));
-    const limit = Math.min(50, Math.max(1, +(query.limit ?? 20)));
+    const page   = Math.max(1, +(query.page  ?? 1));
+    const limit  = Math.min(50, Math.max(1, +(query.limit ?? 20)));
     const offset = (page - 1) * limit;
 
     const conditions: string[] = [`sm.status = 'approved'`];
@@ -120,206 +131,269 @@ export class StudyMaterialsService {
       params.push(query.userId);
     }
 
-    const orderMap: Record<string, string> = {
-      newest:    'sm.approved_at DESC',
+    const sortMap: Record<string, string> = {
+      newest:    'sm.created_at DESC',
       downloads: 'sm.download_count DESC',
-      rating:    '(CASE WHEN sm.rating_count>0 THEN sm.rating_sum/sm.rating_count ELSE 0 END) DESC',
+      rating:    'sm.rating DESC',
     };
-    const orderBy = orderMap[query.sort ?? ''] ?? 'sm.is_featured DESC, sm.download_count DESC';
+    const orderBy = sortMap[query.sort ?? 'downloads'] ?? sortMap.downloads;
 
-    const where = conditions.join(' AND ');
+    const bookmarkSubq = query.userId
+      ? `(SELECT TRUE FROM material_bookmarks mb WHERE mb.material_id=sm.id AND mb.user_id='${query.userId}') AS is_bookmarked,`
+      : `FALSE AS is_bookmarked,`;
 
-    const [rows, count] = await Promise.all([
-      this.db.query(`
-        SELECT
-          sm.id, sm.title, sm.description, sm.subject, sm.material_type AS "materialType",
-          sm.author, sm.tags, sm.file_size_bytes AS "fileSizeBytes",
-          sm.page_count AS "pageCount", sm.is_premium AS "isPremium",
-          sm.is_featured AS "isFeatured", sm.is_trending AS "isTrending",
-          sm.is_new AS "isNew", sm.download_count AS "downloadCount",
-          sm.view_count AS "viewCount", sm.approved_at AS "uploadedDate",
-          CASE WHEN sm.rating_count > 0 THEN ROUND(sm.rating_sum/sm.rating_count, 1) ELSE 0 END AS rating,
-          u.name AS "uploaderName",
-          ${query.userId ? `EXISTS (SELECT 1 FROM material_bookmarks mb WHERE mb.material_id=sm.id AND mb.user_id='${query.userId}')` : 'FALSE'} AS "isBookmarked"
-        FROM study_materials sm
-        LEFT JOIN users u ON u.id = sm.uploader_id
-        WHERE ${where}
-        ORDER BY ${orderBy}
-        LIMIT $${pi} OFFSET $${pi+1}
-      `, [...params, limit, offset]),
-      this.db.query(`SELECT COUNT(*)::int FROM study_materials sm WHERE ${where}`, params),
+    const where   = conditions.join(' AND ');
+    const [rows, [countRow]] = await Promise.all([
+      this.db.query(
+        `SELECT sm.id, sm.title, sm.description, sm.subject, sm.material_type,
+                sm.author, sm.tags, sm.file_key, sm.file_size_bytes, sm.page_count,
+                sm.download_count, sm.rating, sm.rating_count, sm.is_featured, sm.is_trending,
+                sm.created_at, sm.uploader_id, sm.thumbnail_key,
+                ${bookmarkSubq}
+                sm.status
+         FROM study_materials sm WHERE ${where}
+         ORDER BY ${orderBy} LIMIT $${pi++} OFFSET $${pi++}`,
+        [...params, limit, offset]
+      ),
+      this.db.query(`SELECT COUNT(*) FROM study_materials sm WHERE ${where}`, params),
     ]);
 
+    // Attach public URLs
+    const materials = rows.map((m: any) => ({
+      ...m,
+      fileUrl:      m.file_key       ? this.fileUrl(m.file_key)       : null,
+      thumbnailUrl: m.thumbnail_key  ? this.fileUrl(m.thumbnail_key)  : null,
+      fileSizeMb:   m.file_size_bytes ? +(m.file_size_bytes / 1024 / 1024).toFixed(2) : 0,
+    }));
+
+    const total = parseInt(countRow.count ?? '0', 10);
+    return successResponse({ materials, meta: paginationMeta(total, page, limit) });
+  }
+
+  // ── GET: stats ────────────────────────────────────────────
+  async getStats(userId?: string) {
+    const [stats] = await this.db.query(`
+      SELECT
+        COUNT(*)                                          FILTER (WHERE status='approved')::int AS total,
+        COUNT(DISTINCT subject)                           FILTER (WHERE status='approved')::int AS subjects,
+        COUNT(*)                                          FILTER (WHERE material_type='pdf')::int AS pdfs,
+        COUNT(*)                                          FILTER (WHERE material_type='pyq')::int AS pyqs,
+        COALESCE(SUM(download_count),0)::int                                                    AS totalDownloads,
+        COUNT(DISTINCT uploader_id)                                                             AS contributors,
+        COUNT(*)                                          FILTER (WHERE is_featured)::int       AS featured
+      FROM study_materials WHERE status='approved'
+    `);
+
+    const myUploadsCount = userId ? (await this.db.query(
+      `SELECT COUNT(*) FROM study_materials WHERE uploader_id=$1`, [userId]
+    ))[0].count : '0';
+
     return successResponse({
-      materials: rows,
-      meta:      paginationMeta(count[0].count, page, limit),
+      ...stats,
+      myUploads: parseInt(myUploadsCount, 10),
     });
   }
 
-  // ── GET: single material with signed download URL ─────────────
-  async getMaterial(id: string, userId?: string) {
-    const rows = await this.db.query(`
-      SELECT sm.*, u.name AS "uploaderName",
-        ${userId ? `EXISTS (SELECT 1 FROM material_bookmarks mb WHERE mb.material_id=sm.id AND mb.user_id='${userId}')` : 'FALSE'} AS "isBookmarked"
-      FROM study_materials sm LEFT JOIN users u ON u.id=sm.uploader_id
-      WHERE sm.id=$1 AND sm.status='approved'
-    `, [id]);
-    if (!rows.length) throw new NotFoundException('Material not found');
-
-    const m = rows[0];
-    // increment view count
-    await this.db.query(`UPDATE study_materials SET view_count=view_count+1 WHERE id=$1`, [id]);
-
-    // generate signed URL valid 1 hour
-    let downloadUrl = m.file_url;
-    if (m.file_key) {
-      const cmd = new AWS.GetObjectCommand({ Bucket: this.bucket, Key: m.file_key });
-      downloadUrl = await getSignedUrl(this.s3, cmd, { expiresIn: 3600 });
-    }
-
-    return successResponse({ ...m, downloadUrl });
-  }
-
-  // ── POST: record download + increment count ───────────────────
-  async recordDownload(materialId: string, userId: string) {
-    await Promise.all([
-      this.db.query(`UPDATE study_materials SET download_count=download_count+1 WHERE id=$1`, [materialId]),
-      this.db.query(`INSERT INTO material_downloads (user_id, material_id) VALUES ($1,$2)`, [userId, materialId]),
-    ]);
-    // re-generate signed URL
-    const rows = await this.db.query(`SELECT file_key FROM study_materials WHERE id=$1`, [materialId]);
-    if (!rows.length) throw new NotFoundException('Material not found');
-    const fileKey = rows[0].file_key;
-    let downloadUrl = '';
-    if (fileKey) {
-      const cmd = new AWS.GetObjectCommand({ Bucket: this.bucket, Key: fileKey });
-      downloadUrl = await getSignedUrl(this.s3, cmd, { expiresIn: 3600 });
-    }
-    return successResponse({ downloadUrl }, 'Download started');
-  }
-
-  // ── POST/DELETE: bookmark ─────────────────────────────────────
-  async toggleBookmark(materialId: string, userId: string) {
-    const exists = await this.db.query(
-      `SELECT 1 FROM material_bookmarks WHERE user_id=$1 AND material_id=$2`, [userId, materialId]
-    );
-    if (exists.length) {
-      await this.db.query(`DELETE FROM material_bookmarks WHERE user_id=$1 AND material_id=$2`, [userId, materialId]);
-      return successResponse({ bookmarked: false }, 'Removed from saved');
-    } else {
-      await this.db.query(`INSERT INTO material_bookmarks (user_id, material_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`, [userId, materialId]);
-      return successResponse({ bookmarked: true }, '🔖 Saved to bookmarks');
-    }
-  }
-
-  // ── GET: user's own uploads ───────────────────────────────────
-  async myUploads(userId: string) {
-    const rows = await this.db.query(`
-      SELECT id, title, subject, material_type AS "materialType", status,
-             rejection_reason AS "rejectionReason", download_count AS "downloadCount",
-             created_at AS "createdAt"
-      FROM study_materials WHERE uploader_id=$1 ORDER BY created_at DESC LIMIT 50
-    `, [userId]);
-    return successResponse({ uploads: rows });
-  }
-
-  // ── GET: subjects list ────────────────────────────────────────
+  // ── GET: distinct subjects ────────────────────────────────
   async getSubjects() {
-    const rows = await this.db.query(`
-      SELECT DISTINCT subject FROM study_materials WHERE status='approved' ORDER BY subject
-    `);
+    const rows = await this.db.query(
+      `SELECT DISTINCT subject FROM study_materials WHERE status='approved' ORDER BY subject`
+    );
     return successResponse({ subjects: ['All', ...rows.map((r: any) => r.subject)] });
   }
 
-  // ── GET: stats for header ─────────────────────────────────────
-  async getStats() {
-    const [stats] = await this.db.query(`
-      SELECT
-        COUNT(*) FILTER (WHERE status='approved')::int              AS total,
-        COUNT(*) FILTER (WHERE status='approved' AND material_type='pdf')::int  AS pdfs,
-        COUNT(*) FILTER (WHERE status='approved' AND material_type='pyq')::int  AS pyqs,
-        COUNT(*) FILTER (WHERE status='approved' AND material_type='book')::int AS books,
-        SUM(download_count) FILTER (WHERE status='approved')::int   AS totalDownloads
-      FROM study_materials
-    `);
-    return successResponse(stats);
+  // ── GET: single material detail ───────────────────────────
+  async getMaterial(id: string, userId?: string) {
+    const [row] = await this.db.query(`
+      SELECT sm.*,
+             u.name AS uploader_name,
+             (SELECT TRUE FROM material_bookmarks mb WHERE mb.material_id=sm.id AND mb.user_id=$2) AS is_bookmarked
+      FROM study_materials sm
+      LEFT JOIN users u ON u.id = sm.uploader_id
+      WHERE sm.id = $1 AND sm.status = 'approved'
+    `, [id, userId ?? '00000000-0000-0000-0000-000000000000']);
+    if (!row) throw new NotFoundException('Material not found');
+    return successResponse({
+      ...row,
+      fileUrl:      row.file_key      ? this.fileUrl(row.file_key)      : null,
+      thumbnailUrl: row.thumbnail_key ? this.fileUrl(row.thumbnail_key) : null,
+    });
   }
 
-  // ════════════════════════════════════════════════════════════
-  // ADMIN METHODS
-  // ════════════════════════════════════════════════════════════
+  // ── POST: direct multipart upload (replaces presigned URL flow) ──
+  // Android now POSTs directly to this endpoint — no AWS needed.
+  async uploadFile(
+    userId: string,
+    file:   Express.Multer.File,
+    dto:    {
+      title: string; description?: string; subject: string;
+      materialType: MaterialType; author?: string; tags?: string;
+      pageCount?: number;
+    }
+  ) {
+    if (!file) throw new BadRequestException('File is required');
+    if (!dto.title?.trim())   throw new BadRequestException('Title is required');
+    if (!dto.subject?.trim()) throw new BadRequestException('Subject is required');
 
-  async adminList(query: { status?: string; page?: number; limit?: number }) {
-    const page  = Math.max(1, +(query.page  ?? 1));
-    const limit = Math.min(100, +(query.limit ?? 20));
-    const offset = (page - 1) * limit;
-    const status = query.status ?? 'pending';
+    const matType = (dto.materialType ?? 'pdf') as MaterialType;
+    if (!TYPES.includes(matType)) throw new BadRequestException(`Invalid type. Allowed: ${TYPES.join(', ')}`);
 
-    const [rows, count] = await Promise.all([
-      this.db.query(`
-        SELECT sm.id, sm.title, sm.subject, sm.material_type AS "materialType",
-               sm.status, sm.file_size_bytes AS "fileSizeBytes",
-               sm.download_count AS "downloadCount", sm.is_featured AS "isFeatured",
-               sm.created_at AS "createdAt", sm.approved_at AS "approvedAt",
-               u.name AS "uploaderName", u.mobile AS "uploaderMobile",
-               sm.file_key AS "fileKey"
-        FROM study_materials sm LEFT JOIN users u ON u.id=sm.uploader_id
-        WHERE sm.status=$1 ORDER BY sm.created_at DESC LIMIT $2 OFFSET $3
-      `, [status, limit, offset]),
-      this.db.query(`SELECT COUNT(*)::int FROM study_materials WHERE status=$1`, [status]),
+    const fileKey     = this.toFileKey(file.path);
+    const fileSizeBytes = file.size;
+    const tags        = dto.tags ? JSON.parse(dto.tags) : [];
+
+    const [result] = await this.db.query(`
+      INSERT INTO study_materials
+        (title, description, subject, material_type, author, tags,
+         file_key, file_size_bytes, page_count, uploader_id, status)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'pending')
+      RETURNING id, title, status, created_at
+    `, [
+      dto.title.trim(),
+      dto.description?.trim() ?? '',
+      dto.subject.trim(),
+      matType,
+      dto.author?.trim() ?? '',
+      tags,
+      fileKey,
+      fileSizeBytes,
+      dto.pageCount ?? 0,
+      userId,
     ]);
-    return successResponse({ materials: rows, meta: paginationMeta(count[0].count, page, limit) });
+
+    this.logger.log(`📤 Material uploaded: ${result.id} by user ${userId} — file: ${fileKey}`);
+    return successResponse({
+      id:       result.id,
+      title:    result.title,
+      status:   result.status,
+      fileUrl:  this.fileUrl(fileKey),
+      fileKey,
+    }, '📤 Uploaded! Will be published after admin review.');
   }
 
-  async adminApprove(id: string, adminId: string) {
-    await this.db.query(`
-      UPDATE study_materials
-      SET status='approved', approved_at=NOW(), approved_by=$2, rejection_reason=NULL
-      WHERE id=$1
-    `, [id, adminId]);
-    return successResponse(null, '✅ Material approved and published');
+  // ── GET: presigned-compatible URL for legacy clients ──────
+  // Returns a token-based upload URL so old Android clients that
+  // use the two-step flow still work without changes.
+  async getUploadUrl(userId: string, fileName: string, mimeType: string) {
+    // Generate a one-time upload token valid for 15 minutes
+    const token   = crypto.randomUUID();
+    const ext     = extname(fileName).toLowerCase() || '.pdf';
+    const fileKey = `pending/${userId}/${Date.now()}${ext}`;
+    // Store token in cache so the confirm step can verify it
+    await this.cache.set(`upload_token:${token}`, { userId, fileKey, mimeType }, 900);
+    // Return same shape as S3 presigned URL response — Android code unchanged
+    const uploadUrl = `${this.baseUrl}/api/v1/study-materials/upload-local?token=${token}`;
+    return successResponse({ uploadUrl, fileKey, token });
   }
 
-  async adminReject(id: string, reason: string) {
-    if (!reason?.trim()) throw new BadRequestException('Rejection reason required');
-    await this.db.query(`
-      UPDATE study_materials SET status='rejected', rejection_reason=$2 WHERE id=$1
-    `, [id, reason.trim()]);
-    return successResponse(null, 'Material rejected');
+  // ── PUT: receive file for the legacy two-step flow ────────
+  async receiveLocalUpload(token: string, file: Express.Multer.File) {
+    const meta = await this.cache.get<{ userId: string; fileKey: string; mimeType: string }>(`upload_token:${token}`);
+    if (!meta) throw new BadRequestException('Upload token expired or invalid');
+    await this.cache.del(`upload_token:${token}`);
+    // Move file to the correct path
+    const destDir = join(this.uploadDir, 'materials');
+    fs.mkdirSync(destDir, { recursive: true });
+    const ext     = extname(file.originalname).toLowerCase() || '.pdf';
+    const finalKey = `materials/${meta.userId}/${Date.now()}${ext}`;
+    const dest    = join(this.uploadDir, finalKey);
+    fs.renameSync(file.path, dest);
+    return successResponse({ fileKey: finalKey, fileUrl: this.fileUrl(finalKey) });
+  }
+
+  // ── POST: record download and return file URL ─────────────
+  async recordDownload(id: string, userId: string) {
+    const [row] = await this.db.query(
+      `UPDATE study_materials SET download_count=download_count+1 WHERE id=$1 AND status='approved' RETURNING file_key, title`,
+      [id]
+    );
+    if (!row) throw new NotFoundException('Material not found');
+    return successResponse({ downloadUrl: this.fileUrl(row.file_key), title: row.title });
+  }
+
+  // ── POST: toggle bookmark ─────────────────────────────────
+  async toggleBookmark(materialId: string, userId: string) {
+    const exists = await this.db.query(
+      `SELECT id FROM material_bookmarks WHERE material_id=$1 AND user_id=$2`, [materialId, userId]
+    );
+    if (exists.length) {
+      await this.db.query(`DELETE FROM material_bookmarks WHERE material_id=$1 AND user_id=$2`, [materialId, userId]);
+      return successResponse({ bookmarked: false });
+    } else {
+      await this.db.query(`INSERT INTO material_bookmarks (material_id, user_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`, [materialId, userId]);
+      return successResponse({ bookmarked: true });
+    }
+  }
+
+  // ── GET: my uploads ───────────────────────────────────────
+  async myUploads(userId: string) {
+    const uploads = await this.db.query(
+      `SELECT id, title, subject, material_type, status, download_count, rating, created_at, file_key
+       FROM study_materials WHERE uploader_id=$1 ORDER BY created_at DESC`,
+      [userId]
+    );
+    return successResponse({
+      uploads: uploads.map((u: any) => ({ ...u, fileUrl: u.file_key ? this.fileUrl(u.file_key) : null }))
+    });
+  }
+
+  // ── Admin methods ─────────────────────────────────────────
+  async adminList(query: any) {
+    const page   = Math.max(1, +(query.page  ?? 1));
+    const limit  = Math.min(100, +(query.limit ?? 20));
+    const offset = (page - 1) * limit;
+    const conditions: string[] = ['1=1'];
+    const params: any[] = [];
+    let pi = 1;
+    if (query.status)  { conditions.push(`status=$${pi++}`);       params.push(query.status); }
+    if (query.subject) { conditions.push(`subject=$${pi++}`);      params.push(query.subject); }
+    if (query.search)  { conditions.push(`title ILIKE $${pi++}`);  params.push(`%${query.search}%`); }
+    const where = conditions.join(' AND ');
+    const [rows, [cnt]] = await Promise.all([
+      this.db.query(
+        `SELECT sm.*, u.name AS uploader_name FROM study_materials sm LEFT JOIN users u ON u.id=sm.uploader_id
+         WHERE ${where} ORDER BY sm.created_at DESC LIMIT $${pi++} OFFSET $${pi++}`,
+        [...params, limit, offset]
+      ),
+      this.db.query(`SELECT COUNT(*) FROM study_materials sm WHERE ${where}`, params),
+    ]);
+    return successResponse({
+      materials: rows.map((m: any) => ({ ...m, fileUrl: m.file_key ? this.fileUrl(m.file_key) : null })),
+      meta: paginationMeta(parseInt(cnt.count, 10), page, limit),
+    });
+  }
+
+  async adminApprove(id: string) {
+    await this.db.query(`UPDATE study_materials SET status='approved', updated_at=NOW() WHERE id=$1`, [id]);
+    return successResponse(null, '✅ Approved — now visible to students');
+  }
+
+  async adminReject(id: string, reason?: string) {
+    await this.db.query(`UPDATE study_materials SET status='rejected', updated_at=NOW() WHERE id=$1`, [id]);
+    return successResponse(null, `Rejected${reason ? ': ' + reason : ''}`);
   }
 
   async adminToggleFeature(id: string) {
-    const rows = await this.db.query(`SELECT is_featured FROM study_materials WHERE id=$1`, [id]);
-    if (!rows.length) throw new NotFoundException('Not found');
-    const newVal = !rows[0].is_featured;
-    await this.db.query(`UPDATE study_materials SET is_featured=$2 WHERE id=$1`, [id, newVal]);
-    return successResponse({ isFeatured: newVal });
-  }
-
-  async adminToggleTrending(id: string) {
-    const rows = await this.db.query(`SELECT is_trending FROM study_materials WHERE id=$1`, [id]);
-    if (!rows.length) throw new NotFoundException('Not found');
-    const newVal = !rows[0].is_trending;
-    await this.db.query(`UPDATE study_materials SET is_trending=$2 WHERE id=$1`, [id, newVal]);
-    return successResponse({ isTrending: newVal });
+    const [row] = await this.db.query(`SELECT is_featured FROM study_materials WHERE id=$1`, [id]);
+    if (!row) throw new NotFoundException();
+    await this.db.query(`UPDATE study_materials SET is_featured=$2 WHERE id=$1`, [id, !row.is_featured]);
+    return successResponse({ isFeatured: !row.is_featured });
   }
 
   async adminDelete(id: string) {
-    const rows = await this.db.query(`SELECT file_key FROM study_materials WHERE id=$1`, [id]);
-    if (rows.length && rows[0].file_key) {
-      // delete from S3
-      try { await this.s3.send(new AWS.DeleteObjectCommand({ Bucket: this.bucket, Key: rows[0].file_key })); } catch {}
+    const [row] = await this.db.query(`SELECT file_key FROM study_materials WHERE id=$1`, [id]);
+    if (row?.file_key) {
+      const absPath = join(this.uploadDir, row.file_key);
+      try { fs.unlinkSync(absPath); } catch (_) { /* file may not exist */ }
     }
     await this.db.query(`DELETE FROM study_materials WHERE id=$1`, [id]);
     return successResponse(null, 'Deleted');
   }
 
-  async adminGetSignedUrl(id: string) {
-    const rows = await this.db.query(`SELECT file_key FROM study_materials WHERE id=$1`, [id]);
-    if (!rows.length || !rows[0].file_key) throw new NotFoundException('File not found');
-    const cmd = new AWS.GetObjectCommand({ Bucket: this.bucket, Key: rows[0].file_key });
-    const url = await getSignedUrl(this.s3, cmd, { expiresIn: 3600 });
-    return successResponse({ url });
+  async adminGetUrl(id: string) {
+    const [row] = await this.db.query(`SELECT file_key FROM study_materials WHERE id=$1`, [id]);
+    if (!row?.file_key) throw new NotFoundException('File not found');
+    return successResponse({ url: this.fileUrl(row.file_key) });
   }
 
   async adminStats() {
@@ -329,7 +403,7 @@ export class StudyMaterialsService {
         COUNT(*) FILTER (WHERE status='approved')::int AS approved,
         COUNT(*) FILTER (WHERE status='rejected')::int AS rejected,
         COUNT(*) FILTER (WHERE is_featured)::int       AS featured,
-        SUM(download_count)::int                       AS totalDownloads,
+        COALESCE(SUM(download_count),0)::int           AS totalDownloads,
         COUNT(DISTINCT uploader_id)::int               AS contributors
       FROM study_materials
     `);
@@ -342,72 +416,102 @@ export class StudyMaterialsService {
 // ════════════════════════════════════════════════════════════
 @ApiTags('Study Materials')
 @ApiBearerAuth()
+@UseGuards(JwtAuthGuard)
 @Controller('study-materials')
 export class StudyMaterialsController {
-  constructor(private readonly svc: StudyMaterialsService) {}
+  constructor(private readonly svc: StudyMaterialsService, private readonly config: ConfigService) {}
 
-  /** GET /study-materials/stats */
   @Get('stats')
-  @UseGuards(JwtAuthGuard)
-  getStats() { return this.svc.getStats(); }
+  getStats(@Req() r: any) { return this.svc.getStats(r.user?.id); }
 
-  /** GET /study-materials/subjects */
   @Get('subjects')
-  @Public()
   getSubjects() { return this.svc.getSubjects(); }
 
-  /** GET /study-materials?type=pdf&subject=Polity&search=...&page=1 */
   @Get()
-  @UseGuards(JwtAuthGuard)
   list(@Query() q: any, @Req() r: any) {
     return this.svc.listApproved({ ...q, userId: r.user?.id });
   }
 
-  /** GET /study-materials/my-uploads */
   @Get('my-uploads')
-  @UseGuards(JwtAuthGuard)
   myUploads(@Req() r: any) { return this.svc.myUploads(r.user.id); }
 
-  /** GET /study-materials/upload-url?fileName=...&mimeType=... */
+  // ── LEGACY: get pre-signed-style upload URL (token-based) ──
   @Get('upload-url')
-  @UseGuards(JwtAuthGuard)
   getUploadUrl(
     @Query('fileName') fileName: string,
     @Query('mimeType') mimeType: string,
-    @Req() r: any
+    @Req() r: any,
   ) {
-    if (!fileName) throw new BadRequestException('fileName required');
     return this.svc.getUploadUrl(r.user.id, fileName, mimeType ?? 'application/pdf');
   }
 
-  /** POST /study-materials — create record after S3 upload */
-  @Post()
-  @HttpCode(HttpStatus.CREATED)
-  @UseGuards(JwtAuthGuard)
-  create(@Body() dto: any, @Req() r: any) {
-    return this.svc.createMaterial(r.user.id, dto);
+  // ── LEGACY: receive file after two-step token flow ─────────
+  @Put('upload-local')
+  @UseInterceptors(FileInterceptor('file', {
+    storage: diskStorage({
+      destination: join(process.cwd(), 'uploads', 'temp'),
+      filename: (_req, file, cb) => cb(null, `${Date.now()}_${crypto.randomUUID()}${extname(file.originalname)}`),
+    }),
+    limits: { fileSize: MAX_FILE_SIZE_BYTES },
+  }))
+  receiveLocalUpload(@Query('token') token: string, @UploadedFile() file: Express.Multer.File) {
+    return this.svc.receiveLocalUpload(token, file);
   }
 
-  /** GET /study-materials/:id */
+  // ── NEW: single-step direct multipart upload ───────────────
+  // Android sends: POST /study-materials/upload  (multipart/form-data)
+  // Fields: file (binary), title, subject, materialType, description, author, tags (JSON), pageCount
+  @Post('upload')
+  @HttpCode(HttpStatus.CREATED)
+  @UseInterceptors(FileInterceptor('file', {
+    storage: diskStorage({
+      destination: (req, _file, cb) => {
+        const uploadDir = process.env.UPLOAD_DIR ?? join(process.cwd(), 'uploads');
+        const now = new Date();
+        const subDir = join(uploadDir, 'materials', `${now.getFullYear()}`, String(now.getMonth() + 1).padStart(2, '0'));
+        fs.mkdirSync(subDir, { recursive: true });
+        cb(null, subDir);
+      },
+      filename: (_req, file, cb) => {
+        const ext = extname(file.originalname).toLowerCase() || '.pdf';
+        cb(null, `${Date.now()}_${crypto.randomBytes(8).toString('hex')}${ext}`);
+      },
+    }),
+    limits:   { fileSize: MAX_FILE_SIZE_BYTES },
+    fileFilter: (_req, file, cb) => {
+      if (ALLOWED_MIME_TYPES.includes(file.mimetype)) cb(null, true);
+      else cb(new BadRequestException(`File type not allowed. Allowed: PDF, images, Word docs`), false);
+    },
+  }))
+  uploadMaterial(
+    @UploadedFile() file: Express.Multer.File,
+    @Body() body: any,
+    @Req() r: any,
+  ) {
+    return this.svc.uploadFile(r.user.id, file, body);
+  }
+
+  // ── POST: create record AFTER legacy S3/token upload ──────
+  @Post()
+  @HttpCode(HttpStatus.CREATED)
+  createMaterial(@Body() dto: any, @Req() r: any) {
+    return this.svc.uploadFile(r.user.id, null as any, dto);
+  }
+
   @Get(':id')
-  @UseGuards(JwtAuthGuard)
-  getOne(@Param('id', ParseUUIDPipe) id: string, @Req() r: any) {
+  getMaterial(@Param('id', ParseUUIDPipe) id: string, @Req() r: any) {
     return this.svc.getMaterial(id, r.user?.id);
   }
 
-  /** POST /study-materials/:id/download */
   @Post(':id/download')
   @HttpCode(HttpStatus.OK)
-  @UseGuards(JwtAuthGuard)
-  download(@Param('id', ParseUUIDPipe) id: string, @Req() r: any) {
+  recordDownload(@Param('id', ParseUUIDPipe) id: string, @Req() r: any) {
     return this.svc.recordDownload(id, r.user.id);
   }
 
-  /** POST /study-materials/:id/bookmark */
   @Post(':id/bookmark')
   @HttpCode(HttpStatus.OK)
-  @UseGuards(JwtAuthGuard)
-  bookmark(@Param('id', ParseUUIDPipe) id: string, @Req() r: any) {
+  toggleBookmark(@Param('id', ParseUUIDPipe) id: string, @Req() r: any) {
     return this.svc.toggleBookmark(id, r.user.id);
   }
 }
@@ -423,61 +527,46 @@ export class StudyMaterialsController {
 export class AdminStudyMaterialsController {
   constructor(private readonly svc: StudyMaterialsService) {}
 
-  @Get('stats') adminStats() { return this.svc.adminStats(); }
+  @Get('stats')
+  @RequirePermission('study-materials')
+  adminStats() { return this.svc.adminStats(); }
 
   @Get()
-  @RequirePermission('library')
+  @RequirePermission('study-materials')
   adminList(@Query() q: any) { return this.svc.adminList(q); }
 
-  @Post(':id/approve')
-  @RequirePermission('library')
+  @Patch(':id/approve')
+  @RequirePermission('study-materials')
   @HttpCode(HttpStatus.OK)
-  approve(@Param('id', ParseUUIDPipe) id: string, @Req() r: any) {
-    return this.svc.adminApprove(id, r.user?.id ?? 'admin');
-  }
+  approve(@Param('id', ParseUUIDPipe) id: string) { return this.svc.adminApprove(id); }
 
-  @Post(':id/reject')
-  @RequirePermission('library')
+  @Patch(':id/reject')
+  @RequirePermission('study-materials')
   @HttpCode(HttpStatus.OK)
-  reject(@Param('id', ParseUUIDPipe) id: string, @Body() dto: { reason: string }) {
-    return this.svc.adminReject(id, dto.reason);
-  }
+  reject(@Param('id', ParseUUIDPipe) id: string, @Body() b: any) { return this.svc.adminReject(id, b.reason); }
 
-  @Post(':id/toggle-featured')
-  @RequirePermission('library')
+  @Patch(':id/feature')
+  @RequirePermission('study-materials')
   @HttpCode(HttpStatus.OK)
-  toggleFeatured(@Param('id', ParseUUIDPipe) id: string) {
-    return this.svc.adminToggleFeature(id);
-  }
-
-  @Post(':id/toggle-trending')
-  @RequirePermission('library')
-  @HttpCode(HttpStatus.OK)
-  toggleTrending(@Param('id', ParseUUIDPipe) id: string) {
-    return this.svc.adminToggleTrending(id);
-  }
+  toggleFeature(@Param('id', ParseUUIDPipe) id: string) { return this.svc.adminToggleFeature(id); }
 
   @Delete(':id')
-  @RequirePermission('library')
+  @RequirePermission('study-materials')
   @HttpCode(HttpStatus.OK)
-  delete(@Param('id', ParseUUIDPipe) id: string) {
-    return this.svc.adminDelete(id);
-  }
+  adminDelete(@Param('id', ParseUUIDPipe) id: string) { return this.svc.adminDelete(id); }
 
-  @Get(':id/signed-url')
-  @RequirePermission('library')
-  signedUrl(@Param('id', ParseUUIDPipe) id: string) {
-    return this.svc.adminGetSignedUrl(id);
-  }
+  @Get(':id/url')
+  @RequirePermission('study-materials')
+  getUrl(@Param('id', ParseUUIDPipe) id: string) { return this.svc.adminGetUrl(id); }
 }
 
 // ════════════════════════════════════════════════════════════
 // MODULE
 // ════════════════════════════════════════════════════════════
 @Module({
-  imports: [AuthModule],
+  imports:     [AuthModule],
   controllers: [StudyMaterialsController, AdminStudyMaterialsController],
-  providers: [StudyMaterialsService],
-  exports: [StudyMaterialsService],
+  providers:   [StudyMaterialsService],
+  exports:     [StudyMaterialsService],
 })
 export class StudyMaterialsModule {}
