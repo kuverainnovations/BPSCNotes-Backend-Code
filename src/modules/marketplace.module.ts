@@ -8,9 +8,10 @@ import { InjectDataSource } from '@nestjs/typeorm';
 import { DataSource } from 'typeorm';
 import { FileInterceptor } from '@nestjs/platform-express';
 import { ApiTags, ApiBearerAuth } from '@nestjs/swagger';
-import { JwtAuthGuard, AdminJwtGuard, PermissionGuard, RequirePermission, Public } from '../../common/guards';
-import { successResponse, paginationMeta } from '../../common/utils/response.util';
+import { JwtAuthGuard, AdminJwtGuard, PermissionGuard, RequirePermission, Public } from '../common/guards';
+import { successResponse, paginationMeta } from '../common/utils/response.util';
 import { AuthModule } from '../auth/auth.module';
+
 import * as cloudinary from 'cloudinary';
 import { ConfigService } from '@nestjs/config';
 import { Inject } from '@nestjs/common';
