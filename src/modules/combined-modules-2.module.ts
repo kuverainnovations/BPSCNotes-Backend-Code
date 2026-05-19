@@ -1026,6 +1026,7 @@ class FlashcardsService {
          f.difficulty,
          COALESCE(f.card_type,'text') AS card_type,
          f.image_url,
+         f.back_image_url,
          NULL        AS related_mcq,
          f.exam_tags
        FROM flashcards f
@@ -1062,10 +1063,11 @@ class FlashcardsService {
     if (!front || !back) throw new BadRequestException('front (question) and back (answer) are required');
     const cardType = data.cardType || data.card_type || 'text';
     const imageUrl = cardType === 'image' ? (data.imageUrl || data.image_url || null) : null;
+    const backImageUrl = data.backImageUrl || data.back_image_url || null;
     const result = await this.db.query(
       `INSERT INTO flashcards
-         (front, back, subject, exam_tags, difficulty, card_type, image_url, topic, hint, example, created_by)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *`,
+         (front, back, subject, exam_tags, difficulty, card_type, image_url, back_image_url, topic, hint, example, created_by)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING *`,
       [
         front, back,
         data.subject || 'General',
@@ -1073,6 +1075,7 @@ class FlashcardsService {
         data.difficulty || 'medium',
         cardType,
         imageUrl,
+        backImageUrl,
         data.topic || data.subject || 'General',
         data.hint || '',
         data.example || '',
@@ -1093,6 +1096,11 @@ class FlashcardsService {
       subject: 'subject', difficulty: 'difficulty', isActive: 'is_active',
       topic: 'topic', hint: 'hint', example: 'example',
     };
+    // Handle back_image_url separately (camelCase from admin, snake_case from API)
+    if (data.backImageUrl !== undefined || data.back_image_url !== undefined) {
+      fields.push(`\`back_image_url=$\${i++}'\'`);
+      vals.push(data.backImageUrl ?? data.back_image_url ?? null);
+    }
     for (const [key, col] of Object.entries(map)) {
       if (data[key] !== undefined) { fields.push(`${col}=$${i++}`); vals.push(data[key]); }
     }
