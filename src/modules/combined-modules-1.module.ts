@@ -162,9 +162,34 @@ class JobsService {
     const where = conditions.join(' AND ');
     const [rows, countResult] = await Promise.all([
       this.db.query(
-        `SELECT j.*, (SELECT TRUE FROM job_saves js WHERE js.user_id=$${params.length+1} AND js.job_id=j.id) AS is_saved
+        `SELECT
+           j.id, j.title,
+           j.organization                        AS department,
+           j.category,
+           j.total_posts,
+           COALESCE(j.qualification,'')          AS qualification,
+           COALESCE(j.age_limit,'')              AS age_limit,
+           COALESCE(j.description,'')            AS description,
+           COALESCE(j.application_link,'')       AS official_link,
+           j.status,
+           j.exam_tags,
+           j.notification_date::TEXT             AS notification_date,
+           j.notification_date::TEXT             AS apply_start_date,
+           j.last_date::TEXT                     AS apply_end_date,
+           j.exam_date::TEXT                     AS exam_date,
+           j.is_featured,
+           j.view_count,
+           j.save_count,
+           j.created_at,
+           -- Derived fields Android expects
+           FALSE                                 AS is_new,
+           CASE WHEN j.last_date <= NOW() + INTERVAL '3 days' THEN TRUE ELSE FALSE END AS is_urgent,
+           '{}' ::TEXT[]                         AS nearby_districts,
+           ''                                    AS location,
+           ''                                    AS salary_range,
+           (SELECT TRUE FROM job_saves js WHERE js.user_id=$${params.length+1} AND js.job_id=j.id) AS is_saved
          FROM job_vacancies j WHERE ${where}
-         ORDER BY j.created_at DESC LIMIT $${params.length+2} OFFSET $${params.length+3}`,
+         ORDER BY j.last_date ASC LIMIT $${params.length+2} OFFSET $${params.length+3}`,
         [...params, userId, limit, offset]
       ),
       this.db.query(`SELECT COUNT(*) FROM job_vacancies j WHERE ${where}`, params),
