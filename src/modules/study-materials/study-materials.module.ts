@@ -150,7 +150,7 @@ export class StudyMaterialsService {
         `SELECT sm.id, sm.title, sm.description, sm.subject, sm.material_type,
                 sm.author, sm.tags, sm.file_key, sm.file_size_bytes, sm.page_count,
                 sm.download_count, sm.is_featured, sm.is_trending,
-                sm.created_at, sm.uploader_id, sm.thumbnail_key,
+                sm.created_at, sm.uploader_id,
                 ${bookmarkSubq}
                 sm.status
          FROM study_materials sm WHERE ${where}
@@ -164,7 +164,7 @@ export class StudyMaterialsService {
     const materials = rows.map((m: any) => ({
       ...m,
       fileUrl:      m.file_key       ? this.fileUrl(m.file_key)       : null,
-      thumbnailUrl: m.thumbnail_key  ? this.fileUrl(m.thumbnail_key)  : null,
+      // thumbnailUrl: m.thumbnail_key  ? this.fileUrl(m.thumbnail_key)  : null,
       fileSizeMb:   m.file_size_bytes ? +(m.file_size_bytes / 1024 / 1024).toFixed(2) : 0,
     }));
 
