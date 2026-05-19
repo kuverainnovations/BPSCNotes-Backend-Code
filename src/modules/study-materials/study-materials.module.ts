@@ -84,15 +84,18 @@ export class StudyMaterialsService {
     private readonly config: ConfigService,
   ) {
     // UPLOAD_DIR defaults to <project-root>/uploads — change in .env for production
-    this.uploadDir = this.config.get<string>('UPLOAD_DIR')
-      ?? join(process.cwd(), 'uploads');
+    this.uploadDir = './uploads';
 
     // BASE_URL for building file URLs returned to clients
     this.baseUrl = this.config.get<string>('BASE_URL')
       ?? 'https://api.bpscnotes.in';
 
     // Ensure upload directory exists on startup
-    fs.mkdirSync(join(this.uploadDir, 'materials'), { recursive: true });
+    try {
+      fs.mkdirSync(join(this.uploadDir, 'materials'), { recursive: true });
+    } catch (e) {
+      this.logger.error('Upload directory creation failed', e);
+    }
     this.logger.log(`📁 File storage: ${this.uploadDir}`);
   }
 
