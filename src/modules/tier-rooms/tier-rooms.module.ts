@@ -947,6 +947,7 @@ export class TierRoomsController {
   constructor(
     private readonly tiersService:    TierRoomsService,
     private readonly sessionsService: StudySessionsService,
+    private readonly gateway:         TierRoomsGateway,
   ) {}
 
   @Get('tiers')
@@ -995,6 +996,22 @@ export class TierRoomsController {
   @Get('tiers/at-risk')
   getAtRiskStatus(@Req() r: any) {
     return this.tiersService.getAtRiskStatus(r.user.id);
+  }
+
+  /**
+   * GET /rooms/tiers/:tierKey/messages?limit=50
+   * Returns last N chat messages for a tier room, oldest-first.
+   * Called by ChatSheet on open to load history before live WS messages.
+   * FIX: This endpoint was MISSING — causing chat history to always fail (404).
+   */
+  @Get('tiers/:tierKey/messages')
+  async getChatHistory(
+    @Param('tierKey') tierKey: string,
+    @Query('limit')   limit:   number = 50,
+  ) {
+    const msgs = await this.gateway.getChatHistory(tierKey, Math.min(+limit || 50, 100));
+    // gateway returns newest-first from DB; reverse for oldest-first display
+    return successResponse({ messages: msgs.reverse() });
   }
 }
 

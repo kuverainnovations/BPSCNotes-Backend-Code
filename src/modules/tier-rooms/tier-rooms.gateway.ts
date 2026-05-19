@@ -125,7 +125,10 @@ export class TierRoomsGateway
       if (tierKey) {
         this.presence.get(tierKey)?.delete(userId);
         this.socketTier.delete(client.id);
-        this.broadcastPresenceUpdate(tierKey);
+        // Use async count from DB so disconnect shows accurate active session count
+        this.getActiveSessionCount(tierKey).then(count => {
+          this.broadcastPresenceUpdateWithCount(tierKey, count);
+        });
       }
     }
     this.logger.log(`WS disconnected: socket=${client.id}`);
@@ -157,10 +160,15 @@ export class TierRoomsGateway
     if (!this.presence.has(tierKey)) this.presence.set(tierKey, new Set());
     this.presence.get(tierKey)!.add(userId);
 
-    this.broadcastPresenceUpdate(tierKey);
+    // FIX: Presence count = active study SESSIONS, not socket connections.
+    // A user viewing the lobby gets added to socketTier (for chat routing)
+    // but the broadcast count comes from DB active sessions, not socket set.
+    // This stops the "1 online" bug when user just opens the page.
+    const activeCount = await this.getActiveSessionCount(tierKey);
+    this.broadcastPresenceUpdateWithCount(tierKey, activeCount);
 
     // Acknowledge
-    return { event: 'tier:joined', tierKey, activeNow: this.presence.get(tierKey)!.size };
+    return { event: 'tier:joined', tierKey, activeNow: activeCount };
   }
 
   // ── CLIENT: leaves tier room view ─────────────────────────
@@ -181,11 +189,19 @@ export class TierRoomsGateway
   @SubscribeMessage('room:send_message')
   async handleSendMessage(
     @ConnectedSocket() client: Socket,
-    @MessageBody() data: { message: string },
+    @MessageBody() data: { message: string; tierKey?: string },
   ) {
-    const userId  = (client as any).userId as string;
-    const tierKey = this.socketTier.get(client.id);
+    const userId = (client as any).userId as string;
+    // FIX: Use tierKey from socketTier map (set by join_room) OR from payload fallback.
+    // Without payload fallback, a race condition causes "Not in a room" if
+    // the client sends a message immediately after a reconnect before join_room completes.
+    const tierKey = this.socketTier.get(client.id) || data?.tierKey;
     if (!userId || !tierKey) throw new WsException('Not in a room.');
+    // Also register in socketTier if it was resolved from payload
+    if (!this.socketTier.has(client.id) && data?.tierKey) {
+      client.join(\`tier:\${tierKey}\`);
+      this.socketTier.set(client.id, tierKey);
+    }
 
     const msg = data?.message?.trim();
     if (!msg) return;
@@ -364,13 +380,28 @@ export class TierRoomsGateway
   }
 
   // ── SERVER: broadcast presence (member count) ─────────────
+  private async getActiveSessionCount(tierKey: string): Promise<number> {
+    try {
+      const [row] = await this.db.query(
+        `SELECT COUNT(DISTINCT ss.user_id)::int AS active
+         FROM study_sessions ss
+         JOIN user_room_tier urt ON urt.user_id = ss.user_id
+         JOIN room_tiers rt ON rt.id = urt.current_tier_id
+         WHERE rt.tier_key = $1 AND ss.ended_at IS NULL`,
+        [tierKey]
+      );
+      return row?.active ?? 0;
+    } catch { return 0; }
+  }
+
   private broadcastPresenceUpdate(tierKey: string) {
-    const count = this.presence.get(tierKey)?.size ?? 0;
-    this.server.to(`tier:${tierKey}`).emit('tier:presence_update', {
-      tierKey, activeNow: count,
+    // FIX: Use DB session count not socket connection count.
+    // Viewing the lobby emits tier:join_room which adds to socket presence,
+    // but should NOT increment "studying" count until a session is started.
+    this.getActiveSessionCount(tierKey).then(activeNow => {
+      this.server.to(`tier:${tierKey}`).emit('tier:presence_update', { tierKey, activeNow });
+      this.server.emit('tier:presence_update', { tierKey, activeNow });
     });
-    // Also emit to ALL connected clients (for the lobby screen)
-    this.server.emit('tier:presence_update', { tierKey, activeNow: count });
   }
 
   private buildPresenceSnapshot(): Record<string, number> {
