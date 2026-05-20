@@ -319,13 +319,25 @@ export class StudyMaterialsService {
   // ── POST: toggle bookmark ─────────────────────────────────
   async toggleBookmark(materialId: string, userId: string) {
     const exists = await this.db.query(
-      `SELECT id FROM material_bookmarks WHERE material_id=$1 AND user_id=$2`, [materialId, userId]
+      `SELECT 1 FROM material_bookmarks WHERE material_id=$1 AND user_id=$2`,
+      [materialId, userId]
     );
+  
     if (exists.length) {
-      await this.db.query(`DELETE FROM material_bookmarks WHERE material_id=$1 AND user_id=$2`, [materialId, userId]);
+      await this.db.query(
+        `DELETE FROM material_bookmarks WHERE material_id=$1 AND user_id=$2`,
+        [materialId, userId]
+      );
+  
       return successResponse({ bookmarked: false });
     } else {
-      await this.db.query(`INSERT INTO material_bookmarks (material_id, user_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`, [materialId, userId]);
+      await this.db.query(
+        `INSERT INTO material_bookmarks (material_id, user_id)
+         VALUES ($1,$2)
+         ON CONFLICT DO NOTHING`,
+        [materialId, userId]
+      );
+  
       return successResponse({ bookmarked: true });
     }
   }
