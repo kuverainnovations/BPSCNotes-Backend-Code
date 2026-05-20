@@ -1062,32 +1062,107 @@ class FlashcardsService {
   }
 
   async create(data: any, adminId: string) {
+
     const front = data.front || data.question;
     const back  = data.back  || data.answer;
-    if (!front || !back) throw new BadRequestException('front (question) and back (answer) are required');
+  
+    if (!front || !back) {
+      throw new BadRequestException(
+        'front (question) and back (answer) are required'
+      );
+    }
+  
     const cardType = data.cardType || data.card_type || 'text';
-    const imageUrl = cardType === 'image' ? (data.imageUrl || data.image_url || null) : null;
-    const backImageUrl = data.backImageUrl || data.back_image_url || null;
-    const result = await this.db.query(
-      `INSERT INTO flashcards
-         (front, back, subject, exam_tags, difficulty, card_type, image_url, back_image_url, topic, hint, example, created_by)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING *`,
-      [
-        front, back,
-        data.subject || 'General',
-        data.examTags || data.exam_tags || [],
-        data.difficulty || 'medium',
-        cardType,
-        imageUrl,
-        backImageUrl,
-        data.topic || data.subject || 'General',
-        data.hint || '',
-        data.example || '',
-        adminId,
-      ]
+  
+    const imageUrl =
+      cardType === 'image'
+        ? (data.imageUrl || data.image_url || null)
+        : null;
+  
+    const backImageUrl =
+      data.backImageUrl || data.back_image_url || null;
+  
+    // Check whether migration columns exist
+    const hasExtra = await this.db.query(
+      `SELECT COUNT(*) AS cnt
+       FROM information_schema.columns
+       WHERE table_name='flashcards'
+       AND column_name='card_type'`
     );
+  
+    let result;
+  
+    if (parseInt(hasExtra[0]?.cnt || '0') > 0) {
+  
+      // Migration exists → full insert
+      result = await this.db.query(
+        `INSERT INTO flashcards
+           (
+             front,
+             back,
+             subject,
+             exam_tags,
+             difficulty,
+             card_type,
+             image_url,
+             back_image_url,
+             topic,
+             hint,
+             example,
+             created_by
+           )
+         VALUES
+           ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+         RETURNING *`,
+        [
+          front,
+          back,
+          data.subject || 'General',
+          data.examTags || data.exam_tags || [],
+          data.difficulty || 'medium',
+          cardType,
+          imageUrl,
+          backImageUrl,
+          data.topic || data.subject || 'General',
+          data.hint || '',
+          data.example || '',
+          adminId
+        ]
+      );
+  
+    } else {
+  
+      // Migration not run yet → safe fallback
+      result = await this.db.query(
+        `INSERT INTO flashcards
+           (
+             front,
+             back,
+             subject,
+             exam_tags,
+             difficulty,
+             created_by
+           )
+         VALUES
+           ($1,$2,$3,$4,$5,$6)
+         RETURNING *`,
+        [
+          front,
+          back,
+          data.subject || 'General',
+          data.examTags || data.exam_tags || [],
+          data.difficulty || 'medium',
+          adminId
+        ]
+      );
+    }
+  
     await this.invalidateCache();
-    return successResponse({ flashcard: result[0] }, 'Flashcard created ✅');
+  
+    return successResponse(
+      { flashcard: result[0] },
+      'Flashcard created ✅'
+    );
   }
 
   async update(id: string, data: any) {
