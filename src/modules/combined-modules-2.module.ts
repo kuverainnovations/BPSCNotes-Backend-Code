@@ -1026,7 +1026,11 @@ class FlashcardsService {
          f.difficulty,
          COALESCE(f.card_type,'text') AS card_type,
          f.image_url,
-         f.back_image_url,
+         -- Safe: returns NULL if back_image_url column doesn't exist yet (migration pending)
+         CASE WHEN EXISTS (
+           SELECT 1 FROM information_schema.columns
+           WHERE table_name='flashcards' AND column_name='back_image_url'
+         ) THEN f.back_image_url ELSE NULL END AS back_image_url,
          NULL        AS related_mcq,
          f.exam_tags
        FROM flashcards f
