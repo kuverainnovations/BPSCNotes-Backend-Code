@@ -139,7 +139,13 @@ if (q.scheduled_for) {
     // Fetch questions — THIS is the only place questions are returned
     const questions = await this.db.query(
       `SELECT id, question_text, option_a, option_b, option_c, option_d,
-              subject, difficulty, sort_order
+              question_type, question_image_url, option_type,
+              option_a_image, option_b_image, option_c_image, option_d_image,
+              subject, difficulty, sort_order,
+              COALESCE(question_type, 'text')   AS question_type,
+              question_image_url,
+              COALESCE(option_type, 'text')     AS option_type,
+              option_a_image, option_b_image, option_c_image, option_d_image
        FROM quiz_questions
        WHERE quiz_id=$1
        ORDER BY sort_order ASC`,
@@ -170,7 +176,11 @@ if (q.scheduled_for) {
     // Fetch correct answers + explanations
     const questions = await this.db.query(
       `SELECT id, correct_option, explanation, question_text,
-              option_a, option_b, option_c, option_d
+              option_a, option_b, option_c, option_d,
+              COALESCE(question_type, 'text')   AS question_type,
+              question_image_url,
+              COALESCE(option_type, 'text')     AS option_type,
+              option_a_image, option_b_image, option_c_image, option_d_image
        FROM quiz_questions WHERE quiz_id=$1`,
       [quizId]
     );
@@ -355,7 +365,13 @@ if (q.scheduled_for) {
     // Validate each question
     for (const q of questions) {
       if (!q.question && !q.questionText) throw new BadRequestException('Each question needs a question_text');
-      if (!q.optionA || !q.optionB || !q.optionC || !q.optionD) throw new BadRequestException('Each question needs 4 options (optionA-D)');
+      // For image-type options, text options can be empty (images are the content)
+      const opType = q.optionType || q.option_type || 'text';
+      if (opType === 'text') {
+        if (!q.optionA || !q.optionB || !q.optionC || !q.optionD) throw new BadRequestException('Each question needs 4 options (optionA-D)');
+      } else if (opType === 'image') {
+        if (!q.optionAImage && !q.option_a_image) throw new BadRequestException('Image options require option images (optionAImage-D)');
+      }
       if (!['a','b','c','d'].includes(q.correctOption?.toLowerCase())) throw new BadRequestException(`correctOption must be a, b, c or d. Got: ${q.correctOption}`);
     }
 
@@ -365,21 +381,32 @@ if (q.scheduled_for) {
 
     const inserted: any[] = [];
     for (const q of questions) {
+      const questionType = q.questionType || q.question_type || 'text';
+      const optionType   = q.optionType   || q.option_type   || 'text';
       const result = await this.db.query(
         `INSERT INTO quiz_questions
            (quiz_id, question_text, option_a, option_b, option_c, option_d,
-            correct_option, explanation, subject, difficulty, sort_order)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
-         RETURNING id, question_text, sort_order`,
+            correct_option, explanation, subject, difficulty, sort_order,
+            question_type, question_image_url, option_type,
+            option_a_image, option_b_image, option_c_image, option_d_image)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+         RETURNING id, question_text, sort_order, question_type, option_type`,
         [
           quizId,
           (q.question || q.questionText).trim(),
-          q.optionA.trim(), q.optionB.trim(), q.optionC.trim(), q.optionD.trim(),
+          q.optionA?.trim() || '', q.optionB?.trim() || '', q.optionC?.trim() || '', q.optionD?.trim() || '',
           q.correctOption.toLowerCase(),
           q.explanation?.trim() || null,
           q.subject?.trim() || null,
           q.difficulty || 'medium',
           sortOrder++,
+          questionType,
+          q.questionImageUrl || q.question_image_url || null,
+          optionType,
+          q.optionAImage || q.option_a_image || null,
+          q.optionBImage || q.option_b_image || null,
+          q.optionCImage || q.option_c_image || null,
+          q.optionDImage || q.option_d_image || null,
         ]
       );
       inserted.push(result[0]);
@@ -404,8 +431,15 @@ if (q.scheduled_for) {
     const vals: any[]      = [];
     let i = 1;
     const map: any = {
-      questionText: 'question_text',
-      optionA:      'option_a',
+      questionText:     'question_text',
+      questionType:     'question_type',
+      questionImageUrl: 'question_image_url',
+      optionType:       'option_type',
+      optionA:          'option_a',
+      optionAImage:     'option_a_image',
+      optionBImage:     'option_b_image',
+      optionCImage:     'option_c_image',
+      optionDImage:     'option_d_image',
       optionB:      'option_b',
       optionC:      'option_c',
       optionD:      'option_d',
