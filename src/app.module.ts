@@ -31,7 +31,7 @@ import { CoinsModule } from './modules/coins/coins.module';
 
 import {
   StudyRoomsModule, UsersModule, BannersModule, ExamsModule, DailyTargetsModule,
-  FlashcardsModule,
+  FlashcardsModule, AdminUploadModule,
 } from './modules/combined-modules-2.module';
 import { TierRoomsModule }    from './modules/tier-rooms/tier-rooms.module';
 import { AchievementsModule } from './modules/achievements/achievements.module';
@@ -124,6 +124,7 @@ import { StudyMaterialsModule } from '@modules/study-materials/study-materials.m
     ExamsModule,
     DailyTargetsModule,
     FlashcardsModule,
+    AdminUploadModule,
     TierRoomsModule,
     AchievementsModule,
     StudyMaterialsModule,

@@ -18,6 +18,11 @@ import { AuthModule, AuthService } from './auth/auth.module';
 import { AchievementsService, WeeklyChallengesService } from './achievements/achievements.module';
 
 import { JwtAuthGuard, AdminJwtGuard, PermissionGuard, RequirePermission, Public } from '../common/guards';
+import { FileInterceptor } from '@nestjs/platform-express';
+import { diskStorage }     from 'multer';
+import { extname, join }   from 'path';
+import * as fs             from 'fs';
+import * as crypto         from 'crypto';
 import { PaginationDto } from '../common/dtos/pagination.dto';
 import { successResponse, paginationMeta } from '../common/utils/response.util';
 
@@ -805,6 +810,52 @@ class AdminUsersExtraController {
 export class UsersModule {}
 
 // ════════════════════════════════════════════════════════════
+// IMAGE UPLOAD — Admin endpoint for flashcard / MCQ images
+// POST /admin/upload/image  → saves to local disk → returns { data: { url } }
+// ════════════════════════════════════════════════════════════
+@Public()
+@UseGuards(AdminJwtGuard)
+@Controller('admin/upload')
+class AdminUploadController {
+
+  @Post('image')
+  @HttpCode(200)
+  @UseInterceptors(
+    FileInterceptor('image', {
+      storage: diskStorage({
+        destination: (_req: any, _file: any, cb: any) => {
+          const uploadDir = process.env.UPLOAD_DIR ?? join(process.cwd(), 'uploads');
+          const dest = join(uploadDir, 'images');
+          fs.mkdirSync(dest, { recursive: true });
+          cb(null, dest);
+        },
+        filename: (_req: any, file: any, cb: any) => {
+          const ext  = extname(file.originalname).toLowerCase() || '.jpg';
+          const name = `${Date.now()}_${crypto.randomBytes(8).toString('hex')}${ext}`;
+          cb(null, name);
+        },
+      }),
+      limits: { fileSize: 10 * 1024 * 1024 },   // 10 MB max
+      fileFilter: (_req: any, file: any, cb: any) => {
+        if (file.mimetype.startsWith('image/')) cb(null, true);
+        else cb(new Error('Only image files are allowed'), false);
+      },
+    }),
+  )
+  uploadImage(@UploadedFile() file: Express.Multer.File, @Req() _req: any) {
+    if (!file) throw new Error('No file uploaded');
+    const uploadDir = process.env.UPLOAD_DIR ?? join(process.cwd(), 'uploads');
+    const baseUrl   = process.env.BASE_URL    ?? 'https://api.bpscnotes.in';
+    const fileKey   = file.path.replace(uploadDir + '/', '').replace(/\\/g, '/');
+    const url       = `${baseUrl}/uploads/${fileKey}`;
+    return { success: true, message: 'Image uploaded', data: { url, fileKey } };
+  }
+}
+
+@Module({ controllers: [AdminUploadController] })
+export class AdminUploadModule {}
+
+// ════════════════════════════════════════════════════════════
 // BANNERS MODULE
 // ════════════════════════════════════════════════════════════
 @Injectable()
@@ -1026,11 +1077,7 @@ class FlashcardsService {
          f.difficulty,
          COALESCE(f.card_type,'text') AS card_type,
          f.image_url,
-         -- Safe: returns NULL if back_image_url column doesn't exist yet (migration pending)
-         CASE WHEN EXISTS (
-           SELECT 1 FROM information_schema.columns
-           WHERE table_name='flashcards' AND column_name='back_image_url'
-         ) THEN f.back_image_url ELSE NULL END AS back_image_url,
+         f.back_image_url,
          NULL        AS related_mcq,
          f.exam_tags
        FROM flashcards f
@@ -1062,107 +1109,32 @@ class FlashcardsService {
   }
 
   async create(data: any, adminId: string) {
-
     const front = data.front || data.question;
     const back  = data.back  || data.answer;
-  
-    if (!front || !back) {
-      throw new BadRequestException(
-        'front (question) and back (answer) are required'
-      );
-    }
-  
+    if (!front || !back) throw new BadRequestException('front (question) and back (answer) are required');
     const cardType = data.cardType || data.card_type || 'text';
-  
-    const imageUrl =
-      cardType === 'image'
-        ? (data.imageUrl || data.image_url || null)
-        : null;
-  
-    const backImageUrl =
-      data.backImageUrl || data.back_image_url || null;
-  
-    // Check whether migration columns exist
-    const hasExtra = await this.db.query(
-      `SELECT COUNT(*) AS cnt
-       FROM information_schema.columns
-       WHERE table_name='flashcards'
-       AND column_name='card_type'`
+    const imageUrl = cardType === 'image' ? (data.imageUrl || data.image_url || null) : null;
+    const backImageUrl = data.backImageUrl || data.back_image_url || null;
+    const result = await this.db.query(
+      `INSERT INTO flashcards
+         (front, back, subject, exam_tags, difficulty, card_type, image_url, back_image_url, topic, hint, example, created_by)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING *`,
+      [
+        front, back,
+        data.subject || 'General',
+        data.examTags || data.exam_tags || [],
+        data.difficulty || 'medium',
+        cardType,
+        imageUrl,
+        backImageUrl,
+        data.topic || data.subject || 'General',
+        data.hint || '',
+        data.example || '',
+        adminId,
+      ]
     );
-  
-    let result;
-  
-    if (parseInt(hasExtra[0]?.cnt || '0') > 0) {
-  
-      // Migration exists → full insert
-      result = await this.db.query(
-        `INSERT INTO flashcards
-           (
-             front,
-             back,
-             subject,
-             exam_tags,
-             difficulty,
-             card_type,
-             image_url,
-             back_image_url,
-             topic,
-             hint,
-             example,
-             created_by
-           )
-         VALUES
-           ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
-         RETURNING *`,
-        [
-          front,
-          back,
-          data.subject || 'General',
-          data.examTags || data.exam_tags || [],
-          data.difficulty || 'medium',
-          cardType,
-          imageUrl,
-          backImageUrl,
-          data.topic || data.subject || 'General',
-          data.hint || '',
-          data.example || '',
-          adminId
-        ]
-      );
-  
-    } else {
-  
-      // Migration not run yet → safe fallback
-      result = await this.db.query(
-        `INSERT INTO flashcards
-           (
-             front,
-             back,
-             subject,
-             exam_tags,
-             difficulty,
-             created_by
-           )
-         VALUES
-           ($1,$2,$3,$4,$5,$6)
-         RETURNING *`,
-        [
-          front,
-          back,
-          data.subject || 'General',
-          data.examTags || data.exam_tags || [],
-          data.difficulty || 'medium',
-          adminId
-        ]
-      );
-    }
-  
     await this.invalidateCache();
-  
-    return successResponse(
-      { flashcard: result[0] },
-      'Flashcard created ✅'
-    );
+    return successResponse({ flashcard: result[0] }, 'Flashcard created ✅');
   }
 
   async update(id: string, data: any) {
