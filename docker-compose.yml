@@ -33,6 +33,9 @@ services:
     container_name: bpscnotes-api
     restart: unless-stopped
 
+    volumes:
+      - /var/www/uploads:/app/uploads
+
     # BUG FIX 3: removed hardcoded JWT_SECRET / ADMIN_JWT_SECRET from here.
     # They were overriding the strong values in .env with "secret123".
     # docker-compose environment: block has higher priority than env_file.
