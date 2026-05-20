@@ -139,9 +139,10 @@ if (q.scheduled_for) {
     // Fetch questions — THIS is the only place questions are returned
     const questions = await this.db.query(
       `SELECT id, question_text, option_a, option_b, option_c, option_d,
-              question_type, question_image_url, option_type,
-              option_a_image, option_b_image, option_c_image, option_d_image,
-              subject, difficulty, sort_order,
+       explanation,
+       question_type, question_image_url, option_type,
+       option_a_image, option_b_image, option_c_image, option_d_image,
+       subject, difficulty, sort_order,
               COALESCE(question_type, 'text')   AS question_type,
               question_image_url,
               COALESCE(option_type, 'text')     AS option_type,
@@ -342,7 +343,10 @@ if (q.scheduled_for) {
 
     const questions = await this.db.query(
       `SELECT id, question_text, option_a, option_b, option_c, option_d,
-              correct_option, explanation, subject, difficulty, sort_order
+       explanation,
+       question_type, question_image_url, option_type,
+       option_a_image, option_b_image, option_c_image, option_d_image,
+       subject, difficulty, sort_order
        FROM quiz_questions WHERE quiz_id=$1 ORDER BY sort_order ASC`,
       [quizId]
     );
