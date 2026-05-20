@@ -26,6 +26,11 @@ import * as crypto         from 'crypto';
 import { PaginationDto } from '../common/dtos/pagination.dto';
 import { successResponse, paginationMeta } from '../common/utils/response.util';
 
+import {
+  UseInterceptors,
+  UploadedFile,
+} from '@nestjs/common';
+
 // ════════════════════════════════════════════════════════════
 // STUDY ROOMS MODULE
 // ════════════════════════════════════════════════════════════
