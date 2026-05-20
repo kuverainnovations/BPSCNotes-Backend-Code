@@ -849,11 +849,25 @@ class AdminUploadController {
   )
   uploadImage(@UploadedFile() file: Express.Multer.File, @Req() _req: any) {
     if (!file) throw new Error('No file uploaded');
+    // const uploadDir = process.env.UPLOAD_DIR ?? join(process.cwd(), 'uploads');
+    // const baseUrl   = process.env.BASE_URL    ?? 'https://api.bpscnotes.in';
+    // const fileKey   = file.path.replace(uploadDir + '/', '').replace(/\\/g, '/');
+    // const url       = `${baseUrl}/uploads/${fileKey}`;
+    // return { success: true, message: 'Image uploaded', data: { url, fileKey } };
     const uploadDir = process.env.UPLOAD_DIR ?? join(process.cwd(), 'uploads');
-    const baseUrl   = process.env.BASE_URL    ?? 'https://api.bpscnotes.in';
-    const fileKey   = file.path.replace(uploadDir + '/', '').replace(/\\/g, '/');
-    const url       = `${baseUrl}/uploads/${fileKey}`;
-    return { success: true, message: 'Image uploaded', data: { url, fileKey } };
+const baseUrl   = process.env.BASE_URL ?? 'https://api.bpscnotes.in';
+
+const fileKey = file.path
+  .replace(uploadDir + '/', '')
+  .replace(/\\/g, '/');
+
+const url = `${baseUrl}/${fileKey}`;
+
+return {
+  success: true,
+  message: 'Image uploaded',
+  data: { url, fileKey }
+};
   }
 }
 
