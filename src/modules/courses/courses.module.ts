@@ -420,15 +420,16 @@ export class CoursesService {
     await this.db.query(
       `
       UPDATE user_enrollments
-      SET
-        completed_lessons = $1::integer,
-        last_lesson_id = $2::uuid,
-        status =
-          CASE
-            WHEN $1::integer >= $3::integer
-            THEN 'completed'
-            ELSE 'active'
-          END
+SET
+  completed_lessons = $1::integer,
+  last_lesson_id = $2::uuid,
+  last_studied_at = NOW(),
+  status =
+    CASE
+      WHEN $1::integer >= $3::integer
+      THEN 'completed'
+      ELSE 'active'
+    END
       WHERE user_id = $4::uuid
         AND course_id = $5::uuid
       `,
