@@ -526,15 +526,48 @@ SET
     `,[courseId]);
     return successResponse({ chapters });
   }
-
-  async getLessonDetail(lessonId: string, userId: string) {
+  async getLessonDetail(
+    courseId: string,
+    lessonId: string,
+    userId: string
+  ) {
+  
+    // ✅ Update recent activity when lesson opens
+    await this.db.query(
+      `
+      UPDATE user_enrollments
+      SET
+        last_studied_at = NOW(),
+        last_lesson_id = $1::uuid
+      WHERE user_id = $2::uuid
+        AND course_id = $3::uuid
+      `,
+      [lessonId, userId, courseId]
+    );
+  
+    // ✅ Fetch lesson
     const rows = await this.db.query(`
-      SELECT l.*,
-        (SELECT lp.is_completed FROM lesson_progress lp WHERE lp.user_id=$2 AND lp.lesson_id=l.id) AS is_completed,
-        (SELECT lp.watch_time_secs FROM lesson_progress lp WHERE lp.user_id=$2 AND lp.lesson_id=l.id) AS watch_time_secs
-      FROM course_lessons l WHERE l.id=$1
-    `,[lessonId, userId]);
-    if (!rows[0]) throw new NotFoundException('Lesson not found');
+        SELECT l.*,
+          (
+            SELECT lp.is_completed
+            FROM lesson_progress lp
+            WHERE lp.user_id=$2 AND lp.lesson_id=l.id
+          ) AS is_completed,
+  
+          (
+            SELECT lp.watch_time_secs
+            FROM lesson_progress lp
+            WHERE lp.user_id=$2 AND lp.lesson_id=l.id
+          ) AS watch_time_secs
+  
+        FROM course_lessons l
+        WHERE l.id=$1
+      `, [lessonId, userId]);
+  
+    if (!rows[0]) {
+      throw new NotFoundException('Lesson not found');
+    }
+  
     return successResponse({ lesson: rows[0] });
   }
 
@@ -641,8 +674,16 @@ export class CoursesController {
   }
 
   @Get(':courseId/lessons/:lessonId')
-  getLessonDetail(@Param('courseId', ParseUUIDPipe) courseId: string,@Param('lessonId', ParseUUIDPipe) lessonId: string, @Req() req: any) {
-    return this.service.getLessonDetail(lessonId, req.user.id);
+  getLessonDetail(
+    @Param('courseId', ParseUUIDPipe) courseId: string,
+    @Param('lessonId', ParseUUIDPipe) lessonId: string,
+    @Req() req: any
+  ) {
+    return this.service.getLessonDetail(
+      courseId,
+      lessonId,
+      req.user.id
+    );
   }
 
   @Post(':id/review')
