@@ -113,7 +113,7 @@ export class StudyMaterialsService {
   async listApproved(query: {
     type?: string; subject?: string; search?: string;
     page?: number; limit?: number; sort?: string;
-    bookmarkedOnly?: boolean; userId?: string;
+    bookmarkedOnly?: boolean | String; userId?: string;
   }) {
     const page   = Math.max(1, +(query.page  ?? 1));
     const limit  = Math.min(50, Math.max(1, +(query.limit ?? 20)));
