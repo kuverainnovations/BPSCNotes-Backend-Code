@@ -113,7 +113,7 @@ export class StudyMaterialsService {
   async listApproved(query: {
     type?: string; subject?: string; search?: string;
     page?: number; limit?: number; sort?: string;
-    bookmarkedOnly?: boolean; userId?: string;
+    bookmarkedOnly?: boolean | String; userId?: string;
   }) {
     const page   = Math.max(1, +(query.page  ?? 1));
     const limit  = Math.min(50, Math.max(1, +(query.limit ?? 20)));
@@ -131,8 +131,11 @@ export class StudyMaterialsService {
     }
     // FIX: bookmarkedOnly comes from query string as "false"/"true" (string, not boolean)
     // In JS: "false" is TRUTHY → the old code always applied bookmark filter → empty results
-    const wantsBookmarks = query.bookmarkedOnly === true || query.bookmarkedOnly === 'true';
-    if (wantsBookmarks && query.userId) {
+    const wantsBookmarks =
+    query.bookmarkedOnly === true ||
+    query.bookmarkedOnly === 'true' ||
+    query.bookmarkedOnly === '1';
+        if (wantsBookmarks && query.userId) {
       conditions.push(`EXISTS (SELECT 1 FROM material_bookmarks mb WHERE mb.material_id=sm.id AND mb.user_id=$${pi++})`);
       params.push(query.userId);
     }
