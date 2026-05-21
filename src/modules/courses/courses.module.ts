@@ -118,7 +118,11 @@ export class CoursesRepository {
         `SELECT c.id, c.title, c.description, c.instructor, c.instructor_bio,
                 c.instructor_students, c.instructor_courses,
                 c.subject, c.price, c.original_price, c.is_paid,
-                c.is_featured, c.is_limited_offer, c.offer_ends_at, c.thumbnail_url, c.total_lessons,
+                c.is_featured, c.is_limited_offer, c.offer_ends_at, c.thumbnail_url, (
+   SELECT COUNT(*)
+   FROM course_lessons cl
+   WHERE cl.course_id = c.id
+) AS total_lessons,
                 c.total_hours, c.rating, c.review_count, c.enrollment_count, c.bpsc_relevance,
                 c.exam_tags, c.language, c.status, c.created_at, c.trial_lesson_title,
                 c.what_you_learn, c.has_certificate${userSubQuery}
@@ -141,7 +145,11 @@ export class CoursesRepository {
          c.instructor_students, c.instructor_courses,
          c.subject, c.price, c.original_price, c.is_paid, c.is_featured,
          c.is_limited_offer, c.offer_ends_at, c.thumbnail_url,
-         c.total_lessons, c.total_hours, c.rating, c.review_count,
+         (
+   SELECT COUNT(*)
+   FROM course_lessons cl
+   WHERE cl.course_id = c.id
+) AS total_lessons, c.total_hours, c.rating, c.review_count,
          c.enrollment_count, c.bpsc_relevance, c.syllabus_coverage,
          c.language, c.trial_lesson_title, c.exam_tags, c.status,
          c.what_you_learn, c.has_certificate,
@@ -399,8 +407,14 @@ export class CoursesService {
       [userId, courseId]
     );
     const completedLessons = parseInt(progress[0].completed);
-    const courseData = await this.db.query(`SELECT total_lessons FROM courses WHERE id=$1`, [courseId]);
-    const totalLessons = courseData[0]?.total_lessons || 0;
+    const lessonCountResult = await this.db.query(
+      `SELECT COUNT(*)::int AS total
+       FROM course_lessons
+       WHERE course_id = $1`,
+      [courseId]
+    )
+    
+    const totalLessons = lessonCountResult[0]?.total || 0
     const isCompleted  = completedLessons >= totalLessons;
 
     await this.db.query(
