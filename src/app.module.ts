@@ -68,7 +68,7 @@ import { StudyMaterialsModule } from '@modules/study-materials/study-materials.m
           // It runs ALTER TABLE on every restart, can cause data loss and
           // startup race conditions. Use explicit migrations instead.
           synchronize: !isProd,   // true in dev, false in production
-          migrationsRun: isProd,  // auto-run migrations on start in production
+          migrationsRun: !isProd,  // auto-run migrations on start in production
 
           logging:  config.get('database.logging'),
           extra: {
