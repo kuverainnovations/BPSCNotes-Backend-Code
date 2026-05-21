@@ -101,7 +101,7 @@ export class StudyMaterialsService {
 
   // ── Build public URL for a stored file key ────────────────
   private fileUrl(fileKey: string): string {
-    return `${this.baseUrl}/uploads/${fileKey}`;
+    return `${this.baseUrl}/${fileKey}`;
   }
 
   // ── Extract subpath from absolute path ───────────────────
