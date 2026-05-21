@@ -342,28 +342,56 @@ export class StudyMaterialsService {
     });
   }
 
-  // ── Admin methods ─────────────────────────────────────────
   async adminList(query: any) {
-    const page   = Math.max(1, +(query.page  ?? 1));
+    const page   = Math.max(1, +(query.page ?? 1));
     const limit  = Math.min(100, +(query.limit ?? 20));
     const offset = (page - 1) * limit;
+  
     const conditions: string[] = ['1=1'];
     const params: any[] = [];
     let pi = 1;
-    if (query.status)  { conditions.push(`status=$${pi++}`);       params.push(query.status); }
-    if (query.subject) { conditions.push(`subject=$${pi++}`);      params.push(query.subject); }
-    if (query.search)  { conditions.push(`title ILIKE $${pi++}`);  params.push(`%${query.search}%`); }
+  
+    if (query.status) {
+      conditions.push(`sm.status=$${pi++}`);
+      params.push(query.status);
+    }
+  
+    if (query.subject) {
+      conditions.push(`sm.subject=$${pi++}`);
+      params.push(query.subject);
+    }
+  
+    if (query.search) {
+      conditions.push(`sm.title ILIKE $${pi++}`);
+      params.push(`%${query.search}%`);
+    }
+  
     const where = conditions.join(' AND ');
+  
     const [rows, [cnt]] = await Promise.all([
       this.db.query(
-        `SELECT sm.*, u.name AS uploader_name FROM study_materials sm LEFT JOIN users u ON u.id=sm.uploader_id
-         WHERE ${where} ORDER BY sm.created_at DESC LIMIT $${pi++} OFFSET $${pi++}`,
+        `
+        SELECT sm.*, u.name AS uploader_name
+        FROM study_materials sm
+        LEFT JOIN users u ON u.id = sm.uploader_id
+        WHERE ${where}
+        ORDER BY sm.created_at DESC
+        LIMIT $${pi++} OFFSET $${pi++}
+        `,
         [...params, limit, offset]
       ),
-      this.db.query(`SELECT COUNT(*) FROM study_materials sm WHERE ${where}`, params),
+  
+      this.db.query(
+        `SELECT COUNT(*) FROM study_materials sm WHERE ${where}`,
+        params
+      ),
     ]);
+  
     return successResponse({
-      materials: rows.map((m: any) => ({ ...m, fileUrl: m.file_key ? this.fileUrl(m.file_key) : null })),
+      materials: rows.map((m: any) => ({
+        ...m,
+        fileUrl: m.file_key ? this.fileUrl(m.file_key) : null
+      })),
       meta: paginationMeta(parseInt(cnt.count, 10), page, limit),
     });
   }
