@@ -172,6 +172,16 @@ export class CoursesRepository {
            WHERE ue.user_id = $2 AND ue.course_id = c.id LIMIT 1
          ) AS enrollment,` : ''}
 
+         -- Has current user already reviewed
+         ${userId ? `(
+          SELECT EXISTS (
+            SELECT 1
+            FROM course_reviews cr
+            WHERE cr.course_id = c.id
+              AND cr.user_id = $2
+          )
+        ) AS has_reviewed,` : ''}
+
          -- Chapters with lessons + is_completed per user
          (
            SELECT json_agg(
