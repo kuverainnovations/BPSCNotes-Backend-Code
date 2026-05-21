@@ -108,10 +108,10 @@ export class MarketplaceCreatorEconomy1779700000000
 
     // IMPORTANT:
     // Removed DESC to avoid created_at startup crash
-    await queryRunner.query(`
-      CREATE INDEX IF NOT EXISTS idx_md_user_id
-      ON material_downloads(user_id, created_at);
-    `);
+    // await queryRunner.query(`
+    //   CREATE INDEX IF NOT EXISTS idx_md_user_id
+    //   ON material_downloads(user_id, created_at);
+    // `);
 
     await queryRunner.query(`
       CREATE INDEX IF NOT EXISTS idx_md_material_id
