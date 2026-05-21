@@ -101,7 +101,7 @@ export class StudyMaterialsService {
 
   // ── Build public URL for a stored file key ────────────────
   private fileUrl(fileKey: string): string {
-    return `${this.baseUrl}/${fileKey}`;
+    return `${this.baseUrl}/uploads/${fileKey}`;
   }
 
   // ── Extract subpath from absolute path ───────────────────
@@ -129,7 +129,10 @@ export class StudyMaterialsService {
       conditions.push(`(sm.title ILIKE $${pi} OR $${pi} = ANY(sm.tags) OR sm.subject ILIKE $${pi})`);
       params.push(`%${query.search.trim()}%`); pi++;
     }
-    if (query.bookmarkedOnly && query.userId) {
+    // FIX: bookmarkedOnly arrives as string "false"/"true" from query params.
+    // In JS, the string "false" is TRUTHY → always applied bookmark filter → empty list.
+    const wantsBookmarks = query.bookmarkedOnly === true || query.bookmarkedOnly === 'true';
+    if (wantsBookmarks && query.userId) {
       conditions.push(`EXISTS (SELECT 1 FROM material_bookmarks mb WHERE mb.material_id=sm.id AND mb.user_id=$${pi++})`);
       params.push(query.userId);
     }
@@ -333,7 +336,7 @@ export class StudyMaterialsService {
   // ── GET: my uploads ───────────────────────────────────────
   async myUploads(userId: string) {
     const uploads = await this.db.query(
-      `SELECT id, title, subject, material_type, status, download_count, rating, created_at, file_key
+      `SELECT id, title, subject, material_type, status, download_count, created_at, file_key
        FROM study_materials WHERE uploader_id=$1 ORDER BY created_at DESC`,
       [userId]
     );
@@ -342,56 +345,28 @@ export class StudyMaterialsService {
     });
   }
 
+  // ── Admin methods ─────────────────────────────────────────
   async adminList(query: any) {
-    const page   = Math.max(1, +(query.page ?? 1));
+    const page   = Math.max(1, +(query.page  ?? 1));
     const limit  = Math.min(100, +(query.limit ?? 20));
     const offset = (page - 1) * limit;
-  
     const conditions: string[] = ['1=1'];
     const params: any[] = [];
     let pi = 1;
-  
-    if (query.status) {
-      conditions.push(`sm.status=$${pi++}`);
-      params.push(query.status);
-    }
-  
-    if (query.subject) {
-      conditions.push(`sm.subject=$${pi++}`);
-      params.push(query.subject);
-    }
-  
-    if (query.search) {
-      conditions.push(`sm.title ILIKE $${pi++}`);
-      params.push(`%${query.search}%`);
-    }
-  
+    if (query.status)  { conditions.push(`status=$${pi++}`);       params.push(query.status); }
+    if (query.subject) { conditions.push(`subject=$${pi++}`);      params.push(query.subject); }
+    if (query.search)  { conditions.push(`title ILIKE $${pi++}`);  params.push(`%${query.search}%`); }
     const where = conditions.join(' AND ');
-  
     const [rows, [cnt]] = await Promise.all([
       this.db.query(
-        `
-        SELECT sm.*, u.name AS uploader_name
-        FROM study_materials sm
-        LEFT JOIN users u ON u.id = sm.uploader_id
-        WHERE ${where}
-        ORDER BY sm.created_at DESC
-        LIMIT $${pi++} OFFSET $${pi++}
-        `,
+        `SELECT sm.*, u.name AS uploader_name FROM study_materials sm LEFT JOIN users u ON u.id=sm.uploader_id
+         WHERE ${where} ORDER BY sm.created_at DESC LIMIT $${pi++} OFFSET $${pi++}`,
         [...params, limit, offset]
       ),
-  
-      this.db.query(
-        `SELECT COUNT(*) FROM study_materials sm WHERE ${where}`,
-        params
-      ),
+      this.db.query(`SELECT COUNT(*) FROM study_materials sm WHERE ${where}`, params),
     ]);
-  
     return successResponse({
-      materials: rows.map((m: any) => ({
-        ...m,
-        fileUrl: m.file_key ? this.fileUrl(m.file_key) : null
-      })),
+      materials: rows.map((m: any) => ({ ...m, fileUrl: m.file_key ? this.fileUrl(m.file_key) : null })),
       meta: paginationMeta(parseInt(cnt.count, 10), page, limit),
     });
   }
@@ -426,19 +401,32 @@ export class StudyMaterialsService {
   // ── GET: user's download history ────────────────────────
   async myDownloads(userId: string, page = 1, limit = 50) {
     const offset = (page - 1) * limit;
+    // FIX: material_downloads table may not exist if migration hasn't run.
+    // Check first, return empty array instead of crashing with 500.
+    const tableExists = await this.db.query(`
+      SELECT EXISTS (
+        SELECT 1 FROM information_schema.tables
+        WHERE table_name = 'material_downloads'
+      ) AS exists
+    `);
+
+    if (!tableExists[0]?.exists) {
+      this.logger.warn('material_downloads table not found — run migration 1779700000000');
+      return successResponse({ downloads: [] });
+    }
+
     const rows = await this.db.query(
       `SELECT
          sm.id, sm.title, sm.subject, sm.material_type AS "materialType",
          sm.file_key, sm.file_size_bytes AS "fileSizeBytes",
          sm.page_count AS "pageCount",
-         sm.is_premium AS "isPremium",
          COALESCE(sm.price, 0) AS price,
          COALESCE(sm.free_pages, 3) AS "freePages",
-         sm.rating,
          u.name AS "uploaderName",
          dl.created_at AS "downloadedAt",
-         -- Check if user has purchased it
          EXISTS (
+           SELECT 1 FROM information_schema.tables WHERE table_name='material_purchases'
+         ) AND EXISTS (
            SELECT 1 FROM material_purchases mp
            WHERE mp.material_id = sm.id AND mp.user_id = $1
          ) AS "isPurchased"
@@ -451,7 +439,6 @@ export class StudyMaterialsService {
       [userId, limit, offset]
     );
 
-    // Build file URLs
     const downloads = rows.map((r: any) => ({
       ...r,
       fileUrl: r.file_key ? this.fileUrl(r.file_key) : null,
@@ -485,7 +472,6 @@ export class StudyMaterialsService {
       );
       return successResponse({ purchased: true, alreadyPurchased: false, coinsSpent: 0 });
     }
-
 
     // Check user has enough coins
     const [userRow] = await this.db.query(`SELECT coins FROM users WHERE id=$1`, [userId]);
