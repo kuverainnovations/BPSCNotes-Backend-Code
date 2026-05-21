@@ -129,7 +129,10 @@ export class StudyMaterialsService {
       conditions.push(`(sm.title ILIKE $${pi} OR $${pi} = ANY(sm.tags) OR sm.subject ILIKE $${pi})`);
       params.push(`%${query.search.trim()}%`); pi++;
     }
-    if (query.bookmarkedOnly && query.userId) {
+    // FIX: bookmarkedOnly comes from query string as "false"/"true" (string, not boolean)
+    // In JS: "false" is TRUTHY → the old code always applied bookmark filter → empty results
+    const wantsBookmarks = query.bookmarkedOnly === true || query.bookmarkedOnly === 'true';
+    if (wantsBookmarks && query.userId) {
       conditions.push(`EXISTS (SELECT 1 FROM material_bookmarks mb WHERE mb.material_id=sm.id AND mb.user_id=$${pi++})`);
       params.push(query.userId);
     }
@@ -137,7 +140,6 @@ export class StudyMaterialsService {
     const sortMap: Record<string, string> = {
       newest:    'sm.created_at DESC',
       downloads: 'sm.download_count DESC',
-      rating:    'sm.rating DESC',
     };
     const orderBy = sortMap[query.sort ?? 'downloads'] ?? sortMap.downloads;
 
@@ -150,8 +152,8 @@ export class StudyMaterialsService {
       this.db.query(
         `SELECT sm.id, sm.title, sm.description, sm.subject, sm.material_type,
                 sm.author, sm.tags, sm.file_key, sm.file_size_bytes, sm.page_count,
-                sm.download_count, sm.rating, sm.rating_count, sm.is_featured, sm.is_trending,
-                sm.created_at, sm.uploader_id, sm.thumbnail_key,
+                sm.download_count, sm.is_featured, sm.is_trending,
+                sm.created_at, sm.uploader_id,
                 ${bookmarkSubq}
                 sm.status
          FROM study_materials sm WHERE ${where}
@@ -165,7 +167,7 @@ export class StudyMaterialsService {
     const materials = rows.map((m: any) => ({
       ...m,
       fileUrl:      m.file_key       ? this.fileUrl(m.file_key)       : null,
-      thumbnailUrl: m.thumbnail_key  ? this.fileUrl(m.thumbnail_key)  : null,
+      // thumbnailUrl: m.thumbnail_key  ? this.fileUrl(m.thumbnail_key)  : null,
       fileSizeMb:   m.file_size_bytes ? +(m.file_size_bytes / 1024 / 1024).toFixed(2) : 0,
     }));
 
@@ -311,8 +313,6 @@ export class StudyMaterialsService {
       [id]
     );
     if (!row) throw new NotFoundException('Material not found');
-    // Also record in download history (for Downloads tab)
-    this.recordDownloadHistory(id, userId).catch(() => {});
     return successResponse({ downloadUrl: this.fileUrl(row.file_key), title: row.title });
   }
 
@@ -333,7 +333,7 @@ export class StudyMaterialsService {
   // ── GET: my uploads ───────────────────────────────────────
   async myUploads(userId: string) {
     const uploads = await this.db.query(
-      `SELECT id, title, subject, material_type, status, download_count, rating, created_at, file_key
+      `SELECT id, title, subject, material_type, status, download_count, created_at, file_key
        FROM study_materials WHERE uploader_id=$1 ORDER BY created_at DESC`,
       [userId]
     );
@@ -350,9 +350,9 @@ export class StudyMaterialsService {
     const conditions: string[] = ['1=1'];
     const params: any[] = [];
     let pi = 1;
-    if (query.status)  { conditions.push(`status=$${pi++}`);       params.push(query.status); }
-    if (query.subject) { conditions.push(`subject=$${pi++}`);      params.push(query.subject); }
-    if (query.search)  { conditions.push(`title ILIKE $${pi++}`);  params.push(`%${query.search}%`); }
+    if (query.status)  { conditions.push(`sm.status=$${pi++}`);      params.push(query.status); }
+    if (query.subject) { conditions.push(`sm.subject=$${pi++}`);      params.push(query.subject); }
+    if (query.search)  { conditions.push(`sm.title ILIKE $${pi++}`);  params.push(`%${query.search}%`); }
     const where = conditions.join(' AND ');
     const [rows, [cnt]] = await Promise.all([
       this.db.query(
@@ -393,154 +393,6 @@ export class StudyMaterialsService {
     }
     await this.db.query(`DELETE FROM study_materials WHERE id=$1`, [id]);
     return successResponse(null, 'Deleted');
-  }
-
-  // ── GET: user's download history ────────────────────────
-  async myDownloads(userId: string, page = 1, limit = 50) {
-    const offset = (page - 1) * limit;
-    const rows = await this.db.query(
-      `SELECT
-         sm.id, sm.title, sm.subject, sm.material_type AS "materialType",
-         sm.file_key, sm.file_size_bytes AS "fileSizeBytes",
-         sm.page_count AS "pageCount",
-         sm.is_premium AS "isPremium",
-         COALESCE(sm.price, 0) AS price,
-         COALESCE(sm.free_pages, 3) AS "freePages",
-         sm.rating,
-         u.name AS "uploaderName",
-         dl.created_at AS "downloadedAt",
-         -- Check if user has purchased it
-         EXISTS (
-           SELECT 1 FROM material_purchases mp
-           WHERE mp.material_id = sm.id AND mp.user_id = $1
-         ) AS "isPurchased"
-       FROM material_downloads dl
-       JOIN study_materials sm ON sm.id = dl.material_id
-       LEFT JOIN users u ON u.id = sm.uploader_id
-       WHERE dl.user_id = $1
-       ORDER BY dl.created_at DESC
-       LIMIT $2 OFFSET $3`,
-      [userId, limit, offset]
-    );
-
-    // Build file URLs
-    const downloads = rows.map((r: any) => ({
-      ...r,
-      fileUrl: r.file_key ? this.fileUrl(r.file_key) : null,
-    }));
-
-    return successResponse({ downloads });
-  }
-
-  // ── POST: purchase a paid material with coins ─────────────
-  // Commission: BPSCNotes takes 30%, creator gets 70%
-  async purchaseMaterial(materialId: string, userId: string) {
-    // Check if already purchased
-    const [existing] = await this.db.query(
-      `SELECT id FROM material_purchases WHERE material_id=$1 AND user_id=$2`,
-      [materialId, userId]
-    );
-    if (existing) return successResponse({ purchased: true, alreadyPurchased: true });
-
-    const [material] = await this.db.query(
-      `SELECT id, title, price, uploader_id FROM study_materials WHERE id=$1 AND status='approved'`,
-      [materialId]
-    );
-    if (!material) throw new Error('Material not found');
-
-    const price = material.price ?? 0;
-    if (price === 0) {
-      // Free — just record purchase
-      await this.db.query(
-        `INSERT INTO material_purchases (material_id, user_id, price_paid, coins_paid) VALUES ($1,$2,0,0)`,
-        [materialId, userId]
-      );
-      return successResponse({ purchased: true, alreadyPurchased: false, coinsSpent: 0 });
-    }
-
-    // Check user has enough coins
-    const [userRow] = await this.db.query(`SELECT coins FROM users WHERE id=$1`, [userId]);
-    if (!userRow || userRow.coins < price) {
-      throw new Error(`\`Insufficient coins. Need \${price}, have \${userRow?.coins ?? 0}.'\'`);
-    }
-
-    // Deduct coins from buyer
-    await this.db.query(`UPDATE users SET coins=coins-$1 WHERE id=$2`, [price, userId]);
-    const [updatedUser] = await this.db.query(`SELECT coins FROM users WHERE id=$1`, [userId]);
-
-    // Credit 70% to creator
-    const creatorShare = Math.floor(price * 0.70);
-    const platformFee  = price - creatorShare; // 30%
-    if (material.uploader_id && material.uploader_id !== userId) {
-      await this.db.query(`UPDATE users SET coins=coins+$1 WHERE id=$2`, [creatorShare, material.uploader_id]);
-      await this.db.query(
-        `INSERT INTO coin_transactions (user_id,type,amount,description,action,balance)
-         VALUES ($1,'earned',$2,'Sale: '||$3,'material_sale',(SELECT coins FROM users WHERE id=$1))`,
-        [material.uploader_id, creatorShare, material.title]
-      );
-    }
-
-    // Record purchase
-    await this.db.query(
-      `INSERT INTO material_purchases (material_id, user_id, price_paid, coins_paid, platform_fee)
-       VALUES ($1,$2,$3,$3,$4)`,
-      [materialId, userId, price, platformFee]
-    );
-
-    // Coin transaction for buyer
-    await this.db.query(
-      `INSERT INTO coin_transactions (user_id,type,amount,description,action,balance)
-       VALUES ($1,'spent',$2,'Purchased: '||$3,'material_purchase',$4)`,
-      [userId, price, material.title, updatedUser.coins]
-    );
-
-    // Get file URL for immediate access
-    const [mat] = await this.db.query(`SELECT file_key FROM study_materials WHERE id=$1`, [materialId]);
-    const fileUrl = mat?.file_key ? this.fileUrl(mat.file_key) : null;
-
-    return successResponse({
-      purchased: true, alreadyPurchased: false,
-      coinsSpent: price, coinsBalance: updatedUser.coins,
-      fileUrl
-    }, '🎉 Purchase successful! Full PDF unlocked.');
-  }
-
-  // ── GET: preview (free pages URL — for locked content) ───
-  // In production, you'd generate a page-limited PDF.
-  // For now, return same URL with a free_pages hint.
-  async getPreview(materialId: string, userId: string) {
-    const [mat] = await this.db.query(
-      `SELECT sm.*, EXISTS (
-         SELECT 1 FROM material_purchases mp WHERE mp.material_id=sm.id AND mp.user_id=$2
-       ) AS "isPurchased"
-       FROM study_materials sm WHERE sm.id=$1 AND sm.status='approved'`,
-      [materialId, userId]
-    );
-    if (!mat) throw new Error('Not found');
-
-    const freePages  = mat.free_pages ?? 3;
-    const isPurchased = mat.isPurchased || !mat.is_premium;
-    const fileUrl    = mat.file_key ? this.fileUrl(mat.file_key) : null;
-
-    return successResponse({
-      previewUrl:  fileUrl,   // full URL (Android will limit display pages)
-      totalPages:  mat.page_count ?? 0,
-      freePages,
-      isPurchased
-    });
-  }
-
-  // ── GET: record download in history table ─────────────────
-  async recordDownloadHistory(materialId: string, userId: string) {
-    // Upsert: only one record per user+material
-    await this.db.query(
-      `INSERT INTO material_downloads (material_id, user_id)
-       VALUES ($1,$2)
-       ON CONFLICT (material_id, user_id) DO UPDATE SET created_at=NOW()`,
-      [materialId, userId]
-    ).catch(() => {
-      // material_downloads table may not exist yet — create it gracefully
-    });
   }
 
   async adminGetUrl(id: string) {
@@ -679,22 +531,6 @@ export class StudyMaterialsController {
   @HttpCode(HttpStatus.OK)
   toggleBookmark(@Param('id', ParseUUIDPipe) id: string, @Req() r: any) {
     return this.svc.toggleBookmark(id, r.user.id);
-  }
-
-  @Get('my-downloads')
-  getMyDownloads(@Query('page') page = 1, @Query('limit') limit = 50, @Req() r: any) {
-    return this.svc.myDownloads(r.user.id, +page, +limit);
-  }
-
-  @Post(':id/purchase')
-  @HttpCode(HttpStatus.OK)
-  purchaseMaterial(@Param('id', ParseUUIDPipe) id: string, @Req() r: any) {
-    return this.svc.purchaseMaterial(id, r.user.id);
-  }
-
-  @Get(':id/preview')
-  getPreview(@Param('id', ParseUUIDPipe) id: string, @Req() r: any) {
-    return this.svc.getPreview(id, r.user.id);
   }
 }
 
