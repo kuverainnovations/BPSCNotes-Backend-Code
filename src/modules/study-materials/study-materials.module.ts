@@ -173,7 +173,8 @@ export class StudyMaterialsService {
       ...m,
       fileUrl:      m.file_key       ? this.fileUrl(m.file_key)       : null,
       thumbnailUrl: m.thumbnail_key  ? this.fileUrl(m.thumbnail_key)  : null,
-      fileSizeMb:   m.file_size_bytes ? +(m.file_size_bytes / 1024 / 1024).toFixed(2) : 0,
+      // FIX: file_size_bytes from Postgres is a string — must parseInt before math
+      fileSizeMb:   m.file_size_bytes ? +(parseInt(m.file_size_bytes, 10) / 1024 / 1024).toFixed(2) : 0,
       price:      parseInt(m.price ?? '0', 10),
       free_pages: parseInt(m.free_pages ?? '3', 10),   // snake_case — matches Android @SerializedName("free_pages")
       is_premium: m.is_premium ?? false,               // snake_case — matches Android @SerializedName("is_premium")
@@ -242,6 +243,9 @@ export class StudyMaterialsService {
       title: string; description?: string; subject: string;
       materialType: MaterialType; author?: string; tags?: string;
       pageCount?: number;
+      isPremium?: string | boolean;   // "true"/"false" from multipart form
+      freePages?: string | number;    // how many pages visible before paywall
+      price?: string | number;        // coins required (0 = free)
     }
   ) {
     if (!file) throw new BadRequestException('File is required');
@@ -251,16 +255,46 @@ export class StudyMaterialsService {
     const matType = (dto.materialType ?? 'pdf') as MaterialType;
     if (!TYPES.includes(matType)) throw new BadRequestException(`Invalid type. Allowed: ${TYPES.join(', ')}`);
 
-    const fileKey     = this.toFileKey(file.path);
+    const fileKey       = this.toFileKey(file.path);
     const fileSizeBytes = file.size;
-    const tags        = dto.tags ? JSON.parse(dto.tags) : [];
+    const tags          = dto.tags ? JSON.parse(dto.tags) : [];
+
+    // Parse marketplace fields from multipart (arrive as strings)
+    const isPremium  = dto.isPremium  === true || dto.isPremium  === 'true';
+    const freePages  = Math.max(1, parseInt(String(dto.freePages  ?? '3'), 10)  || 3);
+    const price      = Math.max(0, parseInt(String(dto.price      ?? '0'), 10)  || 0);
+
+    // Auto-count PDF pages from the uploaded file
+    let pageCount = parseInt(String(dto.pageCount ?? '0'), 10) || 0;
+    if (pageCount === 0 && matType === 'pdf') {
+      try {
+        const pdfBytes = fs.readFileSync(file.path);
+        // Count pages by scanning for /Type /Page entries in the PDF byte stream
+        // This is a lightweight approach that avoids heavy dependencies
+        const pdfStr   = pdfBytes.toString('latin1');
+        const matches  = pdfStr.match(/\/Type\s*\/Page[^s]/g);
+        pageCount      = matches ? matches.length : 0;
+        if (pageCount === 0) {
+          // Fallback: count /Page objects differently
+          const alt = pdfStr.match(/\/Count\s+(\d+)/g);
+          if (alt && alt.length > 0) {
+            const nums = alt.map(s => parseInt(s.replace(/\D/g, ''), 10)).filter(n => n > 0);
+            pageCount  = nums.length > 0 ? Math.max(...nums) : 0;
+          }
+        }
+       this.logger.log(`📄 PDF pages counted: ${pageCount} (file: ${fileKey})`);
+      } catch (e) {
+        this.logger.warn(`Could not count PDF pages: ${(e as Error).message}`);
+            }
+    }
 
     const [result] = await this.db.query(`
       INSERT INTO study_materials
         (title, description, subject, material_type, author, tags,
-         file_key, file_size_bytes, page_count, uploader_id, status)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'pending')
-      RETURNING id, title, status, created_at
+         file_key, file_size_bytes, page_count, uploader_id, status,
+         is_premium, free_pages, price)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'pending',$11,$12,$13)
+      RETURNING id, title, status, created_at, page_count
     `, [
       dto.title.trim(),
       dto.description?.trim() ?? '',
@@ -270,17 +304,24 @@ export class StudyMaterialsService {
       tags,
       fileKey,
       fileSizeBytes,
-      dto.pageCount ?? 0,
+      pageCount,
       userId,
+      isPremium,
+      freePages,
+      price,
     ]);
 
-    this.logger.log(`📤 Material uploaded: ${result.id} by user ${userId} — file: ${fileKey}`);
+    this.logger.log(`📤 Material uploaded: ${result.id} by user ${userId} — file: ${fileKey} — pages: ${pageCount}`);
     return successResponse({
-      id:       result.id,
-      title:    result.title,
-      status:   result.status,
-      fileUrl:  this.fileUrl(fileKey),
+      id:        result.id,
+      title:     result.title,
+      status:    result.status,
+      fileUrl:   this.fileUrl(fileKey),
       fileKey,
+      pageCount: result.page_count ?? pageCount,
+      isPremium,
+      freePages,
+      price,
     }, '📤 Uploaded! Will be published after admin review.');
   }
 
