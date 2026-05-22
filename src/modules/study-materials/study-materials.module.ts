@@ -360,9 +360,9 @@ export class StudyMaterialsService {
     const conditions: string[] = ['1=1'];
     const params: any[] = [];
     let pi = 1;
-    if (query.status)  { conditions.push(`status=$${pi++}`);       params.push(query.status); }
-    if (query.subject) { conditions.push(`subject=$${pi++}`);      params.push(query.subject); }
-    if (query.search)  { conditions.push(`title ILIKE $${pi++}`);  params.push(`%${query.search}%`); }
+   if (query.status)  { conditions.push(`sm.status=$${pi++}`);      params.push(query.status); }
+if (query.subject) { conditions.push(`sm.subject=$${pi++}`);     params.push(query.subject); }
+if (query.search)  { conditions.push(`sm.title ILIKE $${pi++}`); params.push(`%${query.search}%`); }
     const where = conditions.join(' AND ');
     const [rows, [cnt]] = await Promise.all([
       this.db.query(
