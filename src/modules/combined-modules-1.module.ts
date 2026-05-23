@@ -178,14 +178,14 @@ class JobsService {
            j.last_date::TEXT                     AS apply_end_date,
            j.exam_date::TEXT                     AS exam_date,
            j.created_at,
-           -- Columns that don't exist in table — use safe literals
-           FALSE                                 AS is_featured,
-           FALSE                                 AS is_new,
+           -- Columns that don't exist in table yet — coalesce with safe defaults
+           FALSE                                               AS is_featured,
+           FALSE                                               AS is_new,
            CASE WHEN j.last_date <= NOW() + INTERVAL '3 days'
-                THEN TRUE ELSE FALSE END         AS is_urgent,
-           '{}'::TEXT[]                          AS nearby_districts,
-           ''                                    AS location,
-           ''                                    AS salary_range,
+                THEN TRUE ELSE FALSE END                      AS is_urgent,
+           '{}'::TEXT[]                                       AS nearby_districts,
+           COALESCE(j.location, '')                           AS location,
+           COALESCE(j.salary_range, '')                       AS salary_range,
            (SELECT TRUE FROM job_saves js
             WHERE js.user_id=$${params.length+1} AND js.job_id=j.id) AS is_saved
          FROM job_vacancies j WHERE ${where}
@@ -195,6 +195,15 @@ class JobsService {
       this.db.query(`SELECT COUNT(*) FROM job_vacancies j WHERE ${where}`, params),
     ]);
     return successResponse({ jobs: rows }, 'Success', paginationMeta(parseInt(countResult[0].count), page, limit));
+  }
+
+  /** Ensure location + salary_range columns exist (run once on startup) */
+  async ensureColumns() {
+    await this.db.query(`
+      ALTER TABLE job_vacancies 
+        ADD COLUMN IF NOT EXISTS location     TEXT DEFAULT '',
+        ADD COLUMN IF NOT EXISTS salary_range TEXT DEFAULT ''
+    `).catch(() => {});  // ignore if already exists
   }
 
   async toggleSave(jobId: string, userId: string) {
