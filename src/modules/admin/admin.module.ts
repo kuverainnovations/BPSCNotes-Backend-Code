@@ -144,11 +144,7 @@ export class AdminDashboardService {
       this.db.query(`SELECT COUNT(*) AS count FROM study_rooms WHERE status='active'`),
     ]);
 
-    console.log(await this.db.query(`SELECT current_database()`));
-console.log(await this.db.query(`SELECT * FROM public.users LIMIT 1`));
-  
-    // 🔍 DEBUG (optional)
-    console.log('USERS 👉', users);
+
   
     const stats = {
       totalUsers:          Number(users?.[0]?.total || 0),

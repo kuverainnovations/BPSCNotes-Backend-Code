@@ -10,7 +10,7 @@ import { CACHE_MANAGER }          from '@nestjs/cache-manager';
 import { Cache }                  from 'cache-manager';
 import { Inject }                 from '@nestjs/common';
 import { ApiTags, ApiBearerAuth } from '@nestjs/swagger';
-import { JwtAuthGuard }           from '../../common/guards';
+import { JwtAuthGuard, AdminJwtGuard } from '../../common/guards';
 import { AuthModule }             from '../auth/auth.module';
 import { successResponse }        from '../../common/utils/response.util';
 
@@ -427,10 +427,104 @@ export class CoinsController {
 // ════════════════════════════════════════════════════════════
 // MODULE
 // ════════════════════════════════════════════════════════════
+
+// ════════════════════════════════════════════════════════════
+// ADMIN COINS CONTROLLER
+// Powers: admin.bpscnotes.in/coins page
+//
+// Endpoints:
+//   GET  /admin/coins/stats        — total coins, circulating supply
+//   GET  /admin/coins/top-earners  — top 20 users by coins earned
+//   GET  /admin/coins/rules        — the EARN_TASKS catalogue
+//   POST /admin/coins/rules        — (future) add custom task
+// ════════════════════════════════════════════════════════════
+
+@Injectable()
+export class AdminCoinsService {
+  constructor(@InjectDataSource() private readonly db: DataSource) {}
+
+  async getStats() {
+    const [row] = await this.db.query(`
+      SELECT
+        COALESCE(SUM(coins), 0)::int               AS total_circulating,
+        COALESCE(SUM(total_coins_earned), 0)::int  AS total_ever_earned,
+        COUNT(*)::int                              AS wallets_with_coins,
+        (SELECT COUNT(*)::int FROM coin_transactions
+          WHERE created_at >= NOW() - INTERVAL '24 hours')  AS txns_today,
+        (SELECT COALESCE(SUM(amount), 0)::int FROM coin_transactions
+          WHERE type='earned' AND created_at >= NOW() - INTERVAL '24 hours') AS earned_today,
+        (SELECT COALESCE(SUM(amount), 0)::int FROM coin_transactions
+          WHERE type='earned' AND created_at >= NOW() - INTERVAL '7 days')   AS earned_this_week
+      FROM users
+      WHERE coins > 0
+    `);
+    return successResponse({ stats: row });
+  }
+
+  async getTopEarners(limit = 20) {
+    const rows = await this.db.query(`
+      SELECT
+        u.id,
+        u.name,
+        u.avatar_url,
+        u.coins                AS current_balance,
+        u.total_coins_earned   AS total_earned,
+        u.streak,
+        u.primary_exam,
+        u.district,
+        COUNT(ct.id)::int      AS transaction_count
+      FROM users u
+      LEFT JOIN coin_transactions ct ON ct.user_id = u.id AND ct.type = 'earned'
+      WHERE u.total_coins_earned > 0
+      GROUP BY u.id
+      ORDER BY u.total_coins_earned DESC
+      LIMIT $1
+    `, [limit]);
+    return successResponse({ earners: rows });
+  }
+
+  async getRules() {
+    // Return the static task catalogue + per-task claim counts (last 7 days)
+    const taskStats = await this.db.query(`
+      SELECT action, COUNT(*)::int AS claims_7d, COALESCE(SUM(amount), 0)::int AS coins_7d
+      FROM coin_transactions
+      WHERE created_at >= NOW() - INTERVAL '7 days' AND type = 'earned'
+      GROUP BY action
+    `);
+    const statsMap: Record<string, any> = {};
+    taskStats.forEach((r: any) => { statsMap[r.action] = r; });
+
+    const rules = EARN_TASKS.map(t => ({
+      ...t,
+      claims_last_7d: statsMap[t.action]?.claims_7d ?? 0,
+      coins_last_7d:  statsMap[t.action]?.coins_7d  ?? 0,
+    }));
+
+    return successResponse({ rules });
+  }
+}
+
+@UseGuards(AdminJwtGuard)
+@Controller('admin/coins')
+export class AdminCoinsController {
+  constructor(private readonly svc: AdminCoinsService) {}
+
+  @Get('stats')
+  getStats() { return this.svc.getStats(); }
+
+  @Get('top-earners')
+  getTopEarners(@Query('limit') limit = 20) {
+    return this.svc.getTopEarners(+limit);
+  }
+
+  @Get('rules')
+  getRules() { return this.svc.getRules(); }
+}
+
 @Module({
   imports:     [AuthModule],
-  controllers: [CoinsController],
-  providers:   [CoinsService],
+  controllers: [CoinsController, AdminCoinsController],
+  providers:   [CoinsService, AdminCoinsService],
   exports:     [CoinsService],
 })
 export class CoinsModule {}
