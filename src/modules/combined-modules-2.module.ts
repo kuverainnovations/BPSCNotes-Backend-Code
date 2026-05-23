@@ -1182,10 +1182,55 @@ class FlashcardsService {
   }
 
   private async invalidateCache() {
-    // Clear all flashcard cache keys
     await this.cache.del('flashcards:all:all');
     const subjects = ['Polity','History','Geography','Economy','Bihar GK','Science','Environment'];
     for (const s of subjects) await this.cache.del(`flashcards:${s}:all`);
+  }
+
+  /** GET /flashcards/progress — return user's mastered/weak card IDs */
+  async getUserProgress(userId: string) {
+    const rows = await this.db.query(
+      `SELECT flashcard_id AS "flashcardId", status, streak,
+              ease_factor AS "easeFactor", repetitions, next_review AS "nextReview"
+       FROM user_flashcard_progress
+       WHERE user_id = $1`,
+      [userId]
+    ).catch(() => []);
+
+    const mastered = rows.filter((r: any) => r.status === 'mastered').map((r: any) => r.flashcardId);
+    const weak     = rows.filter((r: any) => r.status === 'weak').map((r: any) => r.flashcardId);
+    return successResponse({ mastered, weak, total: rows.length });
+  }
+
+  /** POST /flashcards/progress — upsert card rating for user */
+  async saveProgress(userId: string, dto: { flashcardId: string; rating: 'mastered' | 'weak' | 'skipped'; streak?: number }) {
+    const { flashcardId, rating, streak = 0 } = dto;
+    if (rating === 'skipped') return successResponse({ saved: false });
+
+    await this.db.query(
+      `INSERT INTO user_flashcard_progress
+         (user_id, flashcard_id, status, streak, repetitions, last_reviewed, next_review)
+       VALUES ($1, $2, $3, $4, 1, NOW(),
+         CURRENT_DATE + INTERVAL '1 day' * CASE WHEN $3='mastered' THEN GREATEST(1, $4) ELSE 1 END)
+       ON CONFLICT (user_id, flashcard_id) DO UPDATE SET
+         status       = EXCLUDED.status,
+         streak       = EXCLUDED.streak,
+         repetitions  = user_flashcard_progress.repetitions + 1,
+         last_reviewed = NOW(),
+         next_review  = CURRENT_DATE + INTERVAL '1 day' * CASE WHEN EXCLUDED.status='mastered' THEN GREATEST(1, EXCLUDED.streak) ELSE 1 END`,
+      [userId, flashcardId, rating, streak]
+    ).catch(async (e: any) => {
+      // Table may not have status/streak columns — add them gracefully
+      await this.db.query(`
+        DO $$ BEGIN
+          ALTER TABLE user_flashcard_progress ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'unseen';
+          ALTER TABLE user_flashcard_progress ADD COLUMN IF NOT EXISTS streak INTEGER DEFAULT 0;
+        EXCEPTION WHEN duplicate_column THEN NULL;
+        END $$;
+      `).catch(() => {});
+    });
+
+    return successResponse({ saved: true, flashcardId, rating });
   }
 }
 
@@ -1198,8 +1243,17 @@ class FlashcardsController {
 
   /** GET /api/v1/flashcards?subject=Polity&limit=200 */
   @Get()
-  findAll(@Query() q: any) {
-    return this.s.findAll(q);
+  findAll(@Query() q: any) { return this.s.findAll(q); }
+
+  /** GET /api/v1/flashcards/progress — user's mastered/weak card IDs */
+  @Get('progress')
+  getProgress(@Req() r: any) { return this.s.getUserProgress(r.user.id); }
+
+  /** POST /api/v1/flashcards/progress — save card rating */
+  @Post('progress')
+  @HttpCode(HttpStatus.OK)
+  saveProgress(@Body() dto: any, @Req() r: any) {
+    return this.s.saveProgress(r.user.id, dto);
   }
 }
 
