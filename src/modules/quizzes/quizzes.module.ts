@@ -243,8 +243,22 @@ if (q.scheduled_for) {
     // Invalidate quiz cache
     await this.cache.del(`quiz_meta:${quizId}`);
 
+    // ANTI-CHEAT: Only award coins on the FIRST passing attempt for this quiz
+    // Prevents farming by re-taking quizzes repeatedly
     let coinsEarned = 0;
-    if (isPassed) coinsEarned = await this.authService.awardCoins(userId, 'daily_quiz', attempt[0].id);
+    if (isPassed) {
+      const [prevPass] = await this.db.query(
+        `SELECT id FROM quiz_attempts
+         WHERE user_id=$1 AND quiz_id=$2 AND is_passed=true AND id != $3
+         LIMIT 1`,
+        [userId, quizId, attempt[0].id]
+      );
+      if (!prevPass) {
+        // First time passing this quiz — award coins
+        coinsEarned = await this.authService.awardCoins(userId, 'daily_quiz', attempt[0].id);
+      }
+      // Subsequent passes: coins=0, but attempt is still recorded
+    }
 
     // ── Async achievement + challenge checks (fire-and-forget) ──
     Promise.all([
