@@ -180,12 +180,12 @@ class JobsService {
            j.created_at,
            -- Columns that don't exist in table yet — coalesce with safe defaults
            FALSE                                               AS is_featured,
-           FALSE                                               AS is_new,
-           CASE WHEN j.last_date <= NOW() + INTERVAL '3 days'
-                THEN TRUE ELSE FALSE END                      AS is_urgent,
-           '{}'::TEXT[]                                       AS nearby_districts,
-           COALESCE(j.location, '')                           AS location,
-           COALESCE(j.salary_range, '')                       AS salary_range,
+FALSE                                               AS is_new,
+CASE WHEN j.last_date <= NOW() + INTERVAL '3 days'
+     THEN TRUE ELSE FALSE END                      AS is_urgent,
+'{}'::TEXT[]                                       AS nearby_districts,
+''                                                 AS location,
+''                                                 AS salary_range,
            (SELECT TRUE FROM job_saves js
             WHERE js.user_id=$${params.length+1} AND js.job_id=j.id) AS is_saved
          FROM job_vacancies j WHERE ${where}
