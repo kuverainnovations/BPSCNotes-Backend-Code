@@ -263,7 +263,7 @@ export class WeeklyChallengesService {
     const cached    = await this.cache.get(cacheKey);
     if (cached) return cached;
 
-    const challenges = await this.db.query(`
+    let challenges = await this.db.query(`
       SELECT
         wc.*,
         t.tier_key AS target_tier_key,
@@ -280,6 +280,21 @@ export class WeeklyChallengesService {
       ORDER BY wc.created_at ASC
     `, [userId, periodKey]);
 
+    // FIX: Auto-seed challenges for the current week if none exist
+    // This prevents the "challenges empty" issue when admin hasn't created them
+    if (challenges.length === 0) {
+      await this.seedWeeklyChallenges(periodKey).catch(() => {});
+      challenges = await this.db.query(`
+        SELECT wc.*,
+          COALESCE(ucp.current_value, 0)  AS user_progress,
+          COALESCE(ucp.is_completed, false) AS is_completed,
+          COALESCE(ucp.reward_claimed, false) AS reward_claimed
+        FROM weekly_challenges wc
+        LEFT JOIN user_challenge_progress ucp ON ucp.challenge_id=wc.id AND ucp.user_id=$1
+        WHERE wc.period_key=$2 AND wc.is_active=TRUE ORDER BY wc.created_at ASC
+      `, [userId, periodKey]).catch(() => []);
+    }
+
     // Compute percentage progress for UI
     const enriched = challenges.map((c: any) => ({
       ...c,
@@ -295,6 +310,25 @@ export class WeeklyChallengesService {
     });
     await this.cache.set(cacheKey, result, 120);
     return result;
+  }
+
+  // ── Auto-seed default challenges for new week ──────────────
+  private async seedWeeklyChallenges(periodKey: string) {
+    const defaults = [
+      { action: 'quiz_complete',   title: 'Quiz Champion',     goal: { target: 5 },  coins: 50, icon: '🏆', desc: 'Complete 5 quizzes this week' },
+      { action: 'study_session',   title: 'Study Streak',      goal: { target: 3 },  coins: 30, icon: '📚', desc: 'Study for 3 sessions this week' },
+      { action: 'flashcard_rated', title: 'Flashcard Master',  goal: { target: 20 }, coins: 25, icon: '🧠', desc: 'Rate 20 flashcards this week' },
+      { action: 'target_complete', title: 'Goal Getter',       goal: { target: 7 },  coins: 40, icon: '🎯', desc: 'Complete 7 daily targets this week' },
+    ];
+
+    for (const d of defaults) {
+      await this.db.query(`
+        INSERT INTO weekly_challenges
+          (period_key, action_type, title, description, goal, coins_reward, icon_emoji, is_active)
+        VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, true)
+        ON CONFLICT DO NOTHING
+      `, [periodKey, d.action, d.title, d.desc, JSON.stringify(d.goal), d.coins, d.icon]).catch(() => {});
+    }
   }
 
   // ── Claim reward after completing a challenge ─────────────

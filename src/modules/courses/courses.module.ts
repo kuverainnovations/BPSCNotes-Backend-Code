@@ -2,7 +2,7 @@
 // COURSES MODULE — Repository → Service → Controller
 // ════════════════════════════════════════════════════════════
 import {
-  Module, Injectable, Controller, Get, Post, Put, Delete,
+  Module, Injectable, Controller, HttpException, HttpStatus, Get, Post, Put, Delete,
   Body, Param, Query, Req, HttpCode, HttpStatus, NotFoundException,
   ForbiddenException, ParseUUIDPipe, UseGuards, UseInterceptors,
   UploadedFile,
@@ -116,7 +116,15 @@ export class CoursesRepository {
     const [rows, countResult] = await Promise.all([
       this.db.query(
         `SELECT c.id, c.title, c.description, c.instructor, c.instructor_bio,
-                c.instructor_students, c.instructor_courses,
+                -- FIX: derive instructor stats dynamically since columns may not exist
+                COALESCE(c.instructor_students,
+                    (SELECT SUM(c2.enrollment_count) FROM courses c2
+                     WHERE c2.instructor = c.instructor AND c2.status='published')
+                ) AS instructor_students,
+                COALESCE(c.instructor_courses,
+                    (SELECT COUNT(*) FROM courses c2
+                     WHERE c2.instructor = c.instructor AND c2.status='published')
+                ) AS instructor_courses,
                 c.subject, c.price, c.original_price, c.is_paid,
                 c.is_featured, c.is_limited_offer, c.offer_ends_at, c.thumbnail_url, (
    SELECT COUNT(*)
@@ -370,7 +378,18 @@ export class CoursesService {
       const sub = await this.db.query(
         `SELECT id FROM subscriptions WHERE user_id=$1 AND status='active' AND ends_at > NOW()`, [userId]
       );
-      if (!sub.length) throw new ForbiddenException({ message: 'Subscription required', code: 'SUBSCRIPTION_REQUIRED' });
+      if (!sub.length) {
+        // FIX: Return 402 Payment Required with structured error so Android can
+        // show "Get Premium" dialog instead of generic error toast
+        throw new HttpException(
+          { 
+            message: 'Premium subscription required to enroll in this course',
+            code: 'SUBSCRIPTION_REQUIRED',
+            upgradeUrl: '/premium'
+          }, 
+          HttpStatus.PAYMENT_REQUIRED  // 402 — cleaner than 403 for this case
+        );
+      }
     }
 
     await this.db.query(
@@ -798,4 +817,4 @@ export class AdminCoursesController {
   providers:   [CoursesService, CoursesRepository],
   exports:     [CoursesService],
 })
-export class CoursesModule {}
+export class CoursesModule {} 
