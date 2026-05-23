@@ -467,14 +467,16 @@ export class AdminCoinsService {
         u.id,
         u.name,
         u.avatar_url,
-        u.coins                AS current_balance,
-        u.total_coins_earned   AS total_earned,
+        u.coins              AS "currentBalance",
+        u.total_coins_earned AS "totalEarned",
+        COUNT(ct.id)::int    AS "transactionCount",
         u.streak,
         u.primary_exam,
-        u.district,
-        COUNT(ct.id)::int      AS transaction_count
+        u.district
       FROM users u
-      LEFT JOIN coin_transactions ct ON ct.user_id = u.id AND ct.type = 'earned'
+      LEFT JOIN coin_transactions ct
+        ON ct.user_id = u.id
+       AND ct.type = 'earned'
       WHERE u.total_coins_earned > 0
       GROUP BY u.id
       ORDER BY u.total_coins_earned DESC
@@ -496,8 +498,8 @@ export class AdminCoinsService {
 
     const rules = EARN_TASKS.map(t => ({
       ...t,
-      claims_last_7d: statsMap[t.action]?.claims_7d ?? 0,
-      coins_last_7d:  statsMap[t.action]?.coins_7d  ?? 0,
+      claimsLast7d: statsMap[t.action]?.claims_7d ?? 0,
+      coinsLast7d: statsMap[t.action]?.coins_7d ?? 0,
     }));
 
     return successResponse({ rules });
