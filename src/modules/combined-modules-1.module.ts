@@ -726,10 +726,18 @@ class AdminCoinsController {
   @Get('rules')        @RequirePermission('coins') getRules()    { return this.s.getRules(); }
   @Post('rules')       @RequirePermission('coins') @HttpCode(HttpStatus.CREATED)
     createRule(@Body() dto: any) { return this.s.createRule(dto); }
-  @Put('rules/:id')    @RequirePermission('coins')
-    updateRule(@Param('id', ParseUUIDPipe) id: string, @Body() dto: any) { return this.s.updateRule(id, dto); }
+    @Put('rules/:id')
+    @RequirePermission('coins')
+    updateRule(
+      @Param('id') id: string,
+      @Body() dto: any
+    ) {
+      return this.s.updateRule(id, dto);
+    }
   @Delete('rules/:id') @RequirePermission('coins') @HttpCode(HttpStatus.OK)
-    deleteRule(@Param('id', ParseUUIDPipe) id: string) { return this.s.deleteRule(id); }
+  deleteRule(
+    @Param('id') id: string
+  ) { return this.s.deleteRule(id); }
   @Get('top-earners')  @RequirePermission('coins') getTopEarners() { return this.s.getTopEarners(); }
 }
 
