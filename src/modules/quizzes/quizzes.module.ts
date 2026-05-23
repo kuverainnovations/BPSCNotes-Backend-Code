@@ -268,18 +268,52 @@ if (q.scheduled_for) {
         .catch(e => console.error('quiz challenge:', e.message)),
     ]);
 
-    return successResponse({
-      attemptId:    attempt[0].id,
-      score,
-      correct,
-      total,
-      wrong:        total - correct,
-      accuracy,
-      isPassed,
-      coinsEarned,
-      timeTakenSecs: dto.timeTakenSecs || 0,
-      answers:      evaluated,
-    });
+    // ── Rank + Percentile Calculation ──────────────────────────
+
+// Total attempts for this quiz
+const totalAttemptsResult = await this.db.query(
+  `SELECT COUNT(*)::int AS count
+   FROM quiz_attempts
+   WHERE quiz_id=$1`,
+  [quizId]
+);
+
+const totalAttempts = totalAttemptsResult[0]?.count || 1;
+
+// Number of users who scored higher
+const higherScoresResult = await this.db.query(
+  `SELECT COUNT(*)::int AS count
+   FROM quiz_attempts
+   WHERE quiz_id=$1
+   AND score > $2`,
+  [quizId, score]
+);
+
+const higherScores = higherScoresResult[0]?.count || 0;
+
+// Rank
+const rank = higherScores + 1;
+
+// Percentile
+const percentile = Number(
+  (((totalAttempts - rank) / totalAttempts) * 100).toFixed(2)
+);
+return successResponse({
+  attemptId: attempt[0].id,
+  score,
+  correct,
+  total,
+  wrong: total - correct,
+  accuracy,
+  isPassed,
+  coinsEarned,
+  timeTakenSecs: dto.timeTakenSecs || 0,
+
+  rank,
+  percentile,
+
+  answers: evaluated,
+});
   }
 
   // ═══════════════════════════════════════════════════════════
