@@ -2,7 +2,7 @@
 // COURSES MODULE — Repository → Service → Controller
 // ════════════════════════════════════════════════════════════
 import {
-  Module, Injectable, Controller, HttpException, HttpStatus, Get, Post, Put, Delete,
+  Module, Injectable, Controller, HttpException, Get, Post, Put, Delete,
   Body, Param, Query, Req, HttpCode, HttpStatus, NotFoundException,
   ForbiddenException, ParseUUIDPipe, UseGuards, UseInterceptors,
   UploadedFile,
