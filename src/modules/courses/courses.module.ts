@@ -118,16 +118,8 @@ export class CoursesRepository {
         `SELECT c.id, c.title, c.description, c.instructor, c.instructor_bio,
                 -- FIX: derive instructor stats dynamically since columns may not exist
                 -- FIX: cast VARCHAR column to BIGINT to match SUM/COUNT return type
-                COALESCE(
-                    NULLIF(c.instructor_students, '')::BIGINT,
-                    (SELECT SUM(c2.enrollment_count) FROM courses c2
-                     WHERE c2.instructor = c.instructor AND c2.status='published')
-                )::TEXT AS instructor_students,
-                COALESCE(
-                    NULLIF(c.instructor_courses, '')::BIGINT,
-                    (SELECT COUNT(*) FROM courses c2
-                     WHERE c2.instructor = c.instructor AND c2.status='published')
-                )::TEXT AS instructor_courses,
+                COALESCE(c.instructor_students, '0') AS instructor_students,
+                COALESCE(c.instructor_students, '0') AS instructor_students,
                 c.subject, c.price, c.original_price, c.is_paid,
                 c.is_featured, c.is_limited_offer, c.offer_ends_at, c.thumbnail_url, (
    SELECT COUNT(*)
