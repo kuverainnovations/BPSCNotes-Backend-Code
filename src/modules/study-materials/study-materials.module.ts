@@ -357,14 +357,27 @@ export class StudyMaterialsService {
 
   // ── POST: record download and return file URL ─────────────
   async recordDownload(id: string, userId: string) {
+    // FIX: Use explicit alias "fileKey" so TypeScript property access is unambiguous
+    // row.file_key can return undefined if the ORM camelCases it to row.fileKey
     const [row] = await this.db.query(
-      `UPDATE study_materials SET download_count=download_count+1 WHERE id=$1 AND status='approved' RETURNING file_key, title`,
+      `UPDATE study_materials
+       SET download_count = download_count + 1
+       WHERE id = $1 AND status = 'approved'
+       RETURNING file_key AS "fileKey", title`,
       [id]
     );
     if (!row) throw new NotFoundException('Material not found');
-    // Also record in download history (for Downloads tab)
-    this.recordDownloadHistory(id, userId).catch(() => {});
-    return successResponse({ downloadUrl: this.fileUrl(row.file_key), title: row.title });
+
+    // Defensive: fileKey could be null/undefined if the material has no file yet
+    const fileKey = row.fileKey || row.file_key || null;
+    if (!fileKey) {
+      throw new NotFoundException('File not attached to this material');
+    }
+
+    // Record in download history (for Downloads tab) — await this time, don't silently skip
+    await this.recordDownloadHistory(id, userId);
+
+    return successResponse({ downloadUrl: this.fileUrl(fileKey), title: row.title });
   }
 
   // ── POST: toggle bookmark ─────────────────────────────────
@@ -599,15 +612,26 @@ if (query.search)  { conditions.push(`sm.title ILIKE $${pi++}`); params.push(`%$
 
   // ── GET: record download in history table ─────────────────
   async recordDownloadHistory(materialId: string, userId: string) {
-    // Upsert: only one record per user+material
+    // FIX: Ensure material_downloads table exists before inserting
+    // The migration may not have run on this deployment
+    await this.db.query(`
+      CREATE TABLE IF NOT EXISTS material_downloads (
+        id          UUID        DEFAULT gen_random_uuid() PRIMARY KEY,
+        material_id UUID        NOT NULL REFERENCES study_materials(id) ON DELETE CASCADE,
+        user_id     UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        created_at  TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE(material_id, user_id)
+      )
+    `).catch((e: any) => this.logger.warn('material_downloads table check:', e.message));
+
+    // Now insert — this should never silently fail
     await this.db.query(
       `INSERT INTO material_downloads (material_id, user_id)
-       VALUES ($1,$2)
-       ON CONFLICT (material_id, user_id) DO UPDATE SET created_at=NOW()`,
+       VALUES ($1, $2)
+       ON CONFLICT (material_id, user_id) DO UPDATE SET created_at = NOW()`,
       [materialId, userId]
-    ).catch(() => {
-      // material_downloads table may not exist yet — create it gracefully
-    });
+    );
+    this.logger.log(`\`Download recorded: material=\${materialId} user=\${userId}'\'`);
   }
 
   async adminGetUrl(id: string) {
