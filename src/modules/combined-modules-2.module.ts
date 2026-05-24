@@ -655,7 +655,14 @@ class UsersService {
       current_streak:     u.streak || 0,
       total_study_minutes: u.total_study_minutes || 0,
       quizzes_attempted:  u.quizzes_attempted || 0,
-      rank:               u.rank || null,
+      // FIX: compute live rank — u.rank in DB is null until batch job runs
+      rank: u.rank || await this.db.query(
+        `SELECT row_num FROM (
+           SELECT id, ROW_NUMBER() OVER (ORDER BY coins DESC, CAST(accuracy AS FLOAT) DESC, streak DESC) AS row_num
+           FROM users WHERE status='active' AND deleted_at IS NULL
+         ) r WHERE r.id = $1`,
+        [userId]
+      ).then((r: any[]) => r[0]?.row_num || null).catch(() => null),
       // ── Activity data ─────────────────────────────────────────
       weekly_activity:    weeklyActivity,       // snake_case matches @SerializedName("weekly_activity")
       subjectAccuracy:    subjectStats,
