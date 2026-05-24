@@ -357,27 +357,30 @@ export class StudyMaterialsService {
 
   // ── POST: record download and return file URL ─────────────
   async recordDownload(id: string, userId: string) {
-    // FIX: Use explicit alias "fileKey" so TypeScript property access is unambiguous
-    // row.file_key can return undefined if the ORM camelCases it to row.fileKey
-    const [row] = await this.db.query(
-      `UPDATE study_materials
-       SET download_count = download_count + 1
-       WHERE id = $1 AND status = 'approved'
-       RETURNING file_key AS "fileKey", title`,
+    // FIX: SELECT file_key first (avoids RETURNING column-mapping issues with TypeORM raw queries)
+    // then UPDATE download_count separately — reliable on all pg driver versions
+    const [mat] = await this.db.query(
+      `SELECT id, title, file_key FROM study_materials WHERE id = $1 AND status = 'approved'`,
       [id]
     );
-    if (!row) throw new NotFoundException('Material not found');
+    if (!mat) throw new NotFoundException('Material not found or not published');
 
-    // Defensive: fileKey could be null/undefined if the material has no file yet
-    const fileKey = row.fileKey || row.file_key || null;
-    if (!fileKey) {
-      throw new NotFoundException('File not attached to this material');
+    // file_key may be stored under either name depending on ORM/driver config
+    const fileKey: string | null = mat.file_key ?? mat.fileKey ?? mat['file_key'] ?? null;
+    if (!fileKey || fileKey.trim() === '') {
+      throw new NotFoundException('No file attached to this material yet. Contact the uploader.');
     }
 
-    // Record in download history (for Downloads tab) — await this time, don't silently skip
+    // Increment download count
+    await this.db.query(
+      `UPDATE study_materials SET download_count = download_count + 1 WHERE id = $1`,
+      [id]
+    );
+
+    // Record in history (creates table if needed)
     await this.recordDownloadHistory(id, userId);
 
-    return successResponse({ downloadUrl: this.fileUrl(fileKey), title: row.title });
+    return successResponse({ downloadUrl: this.fileUrl(fileKey), title: mat.title });
   }
 
   // ── POST: toggle bookmark ─────────────────────────────────
