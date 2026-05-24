@@ -531,9 +531,13 @@ if (query.search)  { conditions.push(`sm.title ILIKE $${pi++}`); params.push(`%$
     await this.db.query(`UPDATE users SET coins=coins-$1 WHERE id=$2`, [price, userId]);
     const [updatedUser] = await this.db.query(`SELECT coins FROM users WHERE id=$1`, [userId]);
 
-    // Credit 70% to creator
-    const creatorShare = Math.floor(price * 0.70);
-    const platformFee  = price - creatorShare; // 30%
+    // Commission rate — read from app_settings (admin-configurable, default 70% to creator)
+    const [setting] = await this.db.query(
+      `SELECT value FROM app_settings WHERE key='creator_commission_pct' LIMIT 1`
+    ).catch(() => []);
+    const creatorPct   = parseFloat(setting?.value ?? '70') / 100;
+    const creatorShare = Math.floor(price * creatorPct);
+    const platformFee  = price - creatorShare; // remainder to platform
     if (material.uploader_id && material.uploader_id !== userId) {
       await this.db.query(`UPDATE users SET coins=coins+$1 WHERE id=$2`, [creatorShare, material.uploader_id]);
       await this.db.query(

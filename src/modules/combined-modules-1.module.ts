@@ -583,13 +583,42 @@ export class NotificationService {
   async getUserNotifications(userId: string, query: any) {
     const { page=1, limit=20 } = query;
     const offset = (page-1)*limit;
+
+    // FIX: Also pull broadcast notifications (target='all') that may not have a user_notifications row
+    // This happens when admin sends before this user created their account, or due to batch insert failures
+    // Strategy: union user_notifications (personal) with 'all'/'free'/'pro' broadcasts
     const [notifs, unread] = await Promise.all([
       this.db.query(
-        `SELECT un.id, un.title, un.body, n.type, un.is_read, un.created_at FROM user_notifications un LEFT JOIN notifications n ON un.notification_id=n.id WHERE un.user_id=$1 ORDER BY un.created_at DESC LIMIT $2 OFFSET $3`,
+        `SELECT
+           COALESCE(un.id, n.id::text)   AS id,
+           COALESCE(un.title, n.title)   AS title,
+           COALESCE(un.body, n.body)     AS body,
+           n.type,
+           COALESCE(un.is_read, false)   AS is_read,
+           COALESCE(un.created_at, n.created_at) AS created_at
+         FROM notifications n
+         LEFT JOIN user_notifications un ON un.notification_id=n.id AND un.user_id=$1
+         WHERE n.is_active=TRUE
+           AND n.status='sent'
+           AND (
+             un.user_id=$1                              -- personal delivery
+             OR n.target='all'                          -- broadcast to everyone
+             OR (n.target='pro' AND EXISTS(
+               SELECT 1 FROM subscriptions s WHERE s.user_id=$1 AND s.status='active' AND s.ends_at>NOW()
+             ))
+             OR (n.target='free' AND NOT EXISTS(
+               SELECT 1 FROM subscriptions s WHERE s.user_id=$1 AND s.status='active' AND s.ends_at>NOW()
+             ))
+           )
+         ORDER BY COALESCE(un.created_at, n.created_at) DESC
+         LIMIT $2 OFFSET $3`,
         [userId, limit, offset]
       ),
-      this.db.query(`SELECT COUNT(*) FROM user_notifications WHERE user_id=$1 AND is_read=FALSE`, [userId]),
+      this.db.query(
+        `SELECT COUNT(*) FROM user_notifications WHERE user_id=$1 AND is_read=FALSE`, [userId]
+      ),
     ]);
+
     return successResponse({ notifications: notifs, unreadCount: parseInt(unread[0].count) }, 'Success',
       paginationMeta(0, page, limit));
   }
