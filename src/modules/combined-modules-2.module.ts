@@ -613,8 +613,27 @@ class UsersService {
         [userId]
       ),
       this.db.query(
-        `SELECT q.subject, COUNT(*) AS attempts, ROUND(AVG(qa.score::decimal/NULLIF(qa.total_questions,0)*100),1) AS avg_accuracy
-         FROM quiz_attempts qa JOIN quizzes q ON qa.quiz_id=q.id WHERE qa.user_id=$1 GROUP BY q.subject`,
+        `-- FIX: qa.score is already a percentage (0-100), not raw count
+         -- Do NOT divide by total_questions again
+         SELECT q.subject,
+                COUNT(*) AS attempts,
+                ROUND(
+                  AVG(
+                    CASE
+                      WHEN qa.score IS NOT NULL
+                           AND qa.score <= 100
+                      THEN qa.score::decimal
+                      ELSE NULL
+                    END
+                  ),
+                  1
+                ) AS avg_accuracy
+         FROM quiz_attempts qa
+         JOIN quizzes q ON qa.quiz_id = q.id
+         WHERE qa.user_id = $1
+           AND qa.total_questions > 0
+         GROUP BY q.subject
+         ORDER BY attempts DESC`,
         [userId]
       ),
       this.db.query(
@@ -624,24 +643,54 @@ class UsersService {
         [userId]
       ),
       this.db.query(
-        /* Generate last 7 days always, joining with actual quiz activity.
-           This guarantees 7 rows even when user has zero activity,
-           so the Android weekly chart always renders instead of showing "No data". */
-        `WITH days AS (
+        `-- FIX: 28-day activity for heatmap
+         -- Combines quiz attempts + study session minutes per day
+      
+         WITH days AS (
            SELECT generate_series(
-             CURRENT_DATE - INTERVAL '6 days',
+             CURRENT_DATE - INTERVAL '27 days',
              CURRENT_DATE,
              INTERVAL '1 day'
            )::DATE AS day
          ),
-         activity AS (
-           SELECT DATE(qa.attempted_at) AS date, COUNT(*) AS cnt
+      
+         quiz_activity AS (
+           SELECT
+             DATE(qa.attempted_at) AS date,
+             COUNT(*) * 5 AS study_mins
            FROM quiz_attempts qa
-           WHERE qa.user_id=$1 AND qa.attempted_at >= NOW() - INTERVAL '7 days'
+           WHERE qa.user_id = $1
+             AND qa.attempted_at >= NOW() - INTERVAL '28 days'
            GROUP BY DATE(qa.attempted_at)
+         ),
+      
+         session_activity AS (
+           SELECT
+             DATE(ss.started_at) AS date,
+             COALESCE(SUM(ss.duration_minutes), 0) AS study_mins
+           FROM study_sessions ss
+           WHERE ss.user_id = $1
+             AND ss.started_at >= NOW() - INTERVAL '28 days'
+           GROUP BY DATE(ss.started_at)
+         ),
+      
+         combined AS (
+           SELECT
+             date,
+             SUM(study_mins) AS study_mins
+           FROM (
+             SELECT date, study_mins FROM quiz_activity
+             UNION ALL
+             SELECT date, study_mins FROM session_activity
+           ) src
+           GROUP BY date
          )
-         SELECT d.day AS date, COALESCE(a.cnt, 0) AS activity
-         FROM days d LEFT JOIN activity a ON a.date = d.day
+      
+         SELECT
+           d.day AS date,
+           COALESCE(c.study_mins, 0) AS activity
+         FROM days d
+         LEFT JOIN combined c ON c.date = d.day
          ORDER BY d.day ASC`,
         [userId]
       ),
