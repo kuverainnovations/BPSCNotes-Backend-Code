@@ -148,6 +148,12 @@ export class StudyMaterialsService {
       ? `(SELECT TRUE FROM material_bookmarks mb WHERE mb.material_id=sm.id AND mb.user_id='${query.userId}') AS is_bookmarked,`
       : `FALSE AS is_bookmarked,`;
 
+    // FIX: Include is_purchased so Android knows if user already bought premium material
+    // Without this, isPurchased is always false → Unlock button always shown → triggers download
+    const purchaseSubq = query.userId
+      ? `EXISTS (SELECT 1 FROM material_purchases mp WHERE mp.material_id=sm.id AND mp.user_id='${query.userId}') AS is_purchased,`
+      : `FALSE AS is_purchased,`;
+
     const where   = conditions.join(' AND ');
     const [rows, [countRow]] = await Promise.all([
       this.db.query(
@@ -160,6 +166,7 @@ export class StudyMaterialsService {
                 COALESCE(sm.free_pages, 3)     AS free_pages,
                 COALESCE(sm.is_premium, false) AS is_premium,
                 ${bookmarkSubq}
+                ${purchaseSubq}
                 sm.status
          FROM study_materials sm WHERE ${where}
          ORDER BY ${orderBy} LIMIT $${pi++} OFFSET $${pi++}`,
