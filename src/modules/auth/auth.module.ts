@@ -425,7 +425,17 @@ export class AuthService {
     const result = await this.db.query(
       `SELECT u.*,
          (SELECT COUNT(*) FROM subscriptions s WHERE s.user_id = u.id AND s.status = 'active' AND s.ends_at > NOW()) > 0 AS is_subscribed,
-         (SELECT plan FROM subscriptions s WHERE s.user_id = u.id AND s.status = 'active' AND s.ends_at > NOW() LIMIT 1) AS current_plan
+         (SELECT plan FROM subscriptions s WHERE s.user_id = u.id AND s.status = 'active' AND s.ends_at > NOW() LIMIT 1) AS current_plan,
+         -- FIX: compute live rank so it's never null
+         -- Uses ROW_NUMBER over active users sorted by coins+accuracy+streak
+         (SELECT row_num FROM (
+           SELECT id,
+             ROW_NUMBER() OVER (
+               ORDER BY coins DESC, CAST(accuracy AS FLOAT) DESC, streak DESC
+             ) AS row_num
+           FROM users
+           WHERE status='active' AND deleted_at IS NULL
+         ) ranked WHERE ranked.id = u.id) AS live_rank
        FROM users u WHERE u.id = $1 AND u.deleted_at IS NULL`,
       [userId]
     );
@@ -436,7 +446,13 @@ export class AuthService {
     delete user.refresh_token;
     delete user.fcm_token;
 
-    await this.cache.set(cacheKey, user, 60); // 60 sec
+    // Map live_rank → rank so Android always has a non-null rank
+    if (user.live_rank != null && (user.rank == null || user.rank === 0)) {
+      user.rank = parseInt(user.live_rank, 10);
+    }
+    delete user.live_rank;
+
+    await this.cache.set(cacheKey, user, 60); // 60 sec TTL
     return user;
   }
 

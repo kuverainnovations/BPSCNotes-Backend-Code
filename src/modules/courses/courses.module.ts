@@ -78,9 +78,6 @@ export class CoursesRepository {
   constructor(@InjectDataSource() private readonly db: DataSource) {}
 
   async findAll(query: CourseQueryDto, userId?: string) {
-    // CRITICAL FIX: Wrap entire findAll in try/catch
-    // COALESCE VARCHAR/BIGINT type mismatch crashes the endpoint silently in some PG versions
-    try {
     const { page = 1, limit = 20, subject, exam, search, type } = query;
     const offset = (page - 1) * limit;
     const conditions: string[] = [`c.status = 'published'`];
@@ -121,8 +118,16 @@ export class CoursesRepository {
         `SELECT c.id, c.title, c.description, c.instructor, c.instructor_bio,
                 -- FIX: derive instructor stats dynamically since columns may not exist
                 -- FIX: cast VARCHAR column to BIGINT to match SUM/COUNT return type
-                COALESCE(c.instructor_students, '0') AS instructor_students,
-               COALESCE(c.instructor_courses, '0') AS instructor_courses,
+                COALESCE(
+                    NULLIF(c.instructor_students, '')::BIGINT,
+                    (SELECT SUM(c2.enrollment_count) FROM courses c2
+                     WHERE c2.instructor = c.instructor AND c2.status='published')
+                )::TEXT AS instructor_students,
+                COALESCE(
+                    NULLIF(c.instructor_courses, '')::BIGINT,
+                    (SELECT COUNT(*) FROM courses c2
+                     WHERE c2.instructor = c.instructor AND c2.status='published')
+                )::TEXT AS instructor_courses,
                 c.subject, c.price, c.original_price, c.is_paid,
                 c.is_featured, c.is_limited_offer, c.offer_ends_at, c.thumbnail_url, (
    SELECT COUNT(*)
@@ -142,12 +147,7 @@ export class CoursesRepository {
     ]);
 
     return { rows, total: parseInt(countResult[0].count) };
-  }catch (e) {
-    console.error('CoursesRepository.findAll failed', e);
-    return { rows: [], total: 0 };
-
- }
-}
+  }
 
   async findOneById(courseId: string, userId?: string) {
     const result = await this.db.query(
@@ -371,29 +371,6 @@ export class CoursesService {
     const course = await this.repo.findOneById(courseId, userId);
     if (!course) throw new NotFoundException('Course not found');
     return successResponse({ course });
-  }
-
-  async getSavedCourses(userId: string) {
-    const saved = await this.db.query(
-      `SELECT c.* FROM courses c
-       INNER JOIN course_saves cs ON cs.course_id = c.id
-       WHERE cs.user_id = $1 AND c.status = 'published'
-       ORDER BY cs.created_at DESC`,
-      [userId]
-    ).catch(() => []);
-    return successResponse({ courses: saved });
-  }
-
-  async getEnrolledCourses(userId: string) {
-    const enrolled = await this.db.query(
-      `SELECT c.*, ue.enrolled_at, ue.status AS enrollment_status, ue.completed_lessons
-       FROM courses c
-       INNER JOIN user_enrollments ue ON ue.course_id = c.id
-       WHERE ue.user_id = $1 AND ue.status IN ('active', 'completed')
-       ORDER BY ue.enrolled_at DESC`,
-      [userId]
-    ).catch(() => []);
-    return successResponse({ courses: enrolled });
   }
 
   async enroll(courseId: string, userId: string) {
@@ -704,18 +681,6 @@ export class CoursesController {
   @ApiOperation({ summary: 'List courses (with filters)' })
   findAll(@Query() query: CourseQueryDto, @Req() req: any) {
     return this.service.findAll(query, req.user?.id);
-  }
-
-  // FIX: /saved MUST come before /:id — NestJS matches routes top-to-bottom
-  // Without this, GET /courses/saved is caught by /:id ParseUUIDPipe → 400 UUID error
-  @Get('saved')
-  getSaved(@Req() req: any) {
-    return this.service.getSavedCourses(req.user.id);
-  }
-
-  @Get('my-courses')
-  getMyCourses(@Req() req: any) {
-    return this.service.getEnrolledCourses(req.user.id);
   }
 
   @Get(':id')
