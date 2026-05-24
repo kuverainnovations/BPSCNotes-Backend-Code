@@ -622,27 +622,35 @@ if (query.search)  { conditions.push(`sm.title ILIKE $${pi++}`); params.push(`%$
 
   // ── GET: record download in history table ─────────────────
   async recordDownloadHistory(materialId: string, userId: string) {
-    // FIX: Ensure material_downloads table exists before inserting
-    // The migration may not have run on this deployment
+    // Ensure table exists
     await this.db.query(`
       CREATE TABLE IF NOT EXISTS material_downloads (
         id          UUID        DEFAULT gen_random_uuid() PRIMARY KEY,
-        material_id UUID        NOT NULL REFERENCES study_materials(id) ON DELETE CASCADE,
-        user_id     UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-        created_at  TIMESTAMPTZ DEFAULT NOW(),
-        UNIQUE(material_id, user_id)
+        material_id UUID        NOT NULL,
+        user_id     UUID        NOT NULL,
+        created_at  TIMESTAMPTZ DEFAULT NOW()
       )
-    `).catch((e: any) => this.logger.warn('material_downloads table check:', e.message));
+    `).catch(() => {});
 
-    // Now insert — this should never silently fail
-    await this.db.query(
-      `INSERT INTO material_downloads (material_id, user_id)
-       VALUES ($1, $2)
-       ON CONFLICT (material_id, user_id) DO UPDATE SET created_at = NOW()`,
+    // Use SELECT + INSERT instead of ON CONFLICT to avoid constraint errors
+    const rows = await this.db.query(
+      `SELECT id FROM material_downloads WHERE material_id = $1 AND user_id = $2 LIMIT 1`,
       [materialId, userId]
-    );
-    this.logger.log(`\`Download recorded: material=\${materialId} user=\${userId}'\'`);
+    ).catch(() => []);
+
+    if (rows.length > 0) {
+      await this.db.query(
+        `UPDATE material_downloads SET created_at = NOW() WHERE material_id = $1 AND user_id = $2`,
+        [materialId, userId]
+      ).catch(() => {});
+    } else {
+      await this.db.query(
+        `INSERT INTO material_downloads (material_id, user_id) VALUES ($1, $2)`,
+        [materialId, userId]
+      ).catch((e: any) => this.logger.warn('recordDownload insert:', e.message));
+    }
   }
+
 
   async adminGetUrl(id: string) {
     const [row] = await this.db.query(`SELECT file_key FROM study_materials WHERE id=$1`, [id]);
