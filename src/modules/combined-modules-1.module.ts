@@ -590,24 +590,26 @@ export class NotificationService {
     const [notifs, unread] = await Promise.all([
       this.db.query(
         `SELECT
-           COALESCE(un.id::text, n.id::text)   AS id,
-           COALESCE(un.title, n.title)          AS title,
-           COALESCE(un.body, n.body)            AS body,
+           COALESCE(un.id::text, n.id::text)        AS id,
+           COALESCE(un.title, n.title)               AS title,
+           COALESCE(un.body, n.body)                 AS body,
            n.type,
-           COALESCE(un.is_read, false)   AS is_read,
-           COALESCE(un.created_at, n.created_at) AS created_at
+           COALESCE(un.is_read, FALSE)               AS is_read,
+           COALESCE(un.created_at, n.created_at)     AS created_at
          FROM notifications n
-         LEFT JOIN user_notifications un ON un.notification_id=n.id AND un.user_id=$1
-         WHERE n.is_active=TRUE
-           AND n.status='sent'
+         LEFT JOIN user_notifications un
+           ON un.notification_id = n.id AND un.user_id = $1
+         WHERE n.status = 'sent'
            AND (
-             un.user_id=$1                              -- personal delivery
-             OR n.target='all'                          -- broadcast to everyone
-             OR (n.target='pro' AND EXISTS(
-               SELECT 1 FROM subscriptions s WHERE s.user_id=$1 AND s.status='active' AND s.ends_at>NOW()
+             un.user_id = $1
+             OR n.target = 'all'
+             OR (n.target = 'pro' AND EXISTS(
+               SELECT 1 FROM subscriptions s
+               WHERE s.user_id=$1 AND s.status='active' AND s.ends_at > NOW()
              ))
-             OR (n.target='free' AND NOT EXISTS(
-               SELECT 1 FROM subscriptions s WHERE s.user_id=$1 AND s.status='active' AND s.ends_at>NOW()
+             OR (n.target = 'free' AND NOT EXISTS(
+               SELECT 1 FROM subscriptions s
+               WHERE s.user_id=$1 AND s.status='active' AND s.ends_at > NOW()
              ))
            )
          ORDER BY COALESCE(un.created_at, n.created_at) DESC
