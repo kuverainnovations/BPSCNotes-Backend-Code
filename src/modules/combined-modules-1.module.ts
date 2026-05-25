@@ -590,9 +590,9 @@ export class NotificationService {
     const [notifs, unread] = await Promise.all([
       this.db.query(
         `SELECT
-           COALESCE(un.id, n.id::text)   AS id,
-           COALESCE(un.title, n.title)   AS title,
-           COALESCE(un.body, n.body)     AS body,
+           COALESCE(un.id::text, n.id::text)   AS id,
+           COALESCE(un.title, n.title)          AS title,
+           COALESCE(un.body, n.body)            AS body,
            n.type,
            COALESCE(un.is_read, false)   AS is_read,
            COALESCE(un.created_at, n.created_at) AS created_at
