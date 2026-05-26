@@ -547,7 +547,10 @@ export class AuthService {
       );
       if (parseInt(todayCount[0].count) >= maxPerDay) return 0;
 
-      // Award coins
+      // Award coins — UPDATE first, then record transaction separately
+      // IMPORTANT: return coinsToAward as soon as UPDATE succeeds.
+      // A failed transaction INSERT must NOT cause return 0 — that leaves the
+      // user with added coins but a response claiming coinsEarned=0.
       const balResult = await this.db.query(
         `UPDATE users
          SET coins = COALESCE(coins,0) + $1,
@@ -557,14 +560,30 @@ export class AuthService {
       );
 
       if (!balResult.length) return 0;
-      const newBalance = parseInt(balResult[0].coins);
+      const newBalance = Number(balResult[0].coins) || 0;
 
-      await this.db.query(
-        `INSERT INTO coin_transactions
-           (user_id, type, amount, description, action, ref_id, balance)
-         VALUES ($1,'earned',$2,$3,$4,$5,$6)`,
-        [userId, coinsToAward, `${action} reward`, action, refId || null, newBalance]
-      );
+      // Record transaction — non-blocking: failure here must NOT roll back coins
+      // or return 0. Fire and wait, but catch independently.
+      try {
+        // Validate refId is a proper UUID before inserting — non-UUID strings cause "invalid UUID" error
+        const safeRefId = refId && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(refId)
+          ? refId : null;
+        await this.db.query(
+          `INSERT INTO coin_transactions
+             (user_id, type, amount, description, action, ref_id, balance)
+           VALUES ($1,'earned',$2,$3,$4,$5,$6)`,
+          [userId, coinsToAward, `${action} reward`, action, safeRefId, newBalance]
+        );
+      } catch (txErr: any) {
+        // Log but do NOT rethrow — coins were already awarded, just missing the history row
+        console.error(`coin_transactions INSERT failed for action=${action}:`, txErr.message);
+        // Attempt a simpler INSERT without ref_id to at least record it
+        this.db.query(
+          `INSERT INTO coin_transactions (user_id, type, amount, description, action, balance)
+           VALUES ($1,'earned',$2,$3,$4,$5)`,
+          [userId, coinsToAward, `${action} reward`, action, newBalance]
+        ).catch(() => {}); // truly non-blocking fallback
+      }
 
       await this.cache.del(`user:${userId}`);
       return coinsToAward;
