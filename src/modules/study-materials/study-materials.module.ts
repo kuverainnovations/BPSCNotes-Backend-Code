@@ -22,6 +22,7 @@ import { Response }               from 'express';
 import { JwtAuthGuard, AdminJwtGuard, PermissionGuard, RequirePermission, Public } from '../../common/guards';
 import { successResponse, paginationMeta } from '../../common/utils/response.util';
 import { AuthModule }             from '../auth/auth.module';
+import { CoinsModule, CoinsService } from '../coins/coins.module';
 
 // ════════════════════════════════════════════════════════════
 // LOCAL STORAGE — No AWS required
@@ -82,6 +83,8 @@ export class StudyMaterialsService {
     @InjectDataSource()    private readonly db:     DataSource,
     @Inject(CACHE_MANAGER) private readonly cache:  Cache,
     private readonly config: ConfigService,
+    private readonly coinsService: CoinsService,
+
   ) {
     // UPLOAD_DIR defaults to <project-root>/uploads — change in .env for production
     this.uploadDir = './uploads';
@@ -449,6 +452,18 @@ if (query.search)  { conditions.push(`sm.title ILIKE $${pi++}`); params.push(`%$
 
   async adminApprove(id: string) {
     await this.db.query(`UPDATE study_materials SET status='approved', updated_at=NOW() WHERE id=$1`, [id]);
+
+    // Award coins to the uploader for the upload_note task (once per material approved)
+    // Only award if they haven't already been awarded for this material's upload action
+    try {
+      const [mat] = await this.db.query(
+        `SELECT uploader_id FROM study_materials WHERE id=$1`, [id]
+      );
+      if (mat?.uploader_id) {
+        await this.coinsService.claimTask('upload_note', mat.uploader_id);
+      }
+    } catch (_) { /* non-blocking — approval still succeeds */ }
+
     return successResponse(null, '✅ Approved — now visible to students');
   }
 
@@ -864,7 +879,7 @@ export class AdminStudyMaterialsController {
 // MODULE
 // ════════════════════════════════════════════════════════════
 @Module({
-  imports:     [AuthModule],
+  imports:     [AuthModule, CoinsModule],
   controllers: [StudyMaterialsController, AdminStudyMaterialsController],
   providers:   [StudyMaterialsService],
   exports:     [StudyMaterialsService],
