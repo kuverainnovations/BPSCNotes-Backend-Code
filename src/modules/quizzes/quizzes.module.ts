@@ -260,7 +260,12 @@ if (q.scheduled_for) {
         const coinAction = quizType === 'mock'  ? 'mock_quiz'
                          : quizType === 'topic' ? 'topic_quiz'
                          : 'daily_quiz';
-        coinsEarned = await this.authService.awardCoins(userId, coinAction, attempt[0].id);
+        // Pass the quiz's specific coins_reward set by admin as the override
+        // so admin-configured rewards are always honoured over global defaults
+        const quizCoinsReward = Number(q.coins_reward) || 0;
+        coinsEarned = await this.authService.awardCoins(
+          userId, coinAction, attempt[0].id, quizCoinsReward
+        );
       }
     }
 

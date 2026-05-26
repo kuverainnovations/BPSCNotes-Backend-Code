@@ -509,7 +509,7 @@ export class AuthService {
     subscription_bonus: { coins: 0,   maxPerDay: 1 },
   };
 
-  async awardCoins(userId: string, action: string, refId?: string): Promise<number> {
+  async awardCoins(userId: string, action: string, refId?: string, coinsOverride?: number): Promise<number> {
     try {
       // Try DB first — admin can override amounts via admin panel
       const dbRules = await this.db.query(
