@@ -1,5 +1,5 @@
 import {
-  Module, Injectable, Controller,
+  Module, Injectable, Controller,OnModuleInit,
   Get, Post, Body, Param, Query, Req,
   UseGuards, HttpCode, HttpStatus,
   NotFoundException, BadRequestException, Logger,
@@ -106,7 +106,7 @@ const EARN_TASKS = [
 const CHECKIN_REWARDS = [5, 5, 10, 10, 15, 15, 25]; // day 1→5, 2→5, ... 7→25
 
 @Injectable()
-export class CoinsService {
+export class CoinsService implements OnModuleInit {
   private readonly logger = new Logger(CoinsService.name);
 
   constructor(
@@ -117,6 +117,52 @@ export class CoinsService {
   // ── GET /coins/balance ────────────────────────────────────────
   // Returns: balance, totalEarned, totalSpent, checkInStreak,
   //          checkedInToday, checkInDays (7-day array)
+  async onModuleInit() {
+    try {
+      await this.db.query(`
+        CREATE TABLE IF NOT EXISTS coin_rules (
+          id           UUID        DEFAULT gen_random_uuid() PRIMARY KEY,
+          action       TEXT        NOT NULL UNIQUE,
+          description  TEXT        NOT NULL,
+          coins_awarded INT        NOT NULL DEFAULT 5,
+          max_per_day  INT         NOT NULL DEFAULT 1,
+          is_active    BOOLEAN     NOT NULL DEFAULT TRUE,
+          created_at   TIMESTAMPTZ DEFAULT NOW(),
+          updated_at   TIMESTAMPTZ DEFAULT NOW()
+        )
+      `);
+      for (const task of EARN_TASKS) {
+        await this.db.query(`
+          INSERT INTO coin_rules (action, description, coins_awarded, max_per_day, is_active)
+          VALUES ($1, $2, $3, 1, TRUE)
+          ON CONFLICT (action) DO UPDATE
+            SET coins_awarded = EXCLUDED.coins_awarded,
+                description   = EXCLUDED.description,
+                updated_at    = NOW()
+        `, [task.action, task.title, task.coinsReward]);
+      }
+      // Ensure extra system rules
+      for (const r of [
+        ['daily_login',       'Daily login bonus',   5, 1],
+        ['referral',          'Refer a friend',      75, 5],
+        ['material_upload',   'Upload study notes',  25, 1],
+        ['subscription_bonus','Subscription bonus',   0, 1],
+      ] as any[]) {
+      
+        await this.db.query(`
+          INSERT INTO coin_rules
+            (action, description, coins_awarded, max_per_day, is_active)
+          VALUES ($1, $2, $3, $4, TRUE)
+          ON CONFLICT (action) DO NOTHING
+        `, r);
+      }
+      this.logger.log('coin_rules seeded ✅');
+    } catch (err) {
+      this.logger.error('coin_rules seed failed:', err.message);
+    }
+  }
+
+
   async getBalance(userId: string) {
     const [user] = await this.db.query(`
       SELECT coins, total_coins_earned, last_active_at,
