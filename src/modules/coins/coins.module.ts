@@ -1,6 +1,6 @@
 import {
-  Module, Injectable, Controller,
-  Get, Post, Body, Param, Query, Req,OnModuleInit,
+  Module, Injectable, Controller,OnModuleInit,
+  Get, Post, Body, Param, Query, Req,
   UseGuards, HttpCode, HttpStatus,
   NotFoundException, BadRequestException, Logger,
 } from '@nestjs/common';
@@ -141,13 +141,14 @@ export class CoinsService implements OnModuleInit {
                 updated_at    = NOW()
         `, [task.action, task.title, task.coinsReward]);
       }
-      // Ensure extra system rules
-      for (const r of [
-        ['daily_login',      'Daily login bonus',    5,  1],
-        ['referral',         'Refer a friend',       75, 5],
-        ['material_upload',  'Upload study notes',   25, 1],
-        ['subscription_bonus','Subscription bonus',  0,  1],
-      ] as any[]) {
+      // Ensure extra system rules (explicit mutable type to avoid readonly error)
+      const extraRules: Array<[string, string, number, number]> = [
+        ['daily_login',       'Daily login bonus',    5,  1],
+        ['referral',          'Refer a friend',       75, 5],
+        ['material_upload',   'Upload study notes',   25, 1],
+        ['subscription_bonus','Subscription bonus',   0,  1],
+      ];
+      for (const r of extraRules) {
         await this.db.query(`
           INSERT INTO coin_rules (action, description, coins_awarded, max_per_day, is_active)
           VALUES ($1, $2, $3, $4, TRUE) ON CONFLICT (action) DO NOTHING
@@ -287,7 +288,9 @@ export class CoinsService implements OnModuleInit {
         description          AS title,
         CASE action
           WHEN 'daily_checkin'    THEN 'Daily streak bonus'
-          WHEN 'daily_quiz'       THEN 'Quiz completed'
+          WHEN 'daily_quiz'       THEN 'Daily quiz completed'
+          WHEN 'mock_quiz'        THEN 'Mock test completed'
+          WHEN 'topic_quiz'       THEN 'Topic quiz completed'
           WHEN 'quiz_attempt'     THEN 'Quiz completed'
           WHEN 'study_session'    THEN 'Study session reward'
           WHEN 'study_room'       THEN 'Study room session'

@@ -476,9 +476,11 @@ export class AuthService {
   // This covers EVERY action used across all modules so coins never silently return 0.
   // DB rows override these defaults (admin can tune via admin panel).
   private static readonly COIN_DEFAULTS: Record<string, { coins: number; maxPerDay: number }> = {
-    // Quiz actions
-    daily_quiz:         { coins: 10,  maxPerDay: 1 },
-    quiz_attempt:       { coins: 10,  maxPerDay: 1 },
+    // Quiz actions — each type has its own daily limit
+    daily_quiz:         { coins: 10,  maxPerDay: 1  },  // 1 daily quiz per day
+    mock_quiz:          { coins: 10,  maxPerDay: 3  },  // up to 3 mock tests per day
+    topic_quiz:         { coins: 15,  maxPerDay: 5  },  // up to 5 topic quizzes per day
+    quiz_attempt:       { coins: 10,  maxPerDay: 5  },  // legacy fallback
     // Study actions
     study_session:      { coins: 15,  maxPerDay: 1 },
     study_room:         { coins: 5,   maxPerDay: 2 },

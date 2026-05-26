@@ -254,10 +254,14 @@ if (q.scheduled_for) {
         [userId, quizId, attempt[0].id]
       );
       if (!prevPass) {
-        // First time passing this quiz — award coins
-        coinsEarned = await this.authService.awardCoins(userId, 'daily_quiz', attempt[0].id);
+        // First time passing this quiz — award using type-specific action
+        // so daily/mock/topic each have independent daily limits
+        const quizType = q.type || 'daily';
+        const coinAction = quizType === 'mock'  ? 'mock_quiz'
+                         : quizType === 'topic' ? 'topic_quiz'
+                         : 'daily_quiz';
+        coinsEarned = await this.authService.awardCoins(userId, coinAction, attempt[0].id);
       }
-      // Subsequent passes: coins=0, but attempt is still recorded
     }
 
     // ── Async achievement + challenge checks (fire-and-forget) ──
