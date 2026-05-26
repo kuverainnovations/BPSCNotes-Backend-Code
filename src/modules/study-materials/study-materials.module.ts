@@ -120,6 +120,11 @@ export class StudyMaterialsService {
     const offset = (page - 1) * limit;
 
     const conditions: string[] = [`sm.status = 'approved'`];
+    // FIX: Uploader should NOT see their own materials in the public Explore list.
+    // They have a dedicated "My Uploads" tab where they see those with full access.
+    if (query.userId) {
+      conditions.push(`sm.uploader_id != '${query.userId}'`);
+    }
     const params: any[] = [];
     let pi = 1;
 
