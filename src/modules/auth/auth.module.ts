@@ -472,15 +472,35 @@ export class AuthService {
     return { accessToken, refreshToken };
   }
 
+  // Hardcoded defaults so coins are ALWAYS awarded even if coin_rules table is empty.
+  // These match the EARN_TASKS definitions in coins.module.ts.
+  private static readonly DEFAULT_COIN_RULES: Record<string, { coins_awarded: number; max_per_day: number }> = {
+    daily_quiz:       { coins_awarded: 10,  max_per_day: 1 },
+    daily_login:      { coins_awarded: 5,   max_per_day: 1 },
+    study_session:    { coins_awarded: 15,  max_per_day: 1 },
+    material_upload:  { coins_awarded: 25,  max_per_day: 1 },
+    referral:         { coins_awarded: 75,  max_per_day: 5 },
+    ad_watch:         { coins_awarded: 5,   max_per_day: 3 },
+    subscription_bonus: { coins_awarded: 0, max_per_day: 1 },
+  };
+
   async awardCoins(userId: string, action: string, refId?: string): Promise<number> {
     try {
       const rules = await this.db.query(
         `SELECT coins_awarded, max_per_day FROM coin_rules WHERE action = $1 AND is_active = TRUE`,
         [action]
       );
-      if (!rules.length) return 0;
 
-      const rule = rules[0];
+      // FIX: If no DB rule exists, use hardcoded defaults instead of returning 0.
+      // This ensures coins work even before coin_rules table is seeded.
+      const rule = rules.length > 0
+        ? rules[0]
+        : (AuthService.DEFAULT_COIN_RULES[action] ?? null);
+
+      if (!rule) {
+        console.warn(`\`awardCoins: no rule found for action '\${action}' — skipping'\'`);
+        return 0;
+      }
       const todayCount = await this.db.query(
         `SELECT COUNT(*) FROM coin_transactions WHERE user_id=$1 AND action=$2 AND created_at::date = CURRENT_DATE`,
         [userId, action]
