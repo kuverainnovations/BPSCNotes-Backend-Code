@@ -550,6 +550,36 @@ return successResponse({
     await this.cache.del(`quiz_meta:${quizId}`);
     return successResponse(null, 'Quiz deleted ✅');
   }
+
+  async getLeaderboard(quizId: string, currentUserId: string) {
+    const rows = await this.db.query(
+      `SELECT
+         RANK() OVER (ORDER BY qa.score DESC, qa.time_taken_secs ASC) AS rank_position,
+         u.id                                                          AS user_id,
+         u.name                                                        AS user_name,
+         qa.score,
+         qa.correct_answers,
+         qa.total_questions,
+         qa.time_taken_secs
+       FROM quiz_attempts qa
+       JOIN users u ON u.id = qa.user_id
+       WHERE qa.quiz_id = $1
+       ORDER BY qa.score DESC, qa.time_taken_secs ASC
+       LIMIT 50`,
+      [quizId]
+    );
+    const leaderboard = rows.map((r: any) => ({
+      rank_position:   parseInt(r.rank_position),
+      user_id:         r.user_id,
+      user_name:       r.user_name,
+      score:           parseFloat(r.score),
+      correct_answers: parseInt(r.correct_answers),
+      total_questions: parseInt(r.total_questions),
+      time_taken_secs: parseInt(r.time_taken_secs),
+      is_current_user: r.user_id === currentUserId,
+    }));
+    return successResponse({ leaderboard });
+  }
 }
 
 // ═════════════════════════════════════════════════════════════
