@@ -1,6 +1,6 @@
 import {
-  Module, Injectable, Controller,OnModuleInit,
-  Get, Post, Body, Param, Query, Req,
+  Module, Injectable, Controller,
+  Get, Post, Body, Param, Query, Req,OnModuleInit,
   UseGuards, HttpCode, HttpStatus,
   NotFoundException, BadRequestException, Logger,
 } from '@nestjs/common';
@@ -143,17 +143,14 @@ export class CoinsService implements OnModuleInit {
       }
       // Ensure extra system rules
       for (const r of [
-        ['daily_login',       'Daily login bonus',   5, 1],
-        ['referral',          'Refer a friend',      75, 5],
-        ['material_upload',   'Upload study notes',  25, 1],
-        ['subscription_bonus','Subscription bonus',   0, 1],
+        ['daily_login',      'Daily login bonus',    5,  1],
+        ['referral',         'Refer a friend',       75, 5],
+        ['material_upload',  'Upload study notes',   25, 1],
+        ['subscription_bonus','Subscription bonus',  0,  1],
       ] as any[]) {
-      
         await this.db.query(`
-          INSERT INTO coin_rules
-            (action, description, coins_awarded, max_per_day, is_active)
-          VALUES ($1, $2, $3, $4, TRUE)
-          ON CONFLICT (action) DO NOTHING
+          INSERT INTO coin_rules (action, description, coins_awarded, max_per_day, is_active)
+          VALUES ($1, $2, $3, $4, TRUE) ON CONFLICT (action) DO NOTHING
         `, r);
       }
       this.logger.log('coin_rules seeded ✅');
@@ -289,12 +286,22 @@ export class CoinsService implements OnModuleInit {
         id,
         description          AS title,
         CASE action
-          WHEN 'daily_checkin'   THEN 'Daily streak bonus'
-          WHEN 'quiz_attempt'    THEN 'Quiz completed'
-          WHEN 'study_session'   THEN 'Study session reward'
-          WHEN 'material_upload' THEN 'Material upload reward'
-          WHEN 'referral'        THEN 'Referral bonus'
-          WHEN 'ad_watch'        THEN 'Ad watched'
+          WHEN 'daily_checkin'    THEN 'Daily streak bonus'
+          WHEN 'daily_quiz'       THEN 'Quiz completed'
+          WHEN 'quiz_attempt'     THEN 'Quiz completed'
+          WHEN 'study_session'    THEN 'Study session reward'
+          WHEN 'study_room'       THEN 'Study room session'
+          WHEN 'material_upload'  THEN 'Study material uploaded'
+          WHEN 'referral'         THEN 'Referral bonus'
+          WHEN 'ad_watch'         THEN 'Ad watched'
+          WHEN 'watch_ad'         THEN 'Ad watched'
+          WHEN 'target_complete'  THEN 'Daily target completed'
+          WHEN 'daily_login'      THEN 'Daily login bonus'
+          WHEN 'achievement'      THEN 'Achievement unlocked'
+          WHEN 'leaderboard_reward' THEN 'Leaderboard reward'
+          WHEN 'tier_promotion'   THEN 'Tier promotion bonus'
+          WHEN 'weekly_challenge' THEN 'Challenge completed'
+          WHEN 'subscription_bonus' THEN 'Subscription bonus'
           ELSE description
         END                  AS subtitle,
         amount               AS coins,

@@ -501,6 +501,8 @@ export class AuthService {
     streak_7:           { coins: 15,  maxPerDay: 1 },
     streak_30:          { coins: 100, maxPerDay: 1 },
     mock_top10:         { coins: 100, maxPerDay: 1 },
+    // Daily targets
+    target_complete:    { coins: 1,   maxPerDay: 20 },
     // Subscriptions
     subscription_bonus: { coins: 0,   maxPerDay: 1 },
   };

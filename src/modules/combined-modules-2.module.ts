@@ -208,6 +208,8 @@ class DailyTargetsService {
     @Inject(CACHE_MANAGER) private readonly cache: Cache,
     private readonly achievementsService: AchievementsService,
     private readonly challengesService: WeeklyChallengesService,
+    private readonly authService: AuthService,
+
   ) {}
 
   // ── GET /users/daily-targets ──────────────────────────────
@@ -417,32 +419,14 @@ class DailyTargetsService {
           .catch(e => console.error('challenge update failed:', e.message)),
       ]);
     }
+    
 
     // Award coin for first completion (not if toggling back)
+    // FIX: Use authService.awardCoins() so it uses COIN_DEFAULTS fallback
+    // The old code read directly from coin_rules table which may be empty
     let coinsEarned = 0;
     if (nowComplete) {
-      const rule = await this.db.query(
-        `SELECT coins_awarded, max_per_day FROM coin_rules WHERE action='target_complete' AND is_active=TRUE`
-      );
-      if (rule.length) {
-        const todayCompletions = await this.db.query(
-          `SELECT COUNT(*) FROM coin_transactions
-           WHERE user_id=$1 AND action='target_complete' AND created_at::date=CURRENT_DATE`,
-          [userId]
-        );
-        if (parseInt(todayCompletions[0].count) < rule[0].max_per_day) {
-          coinsEarned = rule[0].coins_awarded;
-          const bal   = (await this.db.query(
-            `UPDATE users SET coins=coins+$1 WHERE id=$2 RETURNING coins`,
-            [coinsEarned, userId]
-          ))[0].coins;
-          await this.db.query(
-            `INSERT INTO coin_transactions (user_id,type,amount,description,action,ref_id,balance)
-             VALUES ($1,'earned',$2,'Target completed!','target_complete',$3,$4)`,
-            [userId, coinsEarned, targetId, bal]
-          );
-        }
-      }
+      coinsEarned = await this.authService.awardCoins(userId, 'target_complete', targetId);
 
       // Update user's study minutes (+estimated time)
       await this.db.query(
