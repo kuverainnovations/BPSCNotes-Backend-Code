@@ -37,16 +37,32 @@ async function seedRichData() {
 
   // ── Coin Rules ─────────────────────────────────────────────
   const rules = [
-    ['daily_login',      'Daily Login Bonus',           2,   1],
-    ['daily_quiz',       'Complete Daily Quiz',         10,  1],
-    ['streak_7',         '7-Day Study Streak Bonus',    15,  1],
-    ['streak_30',        '30-Day Study Streak Bonus',   100, 1],
-    ['referral',         'Referral — Friend Joined',    50,  5],
-    ['active_recall',    'Complete 10 Flashcards',      5,   3],
-    ['mock_top10',       'Top 10 in Mock Test',         100, 1],
-    ['profile_complete', 'Complete Your Profile',       20,  1],
-    ['watch_ad',         'Watch Video Ad',              5,   3],
-    ['study_room',       'Join Study Room Session',     5,   2],
+    // Auth & engagement
+    ['daily_login',      'Daily Login Bonus',            5,   1],
+    ['profile_complete', 'Complete Your Profile',        20,  1],
+    ['referral',         'Referral — Friend Joined',     75,  5],
+    // Quiz
+    ['daily_quiz',       'Complete Daily Quiz',          10,  1],
+    ['quiz_attempt',     'Quiz Attempt Reward',          10,  1],
+    ['mock_top10',       'Top 10 in Mock Test',          100, 1],
+    // Study
+    ['study_session',    'Complete Study Session',       15,  1],
+    ['study_room',       'Join Study Room Session',      5,   2],
+    ['active_recall',    'Complete 10 Flashcards',       5,   3],
+    // Content
+    ['material_upload',  'Upload Study Notes',           25,  1],
+    // Ads — both aliases so existing transactions match
+    ['ad_watch',         'Watch Video Ad',               5,   3],
+    ['watch_ad',         'Watch Video Ad (legacy)',      5,   3],
+    // Streaks & achievements
+    ['streak_7',         '7-Day Study Streak Bonus',     15,  1],
+    ['streak_30',        '30-Day Study Streak Bonus',    100, 1],
+    ['achievement',      'Achievement Unlocked',         10,  10],
+    ['leaderboard_reward','Leaderboard Reward',          50,  1],
+    ['tier_promotion',   'Tier Promotion Bonus',         20,  1],
+    ['weekly_challenge', 'Weekly Challenge Completed',   30,  1],
+    // Subscriptions
+    ['subscription_bonus','Subscription Bonus',         0,   1],
   ];
   for (const [action, desc, coins, max] of rules) {
     await q(`INSERT INTO coin_rules (action, description, coins_awarded, max_per_day) VALUES ($1,$2,$3,$4) ON CONFLICT (action) DO NOTHING`, [action, desc, coins, max]);

@@ -472,59 +472,101 @@ export class AuthService {
     return { accessToken, refreshToken };
   }
 
-  // Hardcoded defaults so coins are ALWAYS awarded even if coin_rules table is empty.
-  // These match the EARN_TASKS definitions in coins.module.ts.
-  private static readonly DEFAULT_COIN_RULES: Record<string, { coins_awarded: number; max_per_day: number }> = {
-    daily_quiz:       { coins_awarded: 10,  max_per_day: 1 },
-    daily_login:      { coins_awarded: 5,   max_per_day: 1 },
-    study_session:    { coins_awarded: 15,  max_per_day: 1 },
-    material_upload:  { coins_awarded: 25,  max_per_day: 1 },
-    referral:         { coins_awarded: 75,  max_per_day: 5 },
-    ad_watch:         { coins_awarded: 5,   max_per_day: 3 },
-    subscription_bonus: { coins_awarded: 0, max_per_day: 1 },
+  // ── COMPREHENSIVE COIN RULES (used when DB coin_rules table has no row) ──────
+  // This covers EVERY action used across all modules so coins never silently return 0.
+  // DB rows override these defaults (admin can tune via admin panel).
+  private static readonly COIN_DEFAULTS: Record<string, { coins: number; maxPerDay: number }> = {
+    // Quiz actions
+    daily_quiz:         { coins: 10,  maxPerDay: 1 },
+    quiz_attempt:       { coins: 10,  maxPerDay: 1 },
+    // Study actions
+    study_session:      { coins: 15,  maxPerDay: 1 },
+    study_room:         { coins: 5,   maxPerDay: 2 },
+    active_recall:      { coins: 5,   maxPerDay: 3 },
+    // Content creation
+    material_upload:    { coins: 25,  maxPerDay: 1 },
+    // Auth / engagement
+    daily_login:        { coins: 5,   maxPerDay: 1 },
+    referral:           { coins: 75,  maxPerDay: 5 },
+    profile_complete:   { coins: 20,  maxPerDay: 1 },
+    // Ads
+    ad_watch:           { coins: 5,   maxPerDay: 3 },
+    watch_ad:           { coins: 5,   maxPerDay: 3 },  // alias
+    // Achievements & leaderboard
+    achievement:        { coins: 10,  maxPerDay: 10 },
+    leaderboard_reward: { coins: 50,  maxPerDay: 1 },
+    tier_promotion:     { coins: 20,  maxPerDay: 1 },
+    weekly_challenge:   { coins: 30,  maxPerDay: 1 },
+    // Streaks
+    streak_7:           { coins: 15,  maxPerDay: 1 },
+    streak_30:          { coins: 100, maxPerDay: 1 },
+    mock_top10:         { coins: 100, maxPerDay: 1 },
+    // Subscriptions
+    subscription_bonus: { coins: 0,   maxPerDay: 1 },
   };
 
   async awardCoins(userId: string, action: string, refId?: string): Promise<number> {
     try {
-      const rules = await this.db.query(
+      // Try DB first — admin can override amounts via admin panel
+      const dbRules = await this.db.query(
         `SELECT coins_awarded, max_per_day FROM coin_rules WHERE action = $1 AND is_active = TRUE`,
         [action]
       );
 
-      // FIX: If no DB rule exists, use hardcoded defaults instead of returning 0.
-      // This ensures coins work even before coin_rules table is seeded.
-      const rule = rules.length > 0
-        ? rules[0]
-        : (AuthService.DEFAULT_COIN_RULES[action] ?? null);
+      const defaults = AuthService.COIN_DEFAULTS[action];
 
-      if (!rule) {
-        console.warn(`\`awardCoins: no rule found for action '\${action}' — skipping'\'`);
+      // Use DB rule if present, otherwise fall back to code defaults
+      // If neither exists, log a warning and return 0
+      const coinsToAward = dbRules.length > 0
+        ? parseInt(dbRules[0].coins_awarded)
+        : (defaults?.coins ?? -1);
+
+      const maxPerDay = dbRules.length > 0
+        ? parseInt(dbRules[0].max_per_day)
+        : (defaults?.maxPerDay ?? 1);
+
+      if (coinsToAward < 0) {
+        console.warn(`awardCoins: unknown action '${action}' — add it to COIN_DEFAULTS`);
         return 0;
       }
+
+      // Idempotency — respect daily cap
       const todayCount = await this.db.query(
-        `SELECT COUNT(*) FROM coin_transactions WHERE user_id=$1 AND action=$2 AND created_at::date = CURRENT_DATE`,
+        `SELECT COUNT(*) FROM coin_transactions
+         WHERE user_id=$1 AND action=$2 AND created_at::date = CURRENT_DATE`,
         [userId, action]
       );
-      if (parseInt(todayCount[0].count) >= rule.max_per_day) return 0;
+      if (parseInt(todayCount[0].count) >= maxPerDay) return 0;
 
+      // Award coins
       const balResult = await this.db.query(
-        `UPDATE users SET coins = coins + $1, total_coins_earned = total_coins_earned + $1 WHERE id = $2 RETURNING coins`,
-        [rule.coins_awarded, userId]
+        `UPDATE users
+         SET coins = COALESCE(coins,0) + $1,
+             total_coins_earned = COALESCE(total_coins_earned,0) + $1
+         WHERE id = $2 RETURNING coins`,
+        [coinsToAward, userId]
       );
-      const newBalance = balResult[0].coins;
+
+      if (!balResult.length) return 0;
+      const newBalance = parseInt(balResult[0].coins);
 
       await this.db.query(
-        `INSERT INTO coin_transactions (user_id, type, amount, description, action, ref_id, balance) VALUES ($1,'earned',$2,$3,$4,$5,$6)`,
-        [userId, rule.coins_awarded, `${action} reward`, action, refId || null, newBalance]
+        `INSERT INTO coin_transactions
+           (user_id, type, amount, description, action, ref_id, balance)
+         VALUES ($1,'earned',$2,$3,$4,$5,$6)`,
+        [userId, coinsToAward, `${action} reward`, action, refId || null, newBalance]
       );
 
       await this.cache.del(`user:${userId}`);
-      return rule.coins_awarded;
+      return coinsToAward;
+
     } catch (err) {
       console.error('awardCoins error:', err.message);
       return 0;
     }
   }
+
+
 
   private sanitizeUser(user: any) {
     const { password_hash, refresh_token, fcm_token, ...safe } = user;
