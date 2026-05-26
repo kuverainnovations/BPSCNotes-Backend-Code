@@ -592,6 +592,12 @@ class QuizzesController {
   submit(@Param('id', ParseUUIDPipe) id: string, @Req() r: any, @Body() dto: any) {
     return this.s.submit(id, r.user.id, dto);
   }
+
+  /** GET /quizzes/:id/leaderboard — top quiz scores */
+  @Get(':id/leaderboard')
+  leaderboard(@Param('id', ParseUUIDPipe) id: string, @Req() r: any) {
+    return this.s.getLeaderboard(id, r.user.id);
+  }
 }
 
 // ═════════════════════════════════════════════════════════════
