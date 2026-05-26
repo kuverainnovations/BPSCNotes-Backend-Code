@@ -523,19 +523,21 @@ export class AuthService {
       // If neither exists, log a warning and return 0
       // FIX: Safe parsing — parseInt(null) or parseInt(undefined) = NaN which crashes Postgres
       // Always fall back to COIN_DEFAULTS when DB value is missing/null/NaN
-      const dbCoins    = dbRules.length > 0 ? Number(dbRules[0].coins_awarded) : NaN;
-      const dbMaxPerDay = dbRules.length > 0 ? Number(dbRules[0].max_per_day)  : NaN;
+      const dbCoins     = dbRules.length > 0 ? Number(dbRules[0].coins_awarded) : NaN;
+      const dbMaxPerDay = dbRules.length > 0 ? Number(dbRules[0].max_per_day)   : NaN;
 
-      const coinsToAward = (!isNaN(dbCoins) && dbCoins >= 0)
-        ? dbCoins
+      // Priority: coinsOverride (per-quiz admin value) > DB rule > COIN_DEFAULTS
+      const coinsToAward =
+        (coinsOverride !== undefined && coinsOverride > 0) ? coinsOverride
+        : (!isNaN(dbCoins) && dbCoins >= 0)               ? dbCoins
         : (defaults?.coins ?? -1);
 
       const maxPerDay = (!isNaN(dbMaxPerDay) && dbMaxPerDay > 0)
         ? dbMaxPerDay
         : (defaults?.maxPerDay ?? 1);
 
-      if (coinsToAward < 0 || isNaN(coinsToAward)) {
-        console.warn(`awardCoins: no valid rule for action '${action}'`);
+      if (coinsToAward <= 0 || isNaN(coinsToAward)) {
+        console.warn(`awardCoins: no valid coins for action '${action}'`);
         return 0;
       }
 
