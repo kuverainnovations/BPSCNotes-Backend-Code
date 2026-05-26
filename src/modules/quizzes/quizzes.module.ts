@@ -553,20 +553,33 @@ return successResponse({
 
   async getLeaderboard(quizId: string, currentUserId: string) {
     const rows = await this.db.query(
-      `SELECT
-         RANK() OVER (ORDER BY qa.score DESC, qa.time_taken_secs ASC) AS rank_position,
-         u.id                                                          AS user_id,
-         u.name                                                        AS user_name,
-         qa.score,
-         qa.correct_answers,
-         qa.total_questions,
-         qa.time_taken_secs
-       FROM quiz_attempts qa
-       JOIN users u ON u.id = qa.user_id
-       WHERE qa.quiz_id = $1
-       ORDER BY qa.score DESC, qa.time_taken_secs ASC
+      `WITH best_attempts AS (
+         SELECT DISTINCT ON (qa.user_id)
+           qa.user_id,
+           qa.score,
+           qa.correct_answers,
+           qa.total_questions,
+           qa.time_taken_secs
+         FROM quiz_attempts qa
+         WHERE qa.quiz_id     = $1
+           AND qa.total_questions > 0
+           AND qa.score        > 0
+         ORDER BY qa.user_id, qa.score DESC, qa.time_taken_secs ASC
+       )
+       SELECT
+         RANK() OVER (ORDER BY ba.score DESC, ba.time_taken_secs ASC) AS rank_position,
+         u.id   AS user_id,
+         u.name AS user_name,
+         ba.score,
+         ba.correct_answers,
+         ba.total_questions,
+         ba.time_taken_secs,
+         (u.id = $2) AS is_current_user
+       FROM best_attempts ba
+       JOIN users u ON u.id = ba.user_id
+       ORDER BY ba.score DESC, ba.time_taken_secs ASC
        LIMIT 50`,
-      [quizId]
+      [quizId, currentUserId]
     );
     const leaderboard = rows.map((r: any) => ({
       rank_position:   parseInt(r.rank_position),
