@@ -120,6 +120,69 @@ class CurrentAffairsService {
     await this.db.query(`DELETE FROM current_affairs WHERE id=$1`, [affairId]);
     return successResponse(null, 'Article deleted');
   }
+
+  // ── CA MCQs ──────────────────────────────────────────────────────────
+  async ensureCaMcqTable() {
+    await this.db.query(`
+      CREATE TABLE IF NOT EXISTS ca_mcqs (
+        id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        affair_id    UUID NOT NULL REFERENCES current_affairs(id) ON DELETE CASCADE,
+        question     TEXT NOT NULL,
+        option_a     TEXT NOT NULL,
+        option_b     TEXT NOT NULL,
+        option_c     TEXT NOT NULL,
+        option_d     TEXT NOT NULL,
+        correct      CHAR(1) NOT NULL CHECK (correct IN ('a','b','c','d')),
+        explanation  TEXT,
+        difficulty   VARCHAR(10) DEFAULT 'medium',
+        created_at   TIMESTAMPTZ DEFAULT NOW()
+      )
+    `);
+  }
+
+  async getMcqs(affairId: string) {
+    await this.ensureCaMcqTable();
+    const rows = await this.db.query(
+      `SELECT * FROM ca_mcqs WHERE affair_id=$1 ORDER BY created_at ASC`,
+      [affairId]
+    );
+    return successResponse({ mcqs: rows });
+  }
+
+  async addMcq(affairId: string, data: any) {
+    await this.ensureCaMcqTable();
+    if (!data.question || !data.optionA || !data.optionB || !data.optionC || !data.optionD || !data.correct) {
+      throw new BadRequestException('question, optionA-D and correct are required');
+    }
+    const row = await this.db.query(
+      `INSERT INTO ca_mcqs (affair_id, question, option_a, option_b, option_c, option_d, correct, explanation, difficulty)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
+      [affairId, data.question, data.optionA, data.optionB, data.optionC, data.optionD,
+       data.correct.toLowerCase(), data.explanation || '', data.difficulty || 'medium']
+    );
+    return successResponse({ mcq: row[0] }, 'MCQ added ✅');
+  }
+
+  async updateMcq(mcqId: string, data: any) {
+    await this.ensureCaMcqTable();
+    const fields: string[] = [], vals: any[] = [];
+    let i = 1;
+    const map: any = { question:'question', optionA:'option_a', optionB:'option_b',
+      optionC:'option_c', optionD:'option_d', correct:'correct',
+      explanation:'explanation', difficulty:'difficulty' };
+    for (const [k, col] of Object.entries(map)) {
+      if (data[k] !== undefined) { fields.push(`${col}=$${i++}`); vals.push(data[k]); }
+    }
+    if (!fields.length) throw new BadRequestException('No fields to update');
+    await this.db.query(`UPDATE ca_mcqs SET ${fields.join(',')} WHERE id=$${i}`, [...vals, mcqId]);
+    return successResponse(null, 'MCQ updated ✅');
+  }
+
+  async deleteMcq(mcqId: string) {
+    await this.ensureCaMcqTable();
+    await this.db.query(`DELETE FROM ca_mcqs WHERE id=$1`, [mcqId]);
+    return successResponse(null, 'MCQ deleted');
+  }
 }
 
 @ApiTags('Current Affairs') @ApiBearerAuth() @UseGuards(JwtAuthGuard) @Controller('current-affairs')
@@ -128,6 +191,7 @@ class CurrentAffairsController {
   @Get() findAll(@Query() q: any, @Req() r: any) { return this.s.findAll(q, r.user.id); }
   @Get(':id') findOne(@Param('id', ParseUUIDPipe) id: string, @Req() r: any) { return this.s.findOne(id, r.user.id); }
   @Post(':id/bookmark') @HttpCode(200) toggleBookmark(@Param('id', ParseUUIDPipe) id: string, @Req() r: any) { return this.s.toggleBookmark(id, r.user.id); }
+  @Get(':id/mcqs') getMcqs(@Param('id', ParseUUIDPipe) id: string) { return this.s.getMcqs(id); }
 }
 
 @ApiTags('Admin — Current Affairs') @ApiBearerAuth() @Public()
@@ -138,6 +202,11 @@ class AdminCurrentAffairsController {
   @Post() @RequirePermission('current-affairs') @HttpCode(201) create(@Body() dto: any, @Req() r: any) { return this.s.adminCreate(dto, r.admin.id); }
   @Put(':id') @RequirePermission('current-affairs') update(@Param('id', ParseUUIDPipe) id: string, @Body() dto: any) { return this.s.adminUpdate(id, dto); }
   @Delete(':id') @RequirePermission('current-affairs') remove(@Param('id', ParseUUIDPipe) id: string) { return this.s.adminDelete(id); }
+  // MCQ management
+  @Get(':id/mcqs') @RequirePermission('current-affairs') getMcqs(@Param('id', ParseUUIDPipe) id: string) { return this.s.getMcqs(id); }
+  @Post(':id/mcqs') @RequirePermission('current-affairs') @HttpCode(201) addMcq(@Param('id', ParseUUIDPipe) id: string, @Body() dto: any) { return this.s.addMcq(id, dto); }
+  @Put('mcqs/:mcqId') @RequirePermission('current-affairs') updateMcq(@Param('mcqId', ParseUUIDPipe) mcqId: string, @Body() dto: any) { return this.s.updateMcq(mcqId, dto); }
+  @Delete('mcqs/:mcqId') @RequirePermission('current-affairs') deleteMcq(@Param('mcqId', ParseUUIDPipe) mcqId: string) { return this.s.deleteMcq(mcqId); }
 }
 
 @Module({ controllers:[CurrentAffairsController, AdminCurrentAffairsController], providers:[CurrentAffairsService] })
