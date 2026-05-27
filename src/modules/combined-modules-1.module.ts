@@ -709,23 +709,34 @@ export class NotificationService {
   private initFirebase() {
     try {
       if (!admin.apps.length) {
-        const fb = this.config.get('firebase');
-        if (fb.projectId && fb.privateKey) {
-          admin.initializeApp({
-            credential: admin.credential.cert({
-              projectId:   fb.projectId,
-              privateKeyId: fb.privateKeyId,
-              privateKey:   fb.privateKey,
-              clientEmail:  fb.clientEmail,
-            } as any),
-          });
-          this.firebaseInitialized = true;
+  
+        const serviceAccountPath =
+          process.env.FIREBASE_SERVICE_ACCOUNT_PATH;
+  
+        if (!serviceAccountPath) {
+          console.warn('⚠️ FIREBASE_SERVICE_ACCOUNT_PATH missing');
+          return;
         }
+  
+        admin.initializeApp({
+          credential: admin.credential.cert(
+            require(serviceAccountPath)
+          ),
+        });
+  
+        this.firebaseInitialized = true;
+  
+        console.log('✅ Firebase initialized');
+  
       } else {
         this.firebaseInitialized = true;
       }
-    } catch (err) {
-      console.warn('⚠️  Firebase not configured — push notifications disabled:', err.message);
+  
+    } catch (err: any) {
+      console.error(
+        '❌ Firebase initialization failed:',
+        err.message
+      );
     }
   }
 

@@ -55,10 +55,7 @@ export const cloudinaryConfig = registerAs('cloudinary', () => ({
 }));
 
 export const firebaseConfig = registerAs('firebase', () => ({
-  projectId:    process.env.FIREBASE_PROJECT_ID,
-  privateKeyId: process.env.FIREBASE_PRIVATE_KEY_ID,
-  privateKey:   process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, '\n'),
-  clientEmail:  process.env.FIREBASE_CLIENT_EMAIL,
+  serviceAccountPath: process.env.FIREBASE_SERVICE_ACCOUNT_PATH,
 }));
 
 export const throttleConfig = registerAs('throttle', () => ({
