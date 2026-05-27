@@ -411,8 +411,8 @@ class SubscriptionsService {
     if (finalAmount > 0) {
       try {
         // Prefer env vars; fall back to admin-configured DB settings
-        let rpKey    = process.env.RAZORPAY_KEY_ID    || '';
-        let rpSecret = process.env.RAZORPAY_KEY_SECRET || '';
+        let rpKey    =  'rzp_test_EqkfPCBFCCLijY';
+        let rpSecret = 'VEJxBdKNrBiMvIWHx1bPqJXB';
         if (!rpKey || !rpSecret) {
           const [keyRow]    = await this.db.query(`SELECT value FROM payment_settings WHERE key='razorpay_key_id' AND value!='' LIMIT 1`).catch(()=>[]);
           const [secretRow] = await this.db.query(`SELECT value FROM payment_settings WHERE key='razorpay_key_secret' AND value!='' LIMIT 1`).catch(()=>[]);
