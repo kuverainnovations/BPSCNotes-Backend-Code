@@ -376,6 +376,24 @@ export class CoursesService {
       );
       if (!sub.length) {
         // Check if user already purchased this course individually
+        // Ensure table exists (runs only once, idempotent)
+        await this.db.query(`
+          CREATE TABLE IF NOT EXISTS course_purchases (
+            id                    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            user_id               UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            course_id             UUID NOT NULL REFERENCES courses(id) ON DELETE CASCADE,
+            amount                INTEGER NOT NULL DEFAULT 0,
+            razorpay_order_id     VARCHAR(100),
+            razorpay_payment_id   VARCHAR(100),
+            payment_method        VARCHAR(50),
+            status                VARCHAR(20) NOT NULL DEFAULT 'pending'
+                                    CHECK (status IN ('pending','completed','refunded','failed')),
+            created_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            updated_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            UNIQUE(user_id, course_id)
+          )
+        `);
+
         const individualPurchase = await this.db.query(
           `SELECT id FROM course_purchases WHERE user_id=$1 AND course_id=$2 AND status='completed'`,
           [userId, courseId]
