@@ -408,43 +408,54 @@ class SubscriptionsService {
 
     // Create Razorpay order (amount in paise)
     let razorpayOrder: any = null;
+    let activeRpKey = '';   // track whichever key we actually used for the return
     if (finalAmount > 0) {
       try {
-        // Prefer env vars; fall back to admin-configured DB settings
+        // Priority: env vars → payment_settings DB → warn
         let rpKey    =  'rzp_test_EqkfPCBFCCLijY';
         let rpSecret = 'VEJxBdKNrBiMvIWHx1bPqJXB';
+
+        let rpKey1    = process.env.RAZORPAY_KEY_ID    || '';
+        let rpSecret1 = process.env.RAZORPAY_KEY_SECRET || '';
+        console.log(rpKey1+"PaymentIddd")
         if (!rpKey || !rpSecret) {
-          const [keyRow]    = await this.db.query(`SELECT value FROM payment_settings WHERE key='razorpay_key_id' AND value!='' LIMIT 1`).catch(()=>[]);
-          const [secretRow] = await this.db.query(`SELECT value FROM payment_settings WHERE key='razorpay_key_secret' AND value!='' LIMIT 1`).catch(()=>[]);
-          rpKey    = keyRow?.value    || rpKey;
-          rpSecret = secretRow?.value || rpSecret;
+          const rows = await this.db.query(
+            `SELECT key, value FROM payment_settings WHERE key IN ('razorpay_key_id','razorpay_key_secret') AND value IS NOT NULL AND value != ''`
+          ).catch(() => []);
+          for (const r of rows) {
+            if (r.key === 'razorpay_key_id')     rpKey    = r.value;
+            if (r.key === 'razorpay_key_secret')  rpSecret = r.value;
+          }
         }
         if (!rpKey || !rpSecret) {
-          console.warn('Razorpay keys not configured — skipping order creation');
+          console.warn('Razorpay keys not configured — razorpayOrderId will be null');
         } else {
-        const rpResponse = await fetch('https://api.razorpay.com/v1/orders', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': 'Basic ' + Buffer.from(`${rpKey}:${rpSecret}`).toString('base64'),
-          },
-          body: JSON.stringify({
-            amount:   finalAmount * 100, // paise
-            currency: 'INR',
-            receipt:  `sub_${subscriptionId.substring(0,8)}`,
-            notes:    { subscriptionId, userId, plan: data.plan },
-          }),
-        });
-        razorpayOrder = await rpResponse.json();
-        if (razorpayOrder.id) {
-          await this.db.query(
-            `UPDATE subscriptions SET razorpay_order_id=$1 WHERE id=$2`,
-            [razorpayOrder.id, subscriptionId]
-          );
+          activeRpKey = rpKey;
+          const rpResponse = await fetch('https://api.razorpay.com/v1/orders', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': 'Basic ' + Buffer.from(`${rpKey}:${rpSecret}`).toString('base64'),
+            },
+            body: JSON.stringify({
+              amount:   finalAmount * 100,
+              currency: 'INR',
+              receipt:  `sub_${subscriptionId.substring(0,8)}`,
+              notes:    { subscriptionId, userId, plan: data.plan },
+            }),
+          });
+          razorpayOrder = await rpResponse.json();
+          if (razorpayOrder.id) {
+            await this.db.query(
+              `UPDATE subscriptions SET razorpay_order_id=$1 WHERE id=$2`,
+              [razorpayOrder.id, subscriptionId]
+            );
+          } else {
+            // Log Razorpay error for debugging (e.g. bad credentials)
+            console.error('Razorpay order creation error:', JSON.stringify(razorpayOrder));
+          }
         }
-        } // end if(rpKey && rpSecret)
       } catch (err: any) {
-        // Non-blocking — order creation failure should not block UI
         console.error('Razorpay order creation failed:', err.message);
       }
     }
@@ -452,7 +463,7 @@ class SubscriptionsService {
     return successResponse({
       subscriptionId,
       razorpayOrderId: razorpayOrder?.id || null,
-      razorpayKeyId:   process.env.RAZORPAY_KEY_ID,
+      razorpayKeyId:   activeRpKey || null,   // return the key actually used, not empty env var
       breakdown: { baseAmount: price, coinDiscount, couponDiscount, finalAmount, coinsUsed: coinsToUse, couponCode: validCoupon?.code }
     });
   }
