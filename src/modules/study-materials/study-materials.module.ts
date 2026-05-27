@@ -23,6 +23,7 @@ import { JwtAuthGuard, AdminJwtGuard, PermissionGuard, RequirePermission, Public
 import { successResponse, paginationMeta } from '../../common/utils/response.util';
 import { AuthModule }             from '../auth/auth.module';
 import { CoinsModule, CoinsService } from '../coins/coins.module';
+import { NotificationService } from '@modules/combined-modules-1.module';
 
 // ════════════════════════════════════════════════════════════
 // LOCAL STORAGE — No AWS required
@@ -83,7 +84,8 @@ export class StudyMaterialsService {
     @InjectDataSource()    private readonly db:     DataSource,
     @Inject(CACHE_MANAGER) private readonly cache:  Cache,
     private readonly config: ConfigService,
-    private readonly coinsService: CoinsService,
+        private readonly coinsService: CoinsService,
+        private readonly notifService: NotificationService,
 
   ) {
     // UPLOAD_DIR defaults to <project-root>/uploads — change in .env for production
@@ -463,6 +465,21 @@ if (query.search)  { conditions.push(`sm.title ILIKE $${pi++}`); params.push(`%$
         await this.coinsService.claimTask('upload_note', mat.uploader_id);
       }
     } catch (_) { /* non-blocking — approval still succeeds */ }
+
+    // Push notification to the uploader
+    try {
+      const [mat] = await this.db.query(
+        `SELECT uploader_id, title FROM study_materials WHERE id=$1`, [id]
+      );
+      if (mat?.uploader_id) {
+        await this.notifService?.pushToUser(
+          mat.uploader_id,
+          '✅ Study material approved!',
+          `Your upload "${mat.title}" has been approved and is now live for all students.`,
+          { type: 'material_approved', materialId: id, screen: 'study_materials' }
+        );
+      }
+    } catch (_) { /* non-blocking */ }
 
     return successResponse(null, '✅ Approved — now visible to students');
   }

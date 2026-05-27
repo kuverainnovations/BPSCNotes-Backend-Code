@@ -692,6 +692,29 @@ class PaymentSettingsService {
     return successResponse(null, 'Refund initiated ✅');
   }
 
+  async getAnalyticsSummary() {
+    const [activeUsers, quizzesToday, monthRevenue, studySessions] = await Promise.all([
+      this.db.query(
+        `SELECT COUNT(DISTINCT user_id) AS count FROM quiz_attempts WHERE attempted_at > NOW() - INTERVAL '7 days'`
+      ),
+      this.db.query(
+        `SELECT COUNT(*) AS count FROM quiz_attempts WHERE attempted_at::date = CURRENT_DATE`
+      ),
+      this.db.query(
+        `SELECT COALESCE(SUM(final_amount),0) AS total FROM subscriptions WHERE payment_status='success' AND date_trunc('month',created_at)=date_trunc('month',NOW())`
+      ),
+      this.db.query(
+        `SELECT COUNT(*) AS count FROM study_sessions WHERE started_at > NOW() - INTERVAL '7 days'`
+      ).catch(() => [{ count: 0 }]),
+    ]);
+    return successResponse({
+      activeUsers7d:   parseInt(activeUsers[0]?.count || '0'),
+      quizzesToday:    parseInt(quizzesToday[0]?.count || '0'),
+      monthRevenue:    parseInt(monthRevenue[0]?.total || '0'),
+      studySessions7d: parseInt(studySessions[0]?.count || '0'),
+    });
+  }
+
   async getRevenueStats() {
     const [daily] = await this.db.query(
       `SELECT COALESCE(SUM(final_amount),0) AS today
@@ -742,6 +765,12 @@ class AdminPaymentSettingsController {
 
   @Get('payment/revenue')
   getRevenue() { return this.s.getRevenueStats(); }
+
+  @Get('analytics/summary')
+  @RequirePermission('subscriptions')
+  async getAnalyticsSummary() {
+    return this.s.getAnalyticsSummary();
+  }
 
   @Post('subscriptions/:id/refund')
   @HttpCode(200)

@@ -412,12 +412,8 @@ class SubscriptionsService {
     if (finalAmount > 0) {
       try {
         // Priority: env vars → payment_settings DB → warn
-        let rpKey    =  'rzp_test_EqkfPCBFCCLijY';
-        let rpSecret = 'VEJxBdKNrBiMvIWHx1bPqJXB';
-
-        let rpKey1    = process.env.RAZORPAY_KEY_ID    || '';
-        let rpSecret1 = process.env.RAZORPAY_KEY_SECRET || '';
-        console.log(rpKey1+"PaymentIddd")
+        let rpKey    = process.env.RAZORPAY_KEY_ID    || '';
+        let rpSecret = process.env.RAZORPAY_KEY_SECRET || '';
         if (!rpKey || !rpSecret) {
           const rows = await this.db.query(
             `SELECT key, value FROM payment_settings WHERE key IN ('razorpay_key_id','razorpay_key_secret') AND value IS NOT NULL AND value != ''`
@@ -848,6 +844,51 @@ export class NotificationService {
       paginationMeta(0, page, limit));
   }
 
+  // ── Direct push helpers (called by other modules) ──────────
+  async pushToUser(userId: string, title: string, body: string, data: Record<string, string> = {}) {
+    const rows = await this.db.query(
+      `SELECT fcm_token FROM users WHERE id=$1 AND notification_enabled=TRUE AND fcm_token IS NOT NULL LIMIT 1`,
+      [userId]
+    );
+    const token = rows[0]?.fcm_token;
+    if (!token || !admin.apps.length) return false;
+    try {
+      await admin.messaging().send({
+        token,
+        notification: { title, body },
+        data,
+        android: { priority: 'high', notification: { channelId: data.type || 'general' } },
+      });
+      return true;
+    } catch (err: any) {
+      console.error('FCM push failed:', err.message);
+      return false;
+    }
+  }
+
+  async pushToAll(title: string, body: string, data: Record<string, string> = {}) {
+    const tokens = await this.db.query(
+      `SELECT fcm_token FROM users WHERE notification_enabled=TRUE AND fcm_token IS NOT NULL AND status='active' LIMIT 2000`
+    );
+    const fcmTokens = tokens.map((t: any) => t.fcm_token).filter(Boolean);
+    if (!fcmTokens.length || !admin.apps.length) return 0;
+    let sent = 0;
+    for (let i = 0; i < fcmTokens.length; i += 500) {
+      try {
+        const res = await admin.messaging().sendEachForMulticast({
+          tokens: fcmTokens.slice(i, i + 500),
+          notification: { title, body },
+          data,
+          android: { priority: 'high' },
+        });
+        sent += res.successCount;
+      } catch (err: any) {
+        console.error('FCM multicast failed:', err.message);
+      }
+    }
+    return sent;
+  }
+
   async markRead(userId: string, ids?: string[]) {
     if (ids?.length) {
       await this.db.query(`UPDATE user_notifications SET is_read=TRUE, read_at=NOW() WHERE user_id=$1 AND id=ANY($2)`, [userId, ids]);
@@ -880,7 +921,15 @@ class AdminNotificationsController {
   @Post('send') @RequirePermission('notifications') @HttpCode(200) send(@Body() dto: any, @Req() r: any) { return this.s.send(dto, r.admin.id); }
 }
 
-@Module({ imports:[ConfigModule], controllers:[NotificationsController, AdminNotificationsController], providers:[NotificationService], exports:[NotificationService] })
+@Module({
+  imports:   [ConfigModule],
+  controllers: [NotificationsController, AdminNotificationsController],
+  providers: [
+    NotificationService,
+    { provide: 'NOTIFICATION_SERVICE', useExisting: NotificationService },
+  ],
+  exports: [NotificationService, 'NOTIFICATION_SERVICE'],
+})
 export class NotificationsModule {}
 
 // ════════════════════════════════════════════════════════════

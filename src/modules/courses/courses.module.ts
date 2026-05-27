@@ -683,6 +683,16 @@ SET
   async adminCreate(dto: CreateCourseDto, adminId: string) {
     const course = await this.repo.create(dto, adminId);
     await this.invalidateCache();
+
+    // Push notification to all users about new course
+    if (dto.status === 'published' && this.notifService?.pushToAll) {
+      this.notifService.pushToAll(
+        `📚 New Course: ${dto.title}`,
+        `${dto.subject || 'New'} course now available! ${dto.totalLessons || ''} lessons · ${dto.isPaid ? 'Premium' : 'Free'}`,
+        { type: 'new_course', courseId: course.id || '', screen: 'courses' }
+      ).catch(() => {});
+    }
+
     return successResponse({ course }, 'Course created', undefined);
   }
 
