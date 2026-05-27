@@ -410,8 +410,18 @@ class SubscriptionsService {
     let razorpayOrder: any = null;
     if (finalAmount > 0) {
       try {
-        const rpKey    = process.env.RAZORPAY_KEY_ID;
-        const rpSecret = process.env.RAZORPAY_KEY_SECRET;
+        // Prefer env vars; fall back to admin-configured DB settings
+        let rpKey    = process.env.RAZORPAY_KEY_ID    || '';
+        let rpSecret = process.env.RAZORPAY_KEY_SECRET || '';
+        if (!rpKey || !rpSecret) {
+          const [keyRow]    = await this.db.query(`SELECT value FROM payment_settings WHERE key='razorpay_key_id' AND value!='' LIMIT 1`).catch(()=>[]);
+          const [secretRow] = await this.db.query(`SELECT value FROM payment_settings WHERE key='razorpay_key_secret' AND value!='' LIMIT 1`).catch(()=>[]);
+          rpKey    = keyRow?.value    || rpKey;
+          rpSecret = secretRow?.value || rpSecret;
+        }
+        if (!rpKey || !rpSecret) {
+          console.warn('Razorpay keys not configured — skipping order creation');
+        } else {
         const rpResponse = await fetch('https://api.razorpay.com/v1/orders', {
           method: 'POST',
           headers: {
@@ -432,6 +442,7 @@ class SubscriptionsService {
             [razorpayOrder.id, subscriptionId]
           );
         }
+        } // end if(rpKey && rpSecret)
       } catch (err: any) {
         // Non-blocking — order creation failure should not block UI
         console.error('Razorpay order creation failed:', err.message);
