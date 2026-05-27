@@ -654,6 +654,7 @@ class SubscriptionsController {
   constructor(private s: SubscriptionsService) {}
   @Get('plans') @HttpCode(200) getPlans() { return this.s.getPlans(); }
   @Post('initiate') @HttpCode(200) initiate(@Req() r: any, @Body() dto: any) { return this.s.initiate(r.user.id, dto); }
+  @Post('create')   @HttpCode(200) create(@Req() r: any, @Body() dto: any)   { return this.s.initiate(r.user.id, dto); }  // alias for Razorpay flow
   @Post(':id/confirm') @HttpCode(200) confirm(@Param('id', ParseUUIDPipe) id: string, @Req() r: any, @Body() dto: any) { return this.s.confirm(id, r.user.id, dto); }
   @Get('status') getStatus(@Req() r: any) { return this.s.getStatus(r.user.id); }
   @Post('coupons/validate') @HttpCode(200) validateCoupon(@Body() body: any) { return this.s.validateCoupon(body.code, body.type||'subscription'); }
