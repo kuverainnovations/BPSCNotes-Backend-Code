@@ -786,8 +786,13 @@ export class NotificationService {
 
     // FCM push
     let pushSuccess = 0, pushFail = 0;
+    console.log('==== PUSH DEBUG ====');
+console.log('firebaseInitialized:', this.firebaseInitialized);
+console.log('users count:', users.length);
     if (this.firebaseInitialized) {
       const tokens = users.map((u: any) => u.fcm_token).filter(Boolean);
+      console.log('tokens count:', tokens.length);
+console.log('sample token:', tokens[0]);
       if (tokens.length > 0) {
         for (let i = 0; i < tokens.length; i += 500) {
           try {
@@ -800,7 +805,8 @@ export class NotificationService {
             pushSuccess += result.successCount;
             pushFail    += result.failureCount;
           } catch (err) {
-            console.error('FCM error:', err.message);
+            console.error('FCM FULL ERROR:', err);
+            // console.error('FCM error:', err.message);
           }
         }
       }
