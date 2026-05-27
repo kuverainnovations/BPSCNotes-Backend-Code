@@ -595,6 +595,159 @@ export class AppConfigController {
 }
 
 // ── Admin Module ──────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════
+// PAYMENT SETTINGS (Admin)
+// ═══════════════════════════════════════════════════════════
+@Injectable()
+class PaymentSettingsService {
+  constructor(@InjectDataSource() private db: DataSource) {}
+
+  async getSettings() {
+    // Create table if not exists
+    await this.db.query(`
+      CREATE TABLE IF NOT EXISTS payment_settings (
+        key VARCHAR(100) PRIMARY KEY,
+        value TEXT,
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `);
+    const rows = await this.db.query(`SELECT key, value FROM payment_settings`);
+    const map: any = {};
+    rows.forEach((r: any) => { map[r.key] = r.value; });
+    return {
+      razorpayKeyId:        map['razorpay_key_id']        || '',
+      razorpayMode:         map['razorpay_mode']          || 'test',
+      upiDisplayName:       map['upi_display_name']       || 'BPSCNotes',
+      paymentEnabled:       (map['payment_enabled']       || 'true') === 'true',
+      // Never return secrets
+    };
+  }
+
+  async saveSettings(data: any) {
+    await this.db.query(`
+      CREATE TABLE IF NOT EXISTS payment_settings (
+        key VARCHAR(100) PRIMARY KEY,
+        value TEXT,
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `);
+    const entries: any[] = [
+      ['razorpay_key_id',        data.razorpayKeyId        || ''],
+      ['razorpay_mode',          data.razorpayMode          || 'test'],
+      ['upi_display_name',       data.upiDisplayName        || 'BPSCNotes'],
+      ['payment_enabled',        String(data.paymentEnabled !== false)],
+    ];
+    if (data.razorpayKeySecret) {
+      entries.push(['razorpay_key_secret', data.razorpayKeySecret]);
+    }
+    if (data.razorpayWebhookSecret) {
+      entries.push(['razorpay_webhook_secret', data.razorpayWebhookSecret]);
+    }
+    for (const [k, v] of entries) {
+      await this.db.query(
+        `INSERT INTO payment_settings(key,value,updated_at) VALUES($1,$2,NOW())
+         ON CONFLICT(key) DO UPDATE SET value=$2, updated_at=NOW()`,
+        [k, v]
+      );
+    }
+    return successResponse(null, 'Payment settings saved ✅');
+  }
+
+  async refundSubscription(subId: string) {
+    const [sub] = await this.db.query(
+      `SELECT * FROM subscriptions WHERE id=$1 AND payment_status='success'`, [subId]
+    );
+    if (!sub) throw new NotFoundException('Subscription not found');
+
+    // Get Razorpay credentials
+    const [keyRow]    = await this.db.query(`SELECT value FROM payment_settings WHERE key='razorpay_key_id'`);
+    const [secretRow] = await this.db.query(`SELECT value FROM payment_settings WHERE key='razorpay_key_secret'`);
+    const key    = keyRow?.value || process.env.RAZORPAY_KEY_ID;
+    const secret = secretRow?.value || process.env.RAZORPAY_KEY_SECRET;
+
+    if (sub.razorpay_payment_id && key && secret) {
+      try {
+        await fetch(`https://api.razorpay.com/v1/payments/${sub.razorpay_payment_id}/refund`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': 'Basic ' + Buffer.from(`${key}:${secret}`).toString('base64'),
+          },
+          body: JSON.stringify({ amount: sub.final_amount * 100 }),
+        });
+      } catch (err: any) {
+        console.error('Razorpay refund failed:', err.message);
+        throw new BadRequestException('Refund API call failed: ' + err.message);
+      }
+    }
+
+    await this.db.query(
+      `UPDATE subscriptions SET payment_status='refunded', status='cancelled', updated_at=NOW() WHERE id=$1`,
+      [subId]
+    );
+    await this.db.query(
+      `UPDATE users SET coins=GREATEST(0,coins-$1) WHERE id=$2`,
+      [sub.coins_used, sub.user_id]
+    );
+    return successResponse(null, 'Refund initiated ✅');
+  }
+
+  async getRevenueStats() {
+    const [daily] = await this.db.query(
+      `SELECT COALESCE(SUM(final_amount),0) AS today
+       FROM subscriptions WHERE payment_status='success' AND created_at::date=CURRENT_DATE`
+    );
+    const [monthly] = await this.db.query(
+      `SELECT COALESCE(SUM(final_amount),0) AS month
+       FROM subscriptions WHERE payment_status='success'
+       AND date_trunc('month',created_at)=date_trunc('month',NOW())`
+    );
+    const [total] = await this.db.query(
+      `SELECT COALESCE(SUM(final_amount),0) AS total FROM subscriptions WHERE payment_status='success'`
+    );
+    const planBreakdown = await this.db.query(
+      `SELECT plan, COUNT(*) as count, SUM(final_amount) as revenue
+       FROM subscriptions WHERE payment_status='success'
+       GROUP BY plan ORDER BY revenue DESC`
+    );
+    const recentPayments = await this.db.query(
+      `SELECT s.id, u.name, u.phone, s.plan, s.final_amount, s.payment_method,
+              s.payment_status, s.razorpay_payment_id, s.created_at
+       FROM subscriptions s JOIN users u ON u.id=s.user_id
+       WHERE s.payment_status IN ('success','failed','refunded')
+       ORDER BY s.created_at DESC LIMIT 50`
+    );
+    return successResponse({
+      todayRevenue:   parseInt(daily.today),
+      monthlyRevenue: parseInt(monthly.month),
+      totalRevenue:   parseInt(total.total),
+      planBreakdown,
+      recentPayments
+    });
+  }
+}
+
+@ApiTags('Admin — Payments') @ApiBearerAuth() @Public()
+@UseGuards(AdminJwtGuard, PermissionGuard)
+@Controller('admin/settings')
+class AdminPaymentSettingsController {
+  constructor(private s: PaymentSettingsService) {}
+
+  @Get('payment')
+  getSettings() { return this.s.getSettings(); }
+
+  @Post('payment')
+  @HttpCode(200)
+  saveSettings(@Body() dto: any) { return this.s.saveSettings(dto); }
+
+  @Get('payment/revenue')
+  getRevenue() { return this.s.getRevenueStats(); }
+
+  @Post('subscriptions/:id/refund')
+  @HttpCode(200)
+  refund(@Param('id', ParseUUIDPipe) id: string) { return this.s.refundSubscription(id); }
+}
+
 @Module({
   imports: [
     ConfigModule,

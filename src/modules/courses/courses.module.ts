@@ -370,20 +370,62 @@ export class CoursesService {
     if (!course.length) throw new NotFoundException('Course not found');
 
     if (course[0].is_paid) {
+      // Check active subscription first (free for subscribers)
       const sub = await this.db.query(
         `SELECT id FROM subscriptions WHERE user_id=$1 AND status='active' AND ends_at > NOW()`, [userId]
       );
       if (!sub.length) {
-        // FIX: Return 402 Payment Required with structured error so Android can
-        // show "Get Premium" dialog instead of generic error toast
-        throw new HttpException(
-          { 
-            message: 'Premium subscription required to enroll in this course',
-            code: 'SUBSCRIPTION_REQUIRED',
-            upgradeUrl: '/premium'
-          }, 
-          HttpStatus.PAYMENT_REQUIRED  // 402 — cleaner than 403 for this case
+        // Check if user already purchased this course individually
+        const individualPurchase = await this.db.query(
+          `SELECT id FROM course_purchases WHERE user_id=$1 AND course_id=$2 AND status='completed'`,
+          [userId, courseId]
         );
+        if (!individualPurchase.length) {
+          // Create Razorpay order for individual course purchase
+          const coursePrice = course[0].price || 0;
+          let razorpayOrderId: string | null = null;
+          try {
+            const rpKey    = process.env.RAZORPAY_KEY_ID;
+            const rpSecret = process.env.RAZORPAY_KEY_SECRET;
+            const rpRes = await fetch('https://api.razorpay.com/v1/orders', {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'Authorization': 'Basic ' + Buffer.from(`${rpKey}:${rpSecret}`).toString('base64'),
+              },
+              body: JSON.stringify({
+                amount:   coursePrice * 100,
+                currency: 'INR',
+                receipt:  `course_${courseId.substring(0,8)}_${userId.substring(0,8)}`,
+                notes:    { courseId, userId, type: 'course_purchase' },
+              }),
+            });
+            const rpData = await rpRes.json();
+            razorpayOrderId = rpData.id || null;
+
+            // Record pending purchase
+            if (razorpayOrderId) {
+              await this.db.query(
+                `INSERT INTO course_purchases (user_id, course_id, amount, razorpay_order_id, status)
+                 VALUES ($1,$2,$3,$4,'pending')
+                 ON CONFLICT (user_id, course_id) DO UPDATE SET razorpay_order_id=$4, status='pending'`,
+                [userId, courseId, coursePrice, razorpayOrderId]
+              );
+            }
+          } catch (err: any) {
+            console.error('Course order creation failed:', err.message);
+          }
+
+          throw new HttpException({
+            message:         'Purchase required to enroll in this course',
+            code:            'PURCHASE_REQUIRED',
+            price:           coursePrice,
+            razorpayOrderId,
+            razorpayKeyId:   process.env.RAZORPAY_KEY_ID,
+            courseTitle:     course[0].title,
+            courseId,
+          }, HttpStatus.PAYMENT_REQUIRED);
+        }
       }
     }
 

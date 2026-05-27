@@ -200,6 +200,36 @@ export class InitialSchema1700000000000 implements MigrationInterface {
     `);
 
     await queryRunner.query(`
+      CREATE TABLE IF NOT EXISTS course_purchases (
+        id                    UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id               UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        course_id             UUID NOT NULL REFERENCES courses(id) ON DELETE CASCADE,
+        amount                INTEGER NOT NULL DEFAULT 0,
+        razorpay_order_id     VARCHAR(100),
+        razorpay_payment_id   VARCHAR(100),
+        payment_method        VARCHAR(50),
+        status                VARCHAR(20) NOT NULL DEFAULT 'pending'
+                                CHECK (status IN ('pending','completed','refunded','failed')),
+        created_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at            TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        UNIQUE(user_id, course_id)
+      );
+
+      CREATE TABLE IF NOT EXISTS payment_settings (
+        id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        key               VARCHAR(100) UNIQUE NOT NULL,
+        value             TEXT,
+        updated_at        TIMESTAMPTZ DEFAULT NOW()
+      );
+      -- Seed default payment settings
+      INSERT INTO payment_settings (key, value) VALUES
+        ('razorpay_key_id',           ''),
+        ('razorpay_mode',             'test'),
+        ('upi_display_name',          'BPSCNotes'),
+        ('payment_enabled',           'true'),
+        ('min_payment_amount',        '1')
+      ON CONFLICT (key) DO NOTHING;
+
       CREATE TABLE lesson_progress (
         user_id          UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
         lesson_id        UUID NOT NULL REFERENCES course_lessons(id) ON DELETE CASCADE,

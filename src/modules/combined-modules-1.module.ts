@@ -404,8 +404,44 @@ class SubscriptionsService {
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'pending','pending') RETURNING id`,
       [userId, data.plan, price, price, coinsToUse, coinDiscount, validCoupon?.code||null, couponDiscount, finalAmount]
     );
+    const subscriptionId = subResult[0].id;
+
+    // Create Razorpay order (amount in paise)
+    let razorpayOrder: any = null;
+    if (finalAmount > 0) {
+      try {
+        const rpKey    = process.env.RAZORPAY_KEY_ID;
+        const rpSecret = process.env.RAZORPAY_KEY_SECRET;
+        const rpResponse = await fetch('https://api.razorpay.com/v1/orders', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': 'Basic ' + Buffer.from(`${rpKey}:${rpSecret}`).toString('base64'),
+          },
+          body: JSON.stringify({
+            amount:   finalAmount * 100, // paise
+            currency: 'INR',
+            receipt:  `sub_${subscriptionId.substring(0,8)}`,
+            notes:    { subscriptionId, userId, plan: data.plan },
+          }),
+        });
+        razorpayOrder = await rpResponse.json();
+        if (razorpayOrder.id) {
+          await this.db.query(
+            `UPDATE subscriptions SET razorpay_order_id=$1 WHERE id=$2`,
+            [razorpayOrder.id, subscriptionId]
+          );
+        }
+      } catch (err: any) {
+        // Non-blocking — order creation failure should not block UI
+        console.error('Razorpay order creation failed:', err.message);
+      }
+    }
+
     return successResponse({
-      subscriptionId: subResult[0].id,
+      subscriptionId,
+      razorpayOrderId: razorpayOrder?.id || null,
+      razorpayKeyId:   process.env.RAZORPAY_KEY_ID,
       breakdown: { baseAmount: price, coinDiscount, couponDiscount, finalAmount, coinsUsed: coinsToUse, couponCode: validCoupon?.code }
     });
   }
@@ -420,6 +456,20 @@ class SubscriptionsService {
     // Validate no duplicate transaction
     const dupCheck = await this.db.query(`SELECT id FROM subscriptions WHERE razorpay_payment_id=$1`, [data.transactionId]);
     if (dupCheck.length) throw new ConflictException('Transaction already processed');
+
+    // Verify Razorpay signature to ensure payment authenticity
+    if (data.razorpaySignature && sub.razorpay_order_id) {
+      const crypto = require('crypto');
+      const expectedSig = crypto
+        .createHmac('sha256', process.env.RAZORPAY_KEY_SECRET || '')
+        .update(`${sub.razorpay_order_id}|${data.transactionId}`)
+        .digest('hex');
+      if (expectedSig !== data.razorpaySignature) {
+        // Log tamper attempt
+        console.error(`PAYMENT TAMPER DETECTED: user=${userId} order=${sub.razorpay_order_id} payment=${data.transactionId}`);
+        throw new BadRequestException('Payment signature verification failed');
+      }
+    }
 
     const endsAt = new Date();
     if (sub.plan === 'monthly')   endsAt.setMonth(endsAt.getMonth() + 1);
@@ -457,6 +507,86 @@ class SubscriptionsService {
       [userId]
     );
     return successResponse({ isActive: result.length > 0, subscription: result[0] || null });
+  }
+
+  // ── Razorpay Webhook Handler ─────────────────────────────────
+  async handleRazorpayWebhook(req: any, body: any) {
+    const crypto = require('crypto');
+
+    // Verify webhook signature
+    const webhookSecret = process.env.RAZORPAY_WEBHOOK_SECRET;
+    const signature     = req.headers['x-razorpay-signature'];
+    if (webhookSecret && signature) {
+      const expected = crypto
+        .createHmac('sha256', webhookSecret)
+        .update(JSON.stringify(body))
+        .digest('hex');
+      if (expected !== signature) {
+        console.error('Razorpay webhook: invalid signature');
+        return { status: 'invalid_signature' };
+      }
+    }
+
+    const event   = body.event;
+    const payment = body.payload?.payment?.entity;
+    const orderId = payment?.order_id;
+
+    if (!orderId) return { status: 'ignored' };
+
+    // payment.captured — successful payment
+    if (event === 'payment.captured') {
+      const [sub] = await this.db.query(
+        `SELECT * FROM subscriptions WHERE razorpay_order_id=$1 AND payment_status='pending'`,
+        [orderId]
+      );
+      if (!sub) return { status: 'not_found' };
+
+      // Idempotency guard
+      const dup = await this.db.query(
+        `SELECT id FROM subscriptions WHERE razorpay_payment_id=$1`, [payment.id]
+      );
+      if (dup.length) return { status: 'already_processed' };
+
+      const plan   = this.PLANS[sub.plan];
+      const endsAt = new Date();
+      if (sub.plan === 'monthly')   endsAt.setMonth(endsAt.getMonth() + 1);
+      if (sub.plan === 'quarterly') endsAt.setMonth(endsAt.getMonth() + 3);
+      if (sub.plan === 'annual')    endsAt.setFullYear(endsAt.getFullYear() + 1);
+
+      await this.db.query(
+        `UPDATE subscriptions
+         SET payment_status='success', status='active',
+             payment_method=$1, upi_id=$2,
+             razorpay_payment_id=$3, starts_at=NOW(), ends_at=$4, updated_at=NOW()
+         WHERE id=$5`,
+        [payment.method || 'upi', payment.vpa || null, payment.id, endsAt, sub.id]
+      );
+
+      // Bonus coins
+      if (plan?.bonusCoins > 0) {
+        await this.db.query(`UPDATE users SET coins=coins+$1 WHERE id=$2`, [plan.bonusCoins, sub.user_id]);
+        const [bal] = await this.db.query(`SELECT coins FROM users WHERE id=$1`, [sub.user_id]);
+        await this.db.query(
+          `INSERT INTO coin_transactions (user_id,type,amount,description,action,balance)
+           VALUES ($1,'earned',$2,'Subscription bonus coins','subscription_bonus',$3)`,
+          [sub.user_id, plan.bonusCoins, bal.coins]
+        );
+      }
+
+      await this.cache.del(`user:${sub.user_id}`);
+      console.log(`Webhook: subscription ${sub.id} activated for user ${sub.user_id}`);
+    }
+
+    // payment.failed
+    if (event === 'payment.failed') {
+      await this.db.query(
+        `UPDATE subscriptions SET payment_status='failed', status='failed', updated_at=NOW()
+         WHERE razorpay_order_id=$1 AND payment_status='pending'`,
+        [orderId]
+      );
+    }
+
+    return { status: 'ok' };
   }
 
   async validateCoupon(code: string, type: string) {
