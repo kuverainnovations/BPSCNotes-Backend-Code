@@ -711,12 +711,11 @@ export class NotificationService {
       if (!admin.apps.length) {
   
         const serviceAccountPath =
-          process.env.FIREBASE_SERVICE_ACCOUNT_PATH;
-  
-        if (!serviceAccountPath) {
-          console.warn('⚠️ FIREBASE_SERVICE_ACCOUNT_PATH missing');
-          return;
-        }
+        process.env.FIREBASE_SERVICE_ACCOUNT_PATH ||
+        '/app/firebase-service-account.json';
+      
+      console.log('Firebase path:', serviceAccountPath);
+      
   
         admin.initializeApp({
           credential: admin.credential.cert(
