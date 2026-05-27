@@ -23,7 +23,6 @@ import { JwtAuthGuard, AdminJwtGuard, PermissionGuard, RequirePermission, Public
 import { successResponse, paginationMeta } from '../../common/utils/response.util';
 import { AuthModule }             from '../auth/auth.module';
 import { CoinsModule, CoinsService } from '../coins/coins.module';
-import { NotificationService } from '@modules/combined-modules-1.module';
 
 // ════════════════════════════════════════════════════════════
 // LOCAL STORAGE — No AWS required
@@ -84,8 +83,7 @@ export class StudyMaterialsService {
     @InjectDataSource()    private readonly db:     DataSource,
     @Inject(CACHE_MANAGER) private readonly cache:  Cache,
     private readonly config: ConfigService,
-        private readonly coinsService: CoinsService,
-        private readonly notifService: NotificationService,
+    private readonly coinsService: CoinsService,
 
   ) {
     // UPLOAD_DIR defaults to <project-root>/uploads — change in .env for production
@@ -466,18 +464,27 @@ if (query.search)  { conditions.push(`sm.title ILIKE $${pi++}`); params.push(`%$
       }
     } catch (_) { /* non-blocking — approval still succeeds */ }
 
-    // Push notification to the uploader
+    // Push notification to the uploader (direct Firebase, no cross-module dependency)
     try {
       const [mat] = await this.db.query(
-        `SELECT uploader_id, title FROM study_materials WHERE id=$1`, [id]
+        `SELECT sm.uploader_id, sm.title, u.fcm_token, u.notification_enabled
+         FROM study_materials sm
+         JOIN users u ON u.id = sm.uploader_id
+         WHERE sm.id=$1`, [id]
       );
-      if (mat?.uploader_id) {
-        await this.notifService?.pushToUser(
-          mat.uploader_id,
-          '✅ Study material approved!',
-          `Your upload "${mat.title}" has been approved and is now live for all students.`,
-          { type: 'material_approved', materialId: id, screen: 'study_materials' }
-        );
+      if (mat?.fcm_token && mat?.notification_enabled) {
+        const adminSdk = await import('firebase-admin');
+        if (adminSdk.apps.length) {
+          await adminSdk.messaging().send({
+            token: mat.fcm_token,
+            notification: {
+              title: '✅ Study material approved!',
+              body:  `Your upload "${mat.title}" is now live for all students.`,
+            },
+            data: { type: 'material_approved', materialId: id, screen: 'study_materials' },
+            android: { priority: 'high' },
+          }).catch(() => {});
+        }
       }
     } catch (_) { /* non-blocking */ }
 

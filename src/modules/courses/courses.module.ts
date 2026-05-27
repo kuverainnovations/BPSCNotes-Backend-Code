@@ -684,16 +684,41 @@ SET
     const course = await this.repo.create(dto, adminId);
     await this.invalidateCache();
 
-    // Push notification to all users about new course
-    if (dto.status === 'published' && this.notifService?.pushToAll) {
-      this.notifService.pushToAll(
-        `📚 New Course: ${dto.title}`,
-        `${dto.subject || 'New'} course now available! ${dto.totalLessons || ''} lessons · ${dto.isPaid ? 'Premium' : 'Free'}`,
-        { type: 'new_course', courseId: course.id || '', screen: 'courses' }
+    // Push notification to all users about new course (fire-and-forget)
+    if (dto.status === 'published') {
+      this.sendCourseNotification(
+        course.id || '',
+        dto.title,
+        dto.subject || 'General',
+        dto.isPaid || false,
       ).catch(() => {});
     }
 
     return successResponse({ course }, 'Course created', undefined);
+  }
+
+  /** Standalone FCM push — no cross-module dependency needed */
+  private async sendCourseNotification(courseId: string, title: string, subject: string, isPaid: boolean) {
+    try {
+      const adminSdk = await import('firebase-admin');
+      if (!adminSdk.apps.length) return;
+      const rows = await this.db.query(
+        `SELECT fcm_token FROM users WHERE notification_enabled=TRUE AND fcm_token IS NOT NULL AND status='active' LIMIT 2000`
+      );
+      const tokens: string[] = rows.map((r: any) => r.fcm_token).filter(Boolean);
+      if (!tokens.length) return;
+      for (let i = 0; i < tokens.length; i += 500) {
+        await adminSdk.messaging().sendEachForMulticast({
+          tokens: tokens.slice(i, i + 500),
+          notification: {
+            title: `📚 New Course: ${title}`,
+            body:  `${subject} course now available! ${isPaid ? 'Premium' : 'Free'}.`,
+          },
+          data: { type: 'new_course', courseId, screen: 'courses' },
+          android: { priority: 'high' },
+        }).catch(() => {});
+      }
+    } catch (_) { /* non-blocking */ }
   }
 
   async adminUpdate(courseId: string, dto: Partial<CreateCourseDto>) {
