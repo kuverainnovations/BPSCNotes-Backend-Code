@@ -26,35 +26,28 @@ services:
 
   # ── API Server ──────────────────────────────────────────────
   api:
-  build:
-    context: .
-    dockerfile: Dockerfile
-    target: production
-  container_name: bpscnotes-api
-  restart: unless-stopped
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
 
-  volumes:
-    - /var/www/uploads:/app/uploads
-    - /root/firebase-service-account.json:/app/firebase-service-account.json:ro
+    container_name: bpscnotes-api
+    restart: unless-stopped
 
-    # BUG FIX 3: removed hardcoded JWT_SECRET / ADMIN_JWT_SECRET from here.
-    # They were overriding the strong values in .env with "secret123".
-    # docker-compose environment: block has higher priority than env_file.
-    # Only set values here that MUST differ from .env (like hosts for docker networking).
+    volumes:
+      - /var/www/uploads:/app/uploads
+      - /root/firebase-service-account.json:/app/firebase-service-account.json:ro
+
     env_file: .env
+
     environment:
       NODE_ENV: production
-      DB_HOST: postgres         # override .env DB_HOST=localhost with docker service name
-      REDIS_HOST: redis         # override .env REDIS_HOST=localhost with docker service name
+      DB_HOST: postgres
+      REDIS_HOST: redis
 
-    # BUG FIX 5: do NOT expose :5000 to the public internet.
-    # nginx handles all external traffic. The port is still reachable
-    # inside the Docker network (nginx → api:5000).
-    # Uncomment only for local debugging:
-    # ports:
-    #   - "127.0.0.1:5000:5000"   # bind to localhost only if you need direct access
     expose:
       - "5000"
+
 
     depends_on:
       postgres:
