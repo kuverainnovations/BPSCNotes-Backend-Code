@@ -26,15 +26,16 @@ services:
 
   # ── API Server ──────────────────────────────────────────────
   api:
-    build:
-      context: .
-      dockerfile: Dockerfile
-      target: production
-    container_name: bpscnotes-api
-    restart: unless-stopped
+  build:
+    context: .
+    dockerfile: Dockerfile
+    target: production
+  container_name: bpscnotes-api
+  restart: unless-stopped
 
-    volumes:
-      - /var/www/uploads:/app/uploads
+  volumes:
+    - /var/www/uploads:/app/uploads
+    - /root/firebase-service-account.json:/app/firebase-service-account.json:ro
 
     # BUG FIX 3: removed hardcoded JWT_SECRET / ADMIN_JWT_SECRET from here.
     # They were overriding the strong values in .env with "secret123".
