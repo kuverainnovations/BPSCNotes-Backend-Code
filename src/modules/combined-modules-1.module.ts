@@ -879,23 +879,92 @@ console.log('sample token:', tokens[0]);
   }
 
   // ── Direct push helpers (called by other modules) ──────────
-  async pushToUser(userId: string, title: string, body: string, data: Record<string, string> = {}) {
+  // async pushToUser(userId: string, title: string, body: string, data: Record<string, string> = {}) {
+  //   const rows = await this.db.query(
+  //     `SELECT fcm_token FROM users WHERE id=$1 AND notification_enabled=TRUE AND fcm_token IS NOT NULL LIMIT 1`,
+  //     [userId]
+  //   );
+  //   const token = rows[0]?.fcm_token;
+  //   if (!token || !admin.apps.length) return false;
+  //   try {
+  //     await admin.messaging().send({
+  //       token,
+  //       notification: { title, body },
+  //       data,
+  //       android: { priority: 'high', notification: { channelId: data.type || 'general' } },
+  //     });
+  //     return true;
+  //   } catch (err: any) {
+  //     console.error('FCM push failed:', err.message);
+  //     return false;
+  //   }
+  // }
+
+  async pushToUser(
+    userId: string,
+    title: string,
+    body: string,
+    data: Record<string, string> = {}
+  ) {
+    console.log('🔥 pushToUser called', userId);
+  
     const rows = await this.db.query(
-      `SELECT fcm_token FROM users WHERE id=$1 AND notification_enabled=TRUE AND fcm_token IS NOT NULL LIMIT 1`,
+      `SELECT fcm_token, notification_enabled
+       FROM users
+       WHERE id=$1`,
       [userId]
     );
+  
+    console.log('🔥 USER ROWS', rows);
+  
     const token = rows[0]?.fcm_token;
-    if (!token || !admin.apps.length) return false;
+  
+    console.log('🔥 TOKEN', token);
+    console.log('🔥 admin.apps.length', admin.apps.length);
+  
+    if (!rows.length) {
+      console.log('❌ USER NOT FOUND');
+      return false;
+    }
+  
+    if (!rows[0].notification_enabled) {
+      console.log('❌ NOTIFICATIONS DISABLED');
+      return false;
+    }
+  
+    if (!token) {
+      console.log('❌ NO FCM TOKEN');
+      return false;
+    }
+  
+    if (!admin.apps.length) {
+      console.log('❌ FIREBASE NOT INITIALIZED');
+      return false;
+    }
+  
     try {
-      await admin.messaging().send({
+      const res = await admin.messaging().send({
         token,
         notification: { title, body },
         data,
-        android: { priority: 'high', notification: { channelId: data.type || 'general' } },
+        android: {
+          priority: 'high',
+          notification: {
+            channelId: data.type || 'general',
+          },
+        },
       });
+  
+      console.log('✅ FCM SENT', res);
+  
       return true;
+  
     } catch (err: any) {
-      console.error('FCM push failed:', err.message);
+  
+      console.log('❌ FCM ERROR FULL', err);
+      console.log('❌ FCM ERROR MESSAGE', err.message);
+      console.log('❌ FCM ERROR CODE', err.code);
+  
       return false;
     }
   }
