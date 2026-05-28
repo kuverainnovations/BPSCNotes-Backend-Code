@@ -13,6 +13,7 @@ import { Inject } from '@nestjs/common';
 import { ApiTags, ApiBearerAuth } from '@nestjs/swagger';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { AuthModule, AuthService } from './auth/auth.module';
+import { NotificationsModule, NotificationService } from './combined-modules-1.module';
 // Phase 2 achievements + challenges — imported here to wire into
 // DailyTargets and Quizzes so completions trigger achievement checks
 import { AchievementsService, WeeklyChallengesService } from './achievements/achievements.module';
@@ -203,6 +204,7 @@ export class StudyRoomsModule {}
 // ════════════════════════════════════════════════════════════
 @Injectable()
 class DailyTargetsService {
+  notifService: any;
   constructor(
     @InjectDataSource() private readonly db: DataSource,
     @Inject(CACHE_MANAGER) private readonly cache: Cache,
@@ -419,6 +421,7 @@ class DailyTargetsService {
           .catch(e => console.error('challenge update failed:', e.message)),
       ]);
     }
+    
 
     // Award coin for first completion (not if toggling back)
     // FIX: Use authService.awardCoins() so it uses COIN_DEFAULTS fallback
@@ -438,28 +441,6 @@ class DailyTargetsService {
     await this.cache.del(`user:${userId}`);
     await this.cache.del(`profile:${userId}`);
 
-    // 🔔 Target completed push with coins earned
-    if (nowComplete && coinsEarned > 0) {
-      (async () => {
-        try {
-          const adminSdk = await import('firebase-admin');
-          if (!adminSdk.apps.length) return;
-          const [u] = await this.db.query(
-            `SELECT fcm_token FROM users WHERE id=$1 AND notification_enabled=TRUE AND fcm_token IS NOT NULL LIMIT 1`,
-            [userId]
-          );
-          if (u?.fcm_token) {
-            await adminSdk.messaging().send({
-              token: u.fcm_token,
-              notification: { title: '✅ Target Complete!', body: `"${target.title}" done! You earned 🪙 +${coinsEarned} coins. Keep it up!` },
-              data: { type: 'target_complete', screen: 'daily_targets' },
-              android: { priority: 'normal', notification: { channelId: 'general' } },
-            });
-          }
-        } catch (_) {}
-      })();
-    }
-
     return successResponse(
       {
         id:          targetId,
@@ -471,24 +452,12 @@ class DailyTargetsService {
 
     // 🔔 Target complete push
     if (nowComplete && coinsEarned > 0) {
-      (async () => {
-        try {
-          const adminSdk = await import('firebase-admin');
-          if (!adminSdk.apps.length) return;
-          const [u] = await this.db.query(
-            `SELECT fcm_token, notification_enabled FROM users WHERE id=$1 AND fcm_token IS NOT NULL LIMIT 1`,
-            [userId]
-          );
-          if (u?.fcm_token && u.notification_enabled) {
-            await adminSdk.messaging().send({
-              token: u.fcm_token,
-              notification: { title: '✅ Daily Target Done!', body: `Keep it up! You earned 🪙 +${coinsEarned} coins.` },
-              data: { type: 'target_complete', screen: 'daily_targets' },
-              android: { priority: 'normal', notification: { channelId: 'general' } },
-            });
-          }
-        } catch (_) {}
-      })();
+      this.notifService.pushToUser(
+        userId,
+        '✅ Daily Target Done!',
+        `Keep it up! You earned 🪙 +${coinsEarned} coins.`,
+        { type: 'target_complete', screen: 'daily_targets' }
+      ).catch(() => {});
     }
   }
 
@@ -562,12 +531,13 @@ class DailyTargetsController {
 }
 
 @Module({
-  imports: [AuthModule],
+  imports: [AuthModule, NotificationsModule],
   controllers: [DailyTargetsController],
   providers: [
     DailyTargetsService,
     AchievementsService,
     WeeklyChallengesService,
+    NotificationService,
   ],
 })
 

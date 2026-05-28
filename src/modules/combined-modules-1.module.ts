@@ -218,6 +218,7 @@ export class CurrentAffairsModule {}
 // ════════════════════════════════════════════════════════════
 @Injectable()
 class JobsService {
+  pushToAll: any;
   constructor(
     @InjectDataSource() private readonly db: DataSource,
     @Inject(CACHE_MANAGER) private readonly cache: Cache,
@@ -306,46 +307,11 @@ CASE WHEN j.last_date <= NOW() + INTERVAL '3 days'
       [data.title, data.organization, data.category, data.totalPosts||0, data.notificationDate||null, data.lastDate, data.examDate||null, data.ageLimit, data.qualification, data.applicationLink, data.description, data.examTags||[], adminId]
     );
     // 🔔 New job alert to all users
-    (async () => {
-      try {
-        const adminSdk = await import('firebase-admin');
-        if (!adminSdk.apps.length) return;
-        const tokens = await this.db.query(
-          `SELECT fcm_token FROM users WHERE notification_enabled=TRUE AND fcm_token IS NOT NULL AND status='active' LIMIT 2000`
-        );
-        const fcmTokens = tokens.map((t: any) => t.fcm_token).filter(Boolean);
-        if (!fcmTokens.length) return;
-        for (let i = 0; i < fcmTokens.length; i += 500) {
-          await adminSdk.messaging().sendEachForMulticast({
-            tokens: fcmTokens.slice(i, i + 500),
-            notification: { title: `📋 New Job: ${data.title}`, body: `${data.organization} · ${data.totalPosts || ''} posts · Last date: ${data.lastDate?.split('T')[0] || ''}` },
-            data: { type: 'new_job', screen: 'jobs' },
-            android: { priority: 'high', notification: { channelId: 'jobs' } },
-          }).catch(() => {});
-        }
-      } catch (_) {}
-    })();
-
-    // 🔔 New job alert to all users
-    (async () => {
-      try {
-        const adminSdk = await import('firebase-admin');
-        if (!adminSdk.apps.length) return;
-        const tokens = await this.db.query(
-          `SELECT fcm_token FROM users WHERE notification_enabled=TRUE AND fcm_token IS NOT NULL AND status='active' LIMIT 2000`
-        );
-        const fcmTokens = tokens.map((t: any) => t.fcm_token).filter(Boolean);
-        if (!fcmTokens.length) return;
-        for (let i = 0; i < fcmTokens.length; i += 500) {
-          await adminSdk.messaging().sendEachForMulticast({
-            tokens: fcmTokens.slice(i, i + 500),
-            notification: { title: `📋 New Job: ${data.title}`, body: `${data.organization} · Last date: ${data.lastDate?.split('T')[0] || ''}` },
-            data: { type: 'new_job', screen: 'jobs' },
-            android: { priority: 'high', notification: { channelId: 'jobs' } },
-          }).catch(() => {});
-        }
-      } catch (_) {}
-    })();
+    this.pushToAll(
+      `📋 New Job: ${data.title}`,
+      `${data.organization} · Last date: ${data.lastDate?.split('T')[0] || ''}`,
+      { type: 'new_job', screen: 'jobs' }
+    ).catch(() => {});
 
     return successResponse({ job: result[0] }, 'Job vacancy created — live in app ✅');
   }
@@ -397,6 +363,7 @@ class SubscriptionsService {
     quarterly: { price: 499, originalPrice: 899,  duration: '3 months', bonusCoins: 60 },
     annual:    { price: 1499,originalPrice: 2999, duration: '12 months',bonusCoins: 200 },
   };
+  pushToUser: any;
 
   constructor(
     @InjectDataSource() private readonly db: DataSource,
@@ -559,28 +526,13 @@ class SubscriptionsService {
 
     await this.cache.del(`user:${userId}`);
 
-    // 🔔 Welcome push to new subscriber
-    (async () => {
-      try {
-        const adminSdk = await import('firebase-admin');
-        if (!adminSdk.apps.length) return;
-        const [u] = await this.db.query(
-          `SELECT fcm_token FROM users WHERE id=$1 AND notification_enabled=TRUE AND fcm_token IS NOT NULL LIMIT 1`,
-          [userId]
-        );
-        if (u?.fcm_token) {
-          await adminSdk.messaging().send({
-            token: u.fcm_token,
-            notification: {
-              title: '🎉 BPSCNotes Pro Activated!',
-              body:  `Your ${sub.plan} plan is live. Enjoy unlimited access + 🪙 ${plan.bonusCoins} bonus coins!`,
-            },
-            data: { type: 'subscription', screen: 'courses' },
-            android: { priority: 'high', notification: { channelId: 'payments' } },
-          });
-        }
-      } catch (_) {}
-    })();
+    // 🔔 Subscription welcome push
+    this.pushToUser(
+      userId,
+      '🎉 BPSCNotes Pro Activated!',
+      `Your ${sub.plan} plan is live. Enjoy unlimited access + 🪙 ${plan.bonusCoins} bonus coins!`,
+      { type: 'subscription', screen: 'courses' }
+    ).catch(() => {});
 
     return successResponse({ bonusCoinsEarned: plan.bonusCoins }, '🎉 Subscription activated! Enjoy BPSCNotes Pro');
   }
@@ -775,23 +727,33 @@ export class NotificationService {
   private initFirebase() {
     try {
       if (!admin.apps.length) {
-        const fb = this.config.get('firebase');
-        if (fb.projectId && fb.privateKey) {
-          admin.initializeApp({
-            credential: admin.credential.cert({
-              projectId:   fb.projectId,
-              privateKeyId: fb.privateKeyId,
-              privateKey:   fb.privateKey,
-              clientEmail:  fb.clientEmail,
-            } as any),
-          });
-          this.firebaseInitialized = true;
-        }
+  
+        const serviceAccountPath =
+        process.env.FIREBASE_SERVICE_ACCOUNT_PATH ||
+        '/app/firebase-service-account.json';
+      
+      console.log('Firebase path:', serviceAccountPath);
+      
+  
+        admin.initializeApp({
+          credential: admin.credential.cert(
+            require(serviceAccountPath)
+          ),
+        });
+  
+        this.firebaseInitialized = true;
+  
+        console.log('✅ Firebase initialized');
+  
       } else {
         this.firebaseInitialized = true;
       }
-    } catch (err) {
-      console.warn('⚠️  Firebase not configured — push notifications disabled:', err.message);
+  
+    } catch (err: any) {
+      console.error(
+        '❌ Firebase initialization failed:',
+        err.message
+      );
     }
   }
 
@@ -841,8 +803,13 @@ export class NotificationService {
 
     // FCM push
     let pushSuccess = 0, pushFail = 0;
+    console.log('==== PUSH DEBUG ====');
+console.log('firebaseInitialized:', this.firebaseInitialized);
+console.log('users count:', users.length);
     if (this.firebaseInitialized) {
       const tokens = users.map((u: any) => u.fcm_token).filter(Boolean);
+      console.log('tokens count:', tokens.length);
+console.log('sample token:', tokens[0]);
       if (tokens.length > 0) {
         for (let i = 0; i < tokens.length; i += 500) {
           try {
@@ -855,7 +822,8 @@ export class NotificationService {
             pushSuccess += result.successCount;
             pushFail    += result.failureCount;
           } catch (err) {
-            console.error('FCM error:', err.message);
+            console.error('FCM FULL ERROR:', err);
+            // console.error('FCM error:', err.message);
           }
         }
       }

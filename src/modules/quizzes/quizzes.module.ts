@@ -7,6 +7,7 @@ import {
 } from '@nestjs/common';
 import { InjectDataSource } from '@nestjs/typeorm';
 import { AchievementsService, WeeklyChallengesService, AchievementsModule } from '../achievements/achievements.module';
+import { NotificationsModule, NotificationService } from '../combined-modules-1.module';
 import { DataSource } from 'typeorm';
 import { CACHE_MANAGER } from '@nestjs/cache-manager';
 import { Cache } from 'cache-manager';
@@ -26,6 +27,7 @@ class QuizzesService {
     @Inject(CACHE_MANAGER) private readonly cache: Cache,
     private readonly achievementsService: AchievementsService,
     private readonly challengesService: WeeklyChallengesService,
+    private readonly notifService: NotificationService,
   ) {}
 
   // ── GET /quizzes — list with is_attempted flag ──────────────
@@ -246,7 +248,7 @@ if (q.scheduled_for) {
     // ANTI-CHEAT: Only award coins on the FIRST passing attempt for this quiz
     // Prevents farming by re-taking quizzes repeatedly
     let coinsEarned = 0;
-    let prevPass: any = null;   // hoisted — used for notification check below
+    let prevPass: any = null;
     if (isPassed) {
       [prevPass] = await this.db.query(
         `SELECT id FROM quiz_attempts
@@ -308,6 +310,16 @@ const rank = higherScores + 1;
 const percentile = Number(
   (((totalAttempts - rank) / totalAttempts) * 100).toFixed(2)
 );
+// 🔔 First-time pass notification
+    if (isPassed && !prevPass && coinsEarned > 0) {
+      this.notifService.pushToUser(
+        userId,
+        '🎉 Quiz Passed!',
+        `You scored ${score}% on "${q.title}" · 🪙 +${coinsEarned} coins!`,
+        { type: 'quiz_result', quizId, screen: 'quiz_list' }
+      ).catch(() => {});
+    }
+
 return successResponse({
   attemptId: attempt[0].id,
   score,
@@ -324,28 +336,6 @@ return successResponse({
 
   answers: evaluated,
 });
-
-    // 🔔 Push: first-time pass with coins
-    if (isPassed && !prevPass && coinsEarned > 0) {
-      (async () => {
-        try {
-          const adminSdk = await import('firebase-admin');
-          if (!adminSdk.apps.length) return;
-          const [u] = await this.db.query(
-            `SELECT fcm_token FROM users WHERE id=$1 AND notification_enabled=TRUE AND fcm_token IS NOT NULL LIMIT 1`,
-            [userId]
-          );
-          if (u?.fcm_token) {
-            await adminSdk.messaging().send({
-              token: u.fcm_token,
-              notification: { title: '🎉 Quiz Passed!', body: `You scored ${score}% on "${q.title}" · 🪙 +${coinsEarned} coins earned!` },
-              data: { type: 'quiz_result', quizId, screen: 'quiz_list' },
-              android: { priority: 'high' },
-            });
-          }
-        } catch (_) {}
-      })();
-    }
   }
 
   // ═══════════════════════════════════════════════════════════
@@ -746,9 +736,9 @@ class AdminQuestionsController {
 import { AuthModule } from '../auth/auth.module';
 
 @Module({
-  imports:     [AuthModule],
+  imports:     [AuthModule, NotificationsModule],
   controllers: [QuizzesController, AdminQuizzesController, AdminQuestionsController],
-  providers:   [QuizzesService, AchievementsService, WeeklyChallengesService],
+  providers:   [QuizzesService, AchievementsService, WeeklyChallengesService, NotificationService],
   exports:     [QuizzesService],
 })
 export class QuizzesModule {}
