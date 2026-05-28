@@ -323,12 +323,21 @@ const percentile = Number(
           prevPass,
           coinsEarned,
         });
-      this.notifService.pushToUser(
-        userId,
-        '🎉 Quiz Passed!',
-        `You scored ${score}% on "${q.title}" · 🪙 +${coinsEarned} coins!`,
-        { type: 'quiz_result', quizId, screen: 'quiz_list' }
-      ).catch(() => {});
+        try {
+          console.log('🔥 BEFORE PUSH');
+        
+          const result = await this.notifService.pushToUser(
+            userId,
+            '🎉 Quiz Passed!',
+            `You scored ${score}% on "${q.title}" · 🪙 +${coinsEarned} coins!`,
+            { type: 'quiz_result', quizId, screen: 'quiz_list' }
+          );
+        
+          console.log('✅ PUSH SUCCESS', result);
+        } catch (e) {
+          console.error('❌ PUSH FAILED', e);
+        }
+      
     }
 
 return successResponse({
