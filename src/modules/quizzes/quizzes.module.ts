@@ -311,7 +311,18 @@ const percentile = Number(
   (((totalAttempts - rank) / totalAttempts) * 100).toFixed(2)
 );
 // 🔔 First-time pass notification
-    if (isPassed && !prevPass && coinsEarned > 0) {
+    // if (isPassed && !prevPass && coinsEarned > 0) {
+      console.log('🔥 Sending quiz push befor if', {
+        isPassed,
+        prevPass,
+        coinsEarned,
+      });
+      if (isPassed && !prevPass && coinsEarned > 0) {
+        console.log('🔥 Sending quiz push after if', {
+          isPassed,
+          prevPass,
+          coinsEarned,
+        });
       this.notifService.pushToUser(
         userId,
         '🎉 Quiz Passed!',
