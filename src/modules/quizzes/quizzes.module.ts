@@ -317,7 +317,7 @@ const percentile = Number(
         prevPass,
         coinsEarned,
       });
-      if (isPassed && !prevPass && coinsEarned > 0) {
+      if (isPassed) {
         console.log('🔥 Sending quiz push after if', {
           isPassed,
           prevPass,
