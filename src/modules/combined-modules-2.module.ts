@@ -419,7 +419,6 @@ class DailyTargetsService {
           .catch(e => console.error('challenge update failed:', e.message)),
       ]);
     }
-    
 
     // Award coin for first completion (not if toggling back)
     // FIX: Use authService.awardCoins() so it uses COIN_DEFAULTS fallback
@@ -439,6 +438,28 @@ class DailyTargetsService {
     await this.cache.del(`user:${userId}`);
     await this.cache.del(`profile:${userId}`);
 
+    // 🔔 Target completed push with coins earned
+    if (nowComplete && coinsEarned > 0) {
+      (async () => {
+        try {
+          const adminSdk = await import('firebase-admin');
+          if (!adminSdk.apps.length) return;
+          const [u] = await this.db.query(
+            `SELECT fcm_token FROM users WHERE id=$1 AND notification_enabled=TRUE AND fcm_token IS NOT NULL LIMIT 1`,
+            [userId]
+          );
+          if (u?.fcm_token) {
+            await adminSdk.messaging().send({
+              token: u.fcm_token,
+              notification: { title: '✅ Target Complete!', body: `"${target.title}" done! You earned 🪙 +${coinsEarned} coins. Keep it up!` },
+              data: { type: 'target_complete', screen: 'daily_targets' },
+              android: { priority: 'normal', notification: { channelId: 'general' } },
+            });
+          }
+        } catch (_) {}
+      })();
+    }
+
     return successResponse(
       {
         id:          targetId,
@@ -447,6 +468,28 @@ class DailyTargetsService {
       },
       nowComplete ? `Target completed! +${coinsEarned} coins 🎉` : 'Target marked as incomplete'
     );
+
+    // 🔔 Target complete push
+    if (nowComplete && coinsEarned > 0) {
+      (async () => {
+        try {
+          const adminSdk = await import('firebase-admin');
+          if (!adminSdk.apps.length) return;
+          const [u] = await this.db.query(
+            `SELECT fcm_token, notification_enabled FROM users WHERE id=$1 AND fcm_token IS NOT NULL LIMIT 1`,
+            [userId]
+          );
+          if (u?.fcm_token && u.notification_enabled) {
+            await adminSdk.messaging().send({
+              token: u.fcm_token,
+              notification: { title: '✅ Daily Target Done!', body: `Keep it up! You earned 🪙 +${coinsEarned} coins.` },
+              data: { type: 'target_complete', screen: 'daily_targets' },
+              android: { priority: 'normal', notification: { channelId: 'general' } },
+            });
+          }
+        } catch (_) {}
+      })();
+    }
   }
 
   // ── DELETE /users/daily-targets/:id ──────────────────────

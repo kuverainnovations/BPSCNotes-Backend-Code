@@ -455,6 +455,51 @@ export class CoursesService {
     // Bust all course cache keys so enrollment shows immediately in list
     const keys = await this.cache.store.keys('courses:*');
     for (const k of keys) await this.cache.del(k);
+    // 🔔 Course enrollment confirmation push
+    (async () => {
+      try {
+        const adminSdk = await import('firebase-admin');
+        if (!adminSdk.apps.length) return;
+        const [u] = await this.db.query(
+          `SELECT u.fcm_token, c.title AS course_title
+           FROM users u, courses c
+           WHERE u.id=$1 AND c.id=$2
+           AND u.notification_enabled=TRUE AND u.fcm_token IS NOT NULL LIMIT 1`,
+          [userId, courseId]
+        );
+        if (u?.fcm_token) {
+          await adminSdk.messaging().send({
+            token: u.fcm_token,
+            notification: { title: '📚 Enrollment Confirmed!', body: `You're now enrolled in "${u.course_title}". Start your first lesson! 🎯` },
+            data: { type: 'course_enrolled', courseId, screen: 'my_courses' },
+            android: { priority: 'high', notification: { channelId: 'courses' } },
+          });
+        }
+      } catch (_) {}
+    })();
+
+    // 🔔 Enrollment confirmation push
+    (async () => {
+      try {
+        const adminSdk = await import('firebase-admin');
+        if (!adminSdk.apps.length) return;
+        const [row] = await this.db.query(
+          `SELECT u.fcm_token, c.title AS course_title
+           FROM users u, courses c
+           WHERE u.id=$1 AND c.id=$2 AND u.notification_enabled=TRUE AND u.fcm_token IS NOT NULL LIMIT 1`,
+          [userId, courseId]
+        );
+        if (row?.fcm_token) {
+          await adminSdk.messaging().send({
+            token: row.fcm_token,
+            notification: { title: '📚 Enrolled!', body: `You're now in "${row.course_title}". Tap to start your first lesson! 🎯` },
+            data: { type: 'course_enrolled', courseId, screen: 'my_courses' },
+            android: { priority: 'high', notification: { channelId: 'courses' } },
+          });
+        }
+      } catch (_) {}
+    })();
+
     return successResponse(null, 'Enrolled successfully! Start learning 🚀');
   }
 

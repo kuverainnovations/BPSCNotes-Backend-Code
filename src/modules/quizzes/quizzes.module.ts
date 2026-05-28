@@ -246,8 +246,9 @@ if (q.scheduled_for) {
     // ANTI-CHEAT: Only award coins on the FIRST passing attempt for this quiz
     // Prevents farming by re-taking quizzes repeatedly
     let coinsEarned = 0;
+    let prevPass: any = null;   // hoisted — used for notification check below
     if (isPassed) {
-      const [prevPass] = await this.db.query(
+      [prevPass] = await this.db.query(
         `SELECT id FROM quiz_attempts
          WHERE user_id=$1 AND quiz_id=$2 AND is_passed=true AND id != $3
          LIMIT 1`,
@@ -323,6 +324,28 @@ return successResponse({
 
   answers: evaluated,
 });
+
+    // 🔔 Push: first-time pass with coins
+    if (isPassed && !prevPass && coinsEarned > 0) {
+      (async () => {
+        try {
+          const adminSdk = await import('firebase-admin');
+          if (!adminSdk.apps.length) return;
+          const [u] = await this.db.query(
+            `SELECT fcm_token FROM users WHERE id=$1 AND notification_enabled=TRUE AND fcm_token IS NOT NULL LIMIT 1`,
+            [userId]
+          );
+          if (u?.fcm_token) {
+            await adminSdk.messaging().send({
+              token: u.fcm_token,
+              notification: { title: '🎉 Quiz Passed!', body: `You scored ${score}% on "${q.title}" · 🪙 +${coinsEarned} coins earned!` },
+              data: { type: 'quiz_result', quizId, screen: 'quiz_list' },
+              android: { priority: 'high' },
+            });
+          }
+        } catch (_) {}
+      })();
+    }
   }
 
   // ═══════════════════════════════════════════════════════════
