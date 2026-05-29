@@ -1,6 +1,6 @@
 import {
-  Module, Injectable, Controller,OnModuleInit,
-  Get, Post, Body, Param, Query, Req,
+  Module, Injectable, Controller,
+  Get, Post, Body, Param, Query, Req,OnModuleInit,
   UseGuards, HttpCode, HttpStatus,
   NotFoundException, BadRequestException, Logger,
 } from '@nestjs/common';
@@ -399,6 +399,60 @@ export class CoinsService implements OnModuleInit {
   }
 
   // ── POST /coins/tasks/:id/claim ───────────────────────────────
+  // ── POST /coins/ad-reward ─────────────────────────────────────
+  // Credits coins for watching a rewarded ad.
+  // Reads coins_per_ad from app_settings (admin-configurable).
+  // Records a coin_transaction so it shows in history.
+  async recordAdReward(userId: string, source: string = 'wallet') {
+    // Fetch admin-configured coins per ad (default 10)
+    const [setting] = await this.db.query(
+      `SELECT value FROM app_settings WHERE key='ad_reward_coins'`
+    ).catch(() => []);
+    const coinsPerAd = parseInt(setting?.value || '10', 10);
+
+    // Credit coins
+    await this.db.query(`
+      UPDATE users
+      SET coins              = COALESCE(coins, 0) + $1,
+          total_coins_earned = COALESCE(total_coins_earned, 0) + $1
+      WHERE id = $2
+    `, [coinsPerAd, userId]);
+
+    const [updated] = await this.db.query(
+      `SELECT coins, total_coins_earned FROM users WHERE id = $1`, [userId]
+    );
+    const balance = updated?.coins ?? 0;
+
+    // Insert transaction row → shows in history
+    await this.db.query(`
+      INSERT INTO coin_transactions (user_id, type, amount, description, action, balance)
+      VALUES ($1, 'earned', $2, $3, 'ad_watch', $4)
+    `, [userId, coinsPerAd, `Watched ad (+${coinsPerAd} coins)`, balance]);
+
+    return successResponse({
+      balance,
+      coinsEarned:   coinsPerAd,
+      totalEarned:   updated?.total_coins_earned ?? 0,
+    }, `+${coinsPerAd} coins earned! 🪙`);
+  }
+
+  // ── GET /coins/ad-config ──────────────────────────────────────
+  // Returns admin-configured ad reward settings for the mobile app.
+  async getAdConfig() {
+    const rows = await this.db.query(`
+      SELECT key, value FROM app_settings
+      WHERE key IN ('ad_reward_coins', 'ad_min_per_session')
+    `).catch(() => []);
+
+    const map: Record<string, string> = {};
+    for (const r of rows) map[r.key] = r.value;
+
+    return successResponse({
+      coinsPerAd:       parseInt(map['ad_reward_coins']      || '10', 10),
+      minAdsPerSession: parseInt(map['ad_min_per_session']   || '2',  10),
+    });
+  }
+
   async claimTask(taskId: string, userId: string) {
     const task = EARN_TASKS.find(t => t.id === taskId);
     if (!task) throw new NotFoundException(`Task '${taskId}' not found`);
@@ -477,6 +531,19 @@ export class CoinsController {
   @HttpCode(HttpStatus.OK)
   claimTask(@Param('id') id: string, @Req() r: any) {
     return this.svc.claimTask(id, r.user.id);
+  }
+
+  /** POST /coins/ad-reward — credit coins after watching a rewarded ad */
+  @Post('ad-reward')
+  @HttpCode(HttpStatus.OK)
+  recordAdReward(@Req() r: any, @Body() body: { source?: string }) {
+    return this.svc.recordAdReward(r.user.id, body?.source || 'wallet');
+  }
+
+  /** GET /coins/ad-config — fetch admin-configured coins per ad */
+  @Get('ad-config')
+  getAdConfig() {
+    return this.svc.getAdConfig();
   }
 }
 
