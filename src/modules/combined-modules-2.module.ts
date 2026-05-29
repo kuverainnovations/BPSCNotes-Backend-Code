@@ -652,9 +652,12 @@ class UsersService {
          ),
       
          quiz_activity AS (
+           -- Use actual time_taken_secs recorded when the user submitted the quiz.
+           -- Convert seconds → minutes, cap each attempt at 30 min so retakes
+           -- don't inflate the count (a 4-second speed-run counts as <1 min, not 5).
            SELECT
              DATE(qa.attempted_at) AS date,
-             COUNT(*) * 5 AS study_mins
+             SUM(LEAST(CEIL(qa.time_taken_secs::numeric / 60), 30))::int AS study_mins
            FROM quiz_attempts qa
            WHERE qa.user_id = $1
              AND qa.attempted_at >= NOW() - INTERVAL '28 days'
