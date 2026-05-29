@@ -879,92 +879,51 @@ console.log('sample token:', tokens[0]);
   }
 
   // ── Direct push helpers (called by other modules) ──────────
-  // async pushToUser(userId: string, title: string, body: string, data: Record<string, string> = {}) {
-  //   const rows = await this.db.query(
-  //     `SELECT fcm_token FROM users WHERE id=$1 AND notification_enabled=TRUE AND fcm_token IS NOT NULL LIMIT 1`,
-  //     [userId]
-  //   );
-  //   const token = rows[0]?.fcm_token;
-  //   if (!token || !admin.apps.length) return false;
-  //   try {
-  //     await admin.messaging().send({
-  //       token,
-  //       notification: { title, body },
-  //       data,
-  //       android: { priority: 'high', notification: { channelId: data.type || 'general' } },
-  //     });
-  //     return true;
-  //   } catch (err: any) {
-  //     console.error('FCM push failed:', err.message);
-  //     return false;
-  //   }
-  // }
-
-  async pushToUser(
-    userId: string,
-    title: string,
-    body: string,
-    data: Record<string, string> = {}
-  ) {
-    console.log('🔥 pushToUser called', userId);
-  
+  async pushToUser(userId: string, title: string, body: string, data: Record<string, string> = {}) {
     const rows = await this.db.query(
-      `SELECT fcm_token, notification_enabled
-       FROM users
-       WHERE id=$1`,
+      `SELECT fcm_token, notification_enabled FROM users WHERE id=$1 AND fcm_token IS NOT NULL LIMIT 1`,
       [userId]
     );
-  
-    console.log('🔥 USER ROWS', rows);
-  
-    const token = rows[0]?.fcm_token;
-  
-    console.log('🔥 TOKEN', token);
-    console.log('🔥 admin.apps.length', admin.apps.length);
-  
-    if (!rows.length) {
-      console.log('❌ USER NOT FOUND');
-      return false;
-    }
-  
-    if (!rows[0].notification_enabled) {
-      console.log('❌ NOTIFICATIONS DISABLED');
-      return false;
-    }
-  
-    if (!token) {
-      console.log('❌ NO FCM TOKEN');
-      return false;
-    }
-  
-    if (!admin.apps.length) {
-      console.log('❌ FIREBASE NOT INITIALIZED');
-      return false;
-    }
-  
+    const user  = rows[0];
+    const token = user?.fcm_token;
+
+    // ── Always save to user_notifications so inbox is populated ──
+    // This runs regardless of FCM success/failure and notification_enabled setting
+    // (user should still see past notifications in-app even if push was disabled)
     try {
-      const res = await admin.messaging().send({
+      // Insert a notifications record (system/trigger type — no admin user)
+      const [notifRow] = await this.db.query(
+        `INSERT INTO notifications (title, body, type, target, data, status, sent_at, created_by)
+         VALUES ($1, $2, $3, 'user', $4, 'sent', NOW(), NULL)
+         RETURNING id`,
+        [title, body, data.type || 'system', JSON.stringify(data)]
+      );
+      const notifId = notifRow?.id;
+
+      if (notifId) {
+        await this.db.query(
+          `INSERT INTO user_notifications (user_id, notification_id, title, body)
+           VALUES ($1, $2, $3, $4)
+           ON CONFLICT DO NOTHING`,
+          [userId, notifId, title, body]
+        );
+      }
+    } catch (dbErr: any) {
+      console.error('pushToUser DB insert failed:', dbErr.message);
+    }
+
+    // ── FCM push (only if user has token and notifications enabled) ──
+    if (!token || !user?.notification_enabled || !admin.apps.length) return false;
+    try {
+      await admin.messaging().send({
         token,
         notification: { title, body },
         data,
-        android: {
-          priority: 'high',
-          notification: {
-            channelId: data.type || 'general',
-          },
-        },
+        android: { priority: 'high', notification: { channelId: data.type || 'general' } },
       });
-  
-      console.log('✅ FCM SENT', res);
-  
       return true;
-  
     } catch (err: any) {
-  
-      console.log('❌ FCM ERROR FULL', err);
-      console.log('❌ FCM ERROR MESSAGE', err.message);
-      console.log('❌ FCM ERROR CODE', err.code);
-  
+      console.error('FCM push failed:', err.message);
       return false;
     }
   }
