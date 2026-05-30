@@ -128,12 +128,11 @@ class QuizzesService {
     const now = new Date();
 
 if (q.scheduled_for) {
-  const scheduledDate = new Date(q.scheduled_for);
-
-  scheduledDate.setHours(0,0,0,0);
-  now.setHours(0,0,0,0);
-
-  if (scheduledDate > now) {
+  // Use ISO date-string comparison — completely timezone-safe
+  // Compares 'YYYY-MM-DD' strings which are lexicographically ordered
+  const today     = new Date().toISOString().split('T')[0];
+  const scheduled = new Date(q.scheduled_for).toISOString().split('T')[0];
+  if (scheduled > today) {
     throw new BadRequestException('This quiz is not yet available');
   }
 }
