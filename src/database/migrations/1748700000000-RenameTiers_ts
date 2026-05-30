@@ -1,0 +1,75 @@
+import { MigrationInterface, QueryRunner } from 'typeorm';
+
+// Rename tier keys and display names: silver→starter, gold→serious, premium→consistent, diamond→achiever
+export class RenameTiers1748700000000 implements MigrationInterface {
+  async up(queryRunner: QueryRunner): Promise<void> {
+
+    // Step 1: Temporarily disable unique constraint
+    await queryRunner.query(`ALTER TABLE room_tiers DROP CONSTRAINT IF EXISTS room_tiers_tier_key_key`);
+
+    // Step 2: Update tier_key and name in room_tiers
+    await queryRunner.query(`
+      UPDATE room_tiers SET
+        tier_key    = CASE tier_key
+          WHEN 'silver'  THEN 'starter'
+          WHEN 'gold'    THEN 'serious'
+          WHEN 'premium' THEN 'consistent'
+          WHEN 'diamond' THEN 'achiever'
+          ELSE tier_key
+        END,
+        name = CASE tier_key
+          WHEN 'silver'  THEN 'Starter'
+          WHEN 'gold'    THEN 'Serious'
+          WHEN 'premium' THEN 'Consistent'
+          WHEN 'diamond' THEN 'Achiever'
+          ELSE name
+        END,
+        description = CASE tier_key
+          WHEN 'silver'  THEN 'Entry level room. All new students start here.'
+          WHEN 'gold'    THEN 'Earned room for consistent students.'
+          WHEN 'premium' THEN 'For dedicated daily learners.'
+          WHEN 'diamond' THEN 'Elite room for the top aspirants.'
+          ELSE description
+        END
+      WHERE tier_key IN ('silver','gold','premium','diamond')
+    `);
+
+    // Step 3: Re-add unique constraint
+    await queryRunner.query(`ALTER TABLE room_tiers ADD CONSTRAINT room_tiers_tier_key_key UNIQUE (tier_key)`);
+
+    // Step 4: Update progression_rules from_key / to_key if they store tier_key
+    await queryRunner.query(`
+      UPDATE tier_progression_rules SET
+        from_key = CASE from_key WHEN 'silver' THEN 'starter' WHEN 'gold' THEN 'serious' WHEN 'premium' THEN 'consistent' WHEN 'diamond' THEN 'achiever' ELSE from_key END,
+        to_key   = CASE to_key   WHEN 'silver' THEN 'starter' WHEN 'gold' THEN 'serious' WHEN 'premium' THEN 'consistent' WHEN 'diamond' THEN 'achiever' ELSE to_key   END
+      WHERE from_key IN ('silver','gold','premium','diamond') OR to_key IN ('silver','gold','premium','diamond')
+    `).catch(() => {}); // ignore if columns don't exist
+
+    // Step 5: Update users table room_tier references (stored by id, not key — so no change needed)
+    // Step 6: Update achievements condition JSON that references tier_key
+    await queryRunner.query(`
+      UPDATE achievements
+      SET condition = condition::text
+        ::replace('silver','starter')
+        ::replace('gold','serious')
+        ::replace('premium','consistent')
+        ::replace('diamond','achiever')
+        ::jsonb
+      WHERE condition::text ILIKE '%silver%'
+         OR condition::text ILIKE '%gold%'
+         OR condition::text ILIKE '%premium%'
+         OR condition::text ILIKE '%diamond%'
+    `).catch(() => {});
+  }
+
+  async down(queryRunner: QueryRunner): Promise<void> {
+    await queryRunner.query(`ALTER TABLE room_tiers DROP CONSTRAINT IF EXISTS room_tiers_tier_key_key`);
+    await queryRunner.query(`
+      UPDATE room_tiers SET
+        tier_key = CASE tier_key WHEN 'starter' THEN 'silver' WHEN 'serious' THEN 'gold' WHEN 'consistent' THEN 'premium' WHEN 'achiever' THEN 'diamond' ELSE tier_key END,
+        name     = CASE tier_key WHEN 'starter' THEN 'Silver' WHEN 'serious' THEN 'Gold'  WHEN 'consistent' THEN 'Premium' WHEN 'achiever' THEN 'Diamond' ELSE name END
+      WHERE tier_key IN ('starter','serious','consistent','achiever')
+    `);
+    await queryRunner.query(`ALTER TABLE room_tiers ADD CONSTRAINT room_tiers_tier_key_key UNIQUE (tier_key)`);
+  }
+}

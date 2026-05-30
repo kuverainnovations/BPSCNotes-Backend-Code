@@ -204,15 +204,15 @@ export class TierRoomsService {
   }
 
   async assignDefaultTier(userId: string) {
-    const silver = await this.db.query(
-      `SELECT id FROM room_tiers WHERE tier_key='silver' AND is_active=TRUE LIMIT 1`
+    const starter = await this.db.query(
+      `SELECT id FROM room_tiers WHERE tier_key='starter' AND is_active=TRUE LIMIT 1`
     );
-    if (!silver.length) throw new NotFoundException('Silver tier not found. Run migration.');
+    if (!starter.length) throw new NotFoundException('Silver tier not found. Run migration.');
     await this.db.query(
       `INSERT INTO user_room_tier (user_id, current_tier_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`,
-      [userId, silver[0].id]
+      [userId, starter[0].id]
     );
-    await this.db.query(`UPDATE users SET room_tier_id=$1 WHERE id=$2`, [silver[0].id, userId]);
+    await this.db.query(`UPDATE users SET room_tier_id=$1 WHERE id=$2`, [starter[0].id, userId]);
   }
 
   async adminFindAllTiers() {

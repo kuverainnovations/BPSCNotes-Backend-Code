@@ -32,7 +32,7 @@ import { AuthModule, AuthService } from '../auth/auth.module';
 // { type: "streak_days",  threshold: 7 }
 // { type: "quizzes",      threshold: 50 }
 // { type: "goals",        threshold: 10 }
-// { type: "tier_reach",   tier_key: "gold" }
+// { type: "tier_reach",   tier_key: "serious" }
 // { type: "coins",        threshold: 1000 }
 
 @Injectable()
@@ -174,7 +174,7 @@ export class AchievementsService {
   }
 
   private tierOrder(tierKey: string): number {
-    return { silver: 1, gold: 2, premium: 3, diamond: 4 }[tierKey] || 0;
+    return { starter: 1, serious: 2, consistent: 3, achiever: 4, silver: 1, gold: 2, premium: 3, diamond: 4 }[tierKey] || 0;
   }
 
   private async awardAchievement(userId: string, ach: any) {

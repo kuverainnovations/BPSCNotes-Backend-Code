@@ -75,9 +75,9 @@ export class TierNotificationsService {
   // ── Promotion notification (called by cron immediately) ───
   async notifyPromotion(userId: string, newTierKey: string, newTierName: string, newTierEmoji: string) {
     const messages: Record<string, { title: string; body: string }> = {
-      gold:    { title: `${newTierEmoji} You've reached ${newTierName}!`, body: 'Now earning 1.5× coins per study hour. Keep the streak going!' },
-      premium: { title: `${newTierEmoji} Welcome to ${newTierName}!`,    body: '2× coins, exclusive notes, and premium challenges await you.' },
-      diamond: { title: `💎 Diamond Elite — You made it!`,                body: 'Top 3% of all BPSC aspirants. 3× coins and Diamond leaderboard. Incredible!' },
+      serious:    { title: `${newTierEmoji} You've reached ${newTierName}!`,  body: 'Now earning 1.5× coins per study hour. Keep the streak going!' },
+      consistent: { title: `${newTierEmoji} Welcome to ${newTierName}!`,      body: '2× coins, exclusive notes, and consistent learner challenges await you.' },
+      achiever:   { title: `🏆 Achiever Elite — You made it!`,                body: 'Top 3% of all BPSC aspirants. 3× coins and Achiever leaderboard. Incredible!' },
     };
     const msg = messages[newTierKey] || {
       title: `${newTierEmoji} Promoted to ${newTierName}!`,
@@ -109,7 +109,7 @@ export class TierNotificationsService {
       JOIN tier_progression_rules tpr ON tpr.from_tier_id = ct.id AND tpr.is_active=TRUE
       JOIN users u ON u.id = urt.user_id
       WHERE urt.next_tier_progress < (tpr.demotion_threshold_pct / 100.0)
-        -- Only warn users in Gold+ (Silver has no demotion below it)
+        -- Only warn users in Serious+ (Starter has no demotion below it)
         AND ct.sort_order > 1
         -- Don't warn if already in grace period
         AND (urt.demotion_grace_until IS NULL OR urt.demotion_grace_until < NOW())
