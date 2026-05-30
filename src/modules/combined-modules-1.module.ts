@@ -110,10 +110,15 @@ class CurrentAffairsService {
 
   async adminCreate(data: any, adminId: string) {
     if (!data.title || !data.summary) throw new BadRequestException('Title and summary required');
+    // Store type (prelims/mains/both) as the first exam_tag for easy filtering
+    const examTagsWithType = data.examTags || [];
+    const typeTag = data.type || 'prelims';
+    // Always ensure the type is in exam_tags as first element
+    const mergedTags = [typeTag, ...examTagsWithType.filter((t: string) => !['prelims','mains','both'].includes(t))];
     const result = await this.db.query(
       `INSERT INTO current_affairs (title, summary, full_content, category, source, date, is_important, exam_tags, tags, status, author, created_by)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING *`,
-      [data.title, data.summary, data.fullContent, data.category, data.source, data.date||new Date().toISOString().split('T')[0], data.isImportant||false, data.examTags||[], data.tags||[], data.status||'draft', data.author, adminId]
+      [data.title, data.summary, data.fullContent, data.category, data.source, data.date||new Date().toISOString().split('T')[0], data.isImportant||false, mergedTags, data.tags||[], data.status||'draft', data.author, adminId]
     );
     return successResponse({ affair: result[0] }, 'Article created — live in app ✅');
   }
@@ -125,7 +130,13 @@ class CurrentAffairsService {
     for (const [key, col] of Object.entries(map)) {
       if (data[key] !== undefined) { fields.push(`${col}=$${i++}`); vals.push(data[key]); }
     }
-    if (data.examTags) { fields.push(`exam_tags=$${i++}`); vals.push(data.examTags); }
+    // Merge type into exam_tags so it persists
+    const examTagsToSave = data.examTags !== undefined ? data.examTags : undefined;
+    if (data.type || examTagsToSave !== undefined) {
+      const typeTag = data.type || 'prelims';
+      const otherTags = (examTagsToSave || []).filter((t: string) => !['prelims','mains','both'].includes(t));
+      fields.push(`exam_tags=$${i++}`); vals.push([typeTag, ...otherTags]);
+    }
     if (data.tags)     { fields.push(`tags=$${i++}`); vals.push(data.tags); }
     if (fields.length) { fields.push('updated_at=NOW()'); await this.db.query(`UPDATE current_affairs SET ${fields.join(',')} WHERE id=$${i}`, [...vals, affairId]); }
     return successResponse(null, 'Article updated — live in app ✅');
