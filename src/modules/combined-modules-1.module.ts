@@ -82,14 +82,28 @@ class CurrentAffairsService {
   }
 
   async findAllAdmin(query: any) {
-    const { page=1, limit=30, status, date } = query;
+    const { page=1, limit=20, status, date, search, category, type } = query;
     const offset = (page-1)*limit;
     const conditions = ['1=1'], params: any[] = [];
-    if (status) { conditions.push(`status=$${params.length+1}`); params.push(status); }
-    if (date)   { conditions.push(`date=$${params.length+1}`); params.push(date); }
+    if (status)   { conditions.push(`ca.status=$${params.length+1}`);          params.push(status); }
+    if (date)     { conditions.push(`ca.date=$${params.length+1}`);             params.push(date); }
+    if (category) { conditions.push(`ca.category=$${params.length+1}`);         params.push(category); }
+    if (type)     { conditions.push(`ca.type=$${params.length+1}`);             params.push(type); }
+    if (search)   { conditions.push(`ca.title ILIKE $${params.length+1}`);      params.push(`%${search}%`); }
+    const where = conditions.join(' AND ');
     const [rows, countResult] = await Promise.all([
-      this.db.query(`SELECT * FROM current_affairs WHERE ${conditions.join(' AND ')} ORDER BY date DESC, created_at DESC LIMIT $${params.length+1} OFFSET $${params.length+2}`, [...params, limit, offset]),
-      this.db.query(`SELECT COUNT(*) FROM current_affairs WHERE ${conditions.join(' AND ')}`, params),
+      this.db.query(
+        `SELECT ca.id, ca.title, ca.summary, ca.full_content, ca.category, ca.type,
+                ca.date, ca.is_important, ca.exam_tags, ca.tags, ca.status,
+                ca.view_count, ca.bookmark_count, ca.created_at,
+                (SELECT COUNT(*) FROM ca_mcqs m WHERE m.affair_id=ca.id)::int AS mcq_count
+         FROM current_affairs ca
+         WHERE ${where}
+         ORDER BY ca.date DESC, ca.created_at DESC
+         LIMIT $${params.length+1} OFFSET $${params.length+2}`,
+        [...params, limit, offset]
+      ),
+      this.db.query(`SELECT COUNT(*) FROM current_affairs ca WHERE ${where}`, params),
     ]);
     return successResponse({ affairs: rows }, 'Success', paginationMeta(parseInt(countResult[0].count), page, limit));
   }
