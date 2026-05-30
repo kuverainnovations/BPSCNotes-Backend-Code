@@ -132,7 +132,8 @@ export class AdminDashboardService {
           (SELECT COUNT(*) FROM library_notes WHERE status='published') AS notes,
           (SELECT COUNT(*) FROM quizzes WHERE status='published') AS quizzes,
           (SELECT COUNT(*) FROM current_affairs WHERE status='published') AS affairs,
-          (SELECT COUNT(*) FROM job_vacancies WHERE status='active') AS jobs
+          (SELECT COUNT(*) FROM job_vacancies WHERE status='active') AS jobs,
+          (SELECT COUNT(*) FROM study_materials WHERE status='approved') AS study_materials
       `),
       this.db.query(`SELECT COALESCE(SUM(amount),0) AS circulation FROM coin_transactions WHERE type='earned'`),
       this.db.query(`
@@ -148,7 +149,7 @@ export class AdminDashboardService {
           COUNT(DISTINCT ss.user_id) AS member_count
         FROM study_sessions ss
         WHERE ss.ended_at IS NULL
-          AND ss.last_heartbeat > NOW() - INTERVAL '3 minutes'
+          AND ss.last_heartbeat > NOW() - INTERVAL '15 minutes'
       `),
     ]);
 
@@ -176,6 +177,7 @@ export class AdminDashboardService {
   
       totalCourses:        Number(content?.[0]?.courses || 0),
       totalNotes:          Number(content?.[0]?.notes || 0),
+      totalStudyMaterials: Number(content?.[0]?.study_materials || 0),
       totalQuizzes:        Number(content?.[0]?.quizzes || 0),
       totalAffairs:        Number(content?.[0]?.affairs || 0),
       activeJobs:          Number(content?.[0]?.jobs || 0),
