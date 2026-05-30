@@ -342,12 +342,13 @@ return successResponse({
   // ═══════════════════════════════════════════════════════════
 
   async findAllAdmin(query: any) {
-    const { page = 1, limit = 20, status, type } = query;
+    const { page = 1, limit = 20, status, type, search } = query;
     const offset = (page - 1) * limit;
     const conditions = ['1=1'];
     const params: any[] = [];
     if (status) { conditions.push(`status=$${params.length + 1}`); params.push(status); }
     if (type)   { conditions.push(`type=$${params.length + 1}`);   params.push(type); }
+    if (search) { conditions.push(`title ILIKE $${params.length + 1}`); params.push(`%${search}%`); }
     const [rows, countResult] = await Promise.all([
       this.db.query(
         `SELECT q.*,

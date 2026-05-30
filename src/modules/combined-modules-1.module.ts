@@ -82,14 +82,15 @@ class CurrentAffairsService {
   }
 
   async findAllAdmin(query: any) {
-    // Note: current_affairs table has no 'type' column — filter by category only
-    const { page=1, limit=20, status, date, search, category } = query;
+    // Note: current_affairs table has no 'type' column — type is stored in exam_tags[0]
+    const { page=1, limit=20, status, date, search, category, exam } = query;
     const offset = (page-1)*limit;
     const conditions = ['1=1'], params: any[] = [];
     if (status)   { conditions.push(`ca.status=$${params.length+1}`);     params.push(status); }
     if (date)     { conditions.push(`ca.date=$${params.length+1}`);        params.push(date); }
     if (category) { conditions.push(`ca.category=$${params.length+1}`);    params.push(category); }
     if (search)   { conditions.push(`ca.title ILIKE $${params.length+1}`); params.push(`%${search}%`); }
+    if (exam)     { conditions.push(`$${params.length+1}=ANY(ca.exam_tags)`); params.push(exam); }
     const where = conditions.join(' AND ');
     const [rows, countResult] = await Promise.all([
       this.db.query(
@@ -317,13 +318,26 @@ CASE WHEN j.last_date <= NOW() + INTERVAL '3 days'
   }
 
   async findAllAdmin(query: any) {
-    const { page=1, limit=20 } = query;
+    const { page=1, limit=20, search, category, status, sort } = query;
+    const orderBy = sort === 'last_date_asc' ? 'j.last_date ASC' : sort === 'last_date_desc' ? 'j.last_date DESC' : sort === 'created_asc' ? 'j.created_at ASC' : 'j.created_at DESC';
     const offset = (page-1)*limit;
-    const [rows, countResult] = await Promise.all([
-      this.db.query(`SELECT j.*, a.name AS created_by_name FROM job_vacancies j LEFT JOIN admin_users a ON j.created_by=a.id ORDER BY j.created_at DESC LIMIT $1 OFFSET $2`, [limit, offset]),
+    const conditions: string[] = ['1=1'];
+    const params: any[] = [];
+    if (search)   { conditions.push(`(j.title ILIKE $${params.length+1} OR j.organization ILIKE $${params.length+1})`); params.push(`%${search}%`); }
+    if (category) { conditions.push(`j.category=$${params.length+1}`); params.push(category); }
+    if (status)   { conditions.push(`j.status=$${params.length+1}`); params.push(status); }
+    const where = conditions.join(' AND ');
+    const [rows, countResult, govtCount, totalAllCount] = await Promise.all([
+      this.db.query(`SELECT j.*, a.name AS created_by_name FROM job_vacancies j LEFT JOIN admin_users a ON j.created_by=a.id WHERE ${where} ORDER BY ${orderBy} LIMIT $${params.length+1} OFFSET $${params.length+2}`, [...params, limit, offset]),
+      this.db.query(`SELECT COUNT(*) FROM job_vacancies j WHERE ${where}`, params),
+      this.db.query(`SELECT COUNT(*) FROM job_vacancies WHERE category NOT IN ('Private','Part-time')`),
       this.db.query(`SELECT COUNT(*) FROM job_vacancies`),
     ]);
-    return successResponse({ jobs: rows }, 'Success', paginationMeta(parseInt(countResult[0].count), page, limit));
+    return successResponse({
+      jobs: rows,
+      govtJobsTotal: Number(govtCount[0].count),
+      totalJobsAll: Number(totalAllCount[0].count),
+    }, 'Success', paginationMeta(parseInt(countResult[0].count), page, limit));
   }
 
   async adminCreate(data: any, adminId: string) {

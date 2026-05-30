@@ -444,10 +444,15 @@ export class AdminUsersService {
     return result[0];
   }
 
-  async updateAdmin(adminId: string, data: { permissions?: string[]; status?: string }) {
+  async updateAdmin(adminId: string, data: { permissions?: string[]; status?: string; name?: string; email?: string }) {
     await this.db.query(
-      `UPDATE admin_users SET permissions=COALESCE($1,permissions), status=COALESCE($2,status), updated_at=NOW() WHERE id=$3`,
-      [data.permissions, data.status, adminId]
+      `UPDATE admin_users SET
+        permissions=COALESCE($1,permissions),
+        status=COALESCE($2,status),
+        name=COALESCE($3,name),
+        updated_at=NOW()
+       WHERE id=$4`,
+      [data.permissions||null, data.status||null, data.name||null, adminId]
     );
   }
 
