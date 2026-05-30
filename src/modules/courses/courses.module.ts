@@ -263,7 +263,7 @@ export class CoursesRepository {
     const [rows, countResult] = await Promise.all([
       this.db.query(
         `SELECT c.*, a.name AS created_by_name,
-           (SELECT COUNT(*) FROM chapters ch WHERE ch.course_id=c.id) AS total_chapters
+           (SELECT COUNT(*) FROM course_chapters ch WHERE ch.course_id=c.id) AS total_chapters
          FROM courses c
          LEFT JOIN admin_users a ON c.created_by = a.id
          WHERE ${where} ORDER BY c.created_at DESC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
