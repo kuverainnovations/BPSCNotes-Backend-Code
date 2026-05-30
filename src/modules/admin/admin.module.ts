@@ -141,7 +141,14 @@ export class AdminDashboardService {
           ROUND(AVG(score)::numeric, 1) AS avg_score
         FROM quiz_attempts WHERE attempted_at > NOW() - INTERVAL '30 days'
       `),
-      this.db.query(`SELECT COUNT(*) AS count FROM study_rooms WHERE status='active'`),
+      this.db.query(`
+        SELECT
+          COUNT(DISTINCT sr.id) AS room_count,
+          COUNT(DISTINCT ss.user_id) AS member_count
+        FROM study_rooms sr
+        LEFT JOIN study_sessions ss ON ss.room_id=sr.id AND ss.ended_at IS NULL
+        WHERE sr.status='active'
+      `),
     ]);
 
 
@@ -177,7 +184,8 @@ export class AdminDashboardService {
   
       coinCirculation:     Number(coins?.[0]?.circulation || 0),
   
-      activeStudyRooms:    Number(rooms?.[0]?.count || 0),
+      activeStudyRooms:       Number(rooms?.[0]?.room_count || 0),
+      activeMembersInRooms:   Number(rooms?.[0]?.member_count || 0),
     };
   
     await this.cache.set(cacheKey, stats, 60);

@@ -827,6 +827,14 @@ class UsersService {
     return successResponse({ liveClass: result[0] }, 'Live class scheduled — visible in app ✅');
   }
 
+  async toggleLiveClass(classId: string, isLive: boolean) {
+    await this.db.query(
+      `UPDATE live_classes SET is_live=$1, updated_at=NOW() WHERE id=$2`,
+      [isLive, classId]
+    );
+    return successResponse({ isLive }, isLive ? 'Class is now LIVE 🔴' : 'Class ended');
+  }
+
   async updateLiveClass(classId: string, data: any) {
     const fields: string[] = [], vals: any[] = [];
     let i = 1;
@@ -865,6 +873,7 @@ class AdminUsersExtraController {
   @Get('live-classes')          @RequirePermission('live-classes') getLiveClasses(@Query() q: any) { return this.s.getLiveClassesAdmin(q); }
   @Post('live-classes')         @RequirePermission('live-classes') @HttpCode(201) createLiveClass(@Body() dto: any, @Req() r: any) { return this.s.createLiveClass(dto, r.admin.id); }
   @Put('live-classes/:id')      @RequirePermission('live-classes') updateLiveClass(@Param('id', ParseUUIDPipe) id: string, @Body() dto: any) { return this.s.updateLiveClass(id, dto); }
+  @Put('live-classes/:id/toggle') @RequirePermission('live-classes') toggleLiveClass(@Param('id', ParseUUIDPipe) id: string, @Body() dto: any) { return this.s.toggleLiveClass(id, dto.isLive ?? false); }
 }
 
 @Module({ controllers:[UsersController, AdminUsersExtraController], providers:[UsersService], exports:[UsersService] })
