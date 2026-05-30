@@ -293,18 +293,27 @@ export class TierRoomsService {
   }
 
   async getLiveSessions() {
+    // Sessions are started by tier (not a specific room_id).
+    // Count active study_sessions grouped by their tier_id.
+    // A session is "active" if ended_at IS NULL AND last_heartbeat is within 3 minutes.
     const rows = await this.db.query(`
       SELECT
-        sr.id, sr.name, sr.status,
-        rt.tier_key, rt.name AS tier_name, rt.icon_emoji,
-        COUNT(DISTINCT ss.user_id)::int AS active_members,
-        MIN(ss.started_at) AS started_at
-      FROM study_rooms sr
-      LEFT JOIN room_tiers rt ON rt.id = sr.tier_id
-      LEFT JOIN study_sessions ss ON ss.room_id = sr.id AND ss.ended_at IS NULL
-      WHERE sr.status = 'active'
-      GROUP BY sr.id, sr.name, sr.status, rt.tier_key, rt.name, rt.icon_emoji
-      ORDER BY active_members DESC
+        rt.id,
+        rt.tier_key,
+        rt.name        AS tier_name,
+        rt.name        AS name,
+        rt.icon_emoji,
+        rt.color_hex,
+        COUNT(DISTINCT ss.user_id)::int                          AS active_members,
+        MIN(ss.started_at)                                       AS started_at
+      FROM room_tiers rt
+      LEFT JOIN study_sessions ss
+             ON ss.tier_id    = rt.id
+            AND ss.ended_at   IS NULL
+            AND ss.last_heartbeat > NOW() - INTERVAL '3 minutes'
+      WHERE rt.is_active = TRUE
+      GROUP BY rt.id, rt.tier_key, rt.name, rt.icon_emoji, rt.color_hex
+      ORDER BY active_members DESC, rt.sort_order ASC
     `);
     return successResponse({ sessions: rows });
   }

@@ -141,13 +141,14 @@ export class AdminDashboardService {
           ROUND(AVG(score)::numeric, 1) AS avg_score
         FROM quiz_attempts WHERE attempted_at > NOW() - INTERVAL '30 days'
       `),
+      // room_id is NULL in sessions (app doesn't pass it) — count by last_heartbeat instead
       this.db.query(`
         SELECT
-          COUNT(DISTINCT sr.id) AS room_count,
+          (SELECT COUNT(*) FROM study_rooms WHERE status='active') AS room_count,
           COUNT(DISTINCT ss.user_id) AS member_count
-        FROM study_rooms sr
-        LEFT JOIN study_sessions ss ON ss.room_id=sr.id AND ss.ended_at IS NULL
-        WHERE sr.status='active'
+        FROM study_sessions ss
+        WHERE ss.ended_at IS NULL
+          AND ss.last_heartbeat > NOW() - INTERVAL '3 minutes'
       `),
     ]);
 
