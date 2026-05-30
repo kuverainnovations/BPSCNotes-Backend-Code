@@ -1223,7 +1223,7 @@ class FlashcardsService {
     };
     // Handle back_image_url separately (camelCase from admin, snake_case from API)
     if (data.backImageUrl !== undefined || data.back_image_url !== undefined) {
-      fields.push(`\`back_image_url=$\${i++}'\'`);
+      fields.push(`back_image_url=$${i++}`);
       vals.push(data.backImageUrl ?? data.back_image_url ?? null);
     }
     for (const [key, col] of Object.entries(map)) {
