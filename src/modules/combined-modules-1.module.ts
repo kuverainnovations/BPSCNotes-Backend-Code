@@ -8,7 +8,7 @@ import { InjectDataSource } from '@nestjs/typeorm';
 import { DataSource } from 'typeorm';
 import { CACHE_MANAGER } from '@nestjs/cache-manager';
 import { Cache } from 'cache-manager';
-import { Inject } from '@nestjs/common';
+import { Inject , Optional } from '@nestjs/common';
 import { ApiTags, ApiBearerAuth } from '@nestjs/swagger';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import * as admin from 'firebase-admin';
@@ -243,10 +243,10 @@ export class CurrentAffairsModule {}
 // ════════════════════════════════════════════════════════════
 @Injectable()
 class JobsService {
-  pushToAll: any;
   constructor(
     @InjectDataSource() private readonly db: DataSource,
     @Inject(CACHE_MANAGER) private readonly cache: Cache,
+    @Inject('NOTIFICATION_SERVICE') @Optional() private readonly notifService?: { pushToAll: (title: string, body: string, data?: Record<string, string>) => Promise<void> },
   ) {}
 
   async findAll(query: any, userId: string) {
@@ -331,8 +331,8 @@ CASE WHEN j.last_date <= NOW() + INTERVAL '3 days'
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *`,
       [data.title, data.organization, data.category, data.totalPosts||0, data.notificationDate||null, data.lastDate, data.examDate||null, data.ageLimit, data.qualification, data.applicationLink, data.description, data.examTags||[], adminId]
     );
-    // 🔔 New job alert to all users
-    this.pushToAll(
+    // 🔔 New job alert to all users (only if notification service available)
+    this.notifService?.pushToAll(
       `📋 New Job: ${data.title}`,
       `${data.organization} · Last date: ${data.lastDate?.split('T')[0] || ''}`,
       { type: 'new_job', screen: 'jobs' }
