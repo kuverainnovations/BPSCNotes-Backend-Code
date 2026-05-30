@@ -82,18 +82,18 @@ class CurrentAffairsService {
   }
 
   async findAllAdmin(query: any) {
-    const { page=1, limit=20, status, date, search, category, type } = query;
+    // Note: current_affairs table has no 'type' column — filter by category only
+    const { page=1, limit=20, status, date, search, category } = query;
     const offset = (page-1)*limit;
     const conditions = ['1=1'], params: any[] = [];
-    if (status)   { conditions.push(`ca.status=$${params.length+1}`);          params.push(status); }
-    if (date)     { conditions.push(`ca.date=$${params.length+1}`);             params.push(date); }
-    if (category) { conditions.push(`ca.category=$${params.length+1}`);         params.push(category); }
-    if (type)     { conditions.push(`ca.type=$${params.length+1}`);             params.push(type); }
-    if (search)   { conditions.push(`ca.title ILIKE $${params.length+1}`);      params.push(`%${search}%`); }
+    if (status)   { conditions.push(`ca.status=$${params.length+1}`);     params.push(status); }
+    if (date)     { conditions.push(`ca.date=$${params.length+1}`);        params.push(date); }
+    if (category) { conditions.push(`ca.category=$${params.length+1}`);    params.push(category); }
+    if (search)   { conditions.push(`ca.title ILIKE $${params.length+1}`); params.push(`%${search}%`); }
     const where = conditions.join(' AND ');
     const [rows, countResult] = await Promise.all([
       this.db.query(
-        `SELECT ca.id, ca.title, ca.summary, ca.full_content, ca.category, ca.type,
+        `SELECT ca.id, ca.title, ca.summary, ca.full_content, ca.category,
                 ca.date, ca.is_important, ca.exam_tags, ca.tags, ca.status,
                 ca.view_count, ca.bookmark_count, ca.created_at,
                 (SELECT COUNT(*) FROM ca_mcqs m WHERE m.affair_id=ca.id)::int AS mcq_count
