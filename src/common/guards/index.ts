@@ -126,9 +126,10 @@ export class PermissionGuard implements CanActivate {
     if (!admin) throw new UnauthorizedException();
 
     const perms: string[] = admin.permissions || [];
-    if (perms.includes('all') || perms.includes(permission)) return true;
+    // super_admin role bypasses all permission checks
+    if (admin.role === 'super_admin' || perms.includes('all') || perms.includes(permission)) return true;
 
-    throw new ForbiddenException(`Permission required: ${permission}`);
+    throw new ForbiddenException(`Permission required: ${permission}. Ask a super admin to grant you access.`);
   }
 }
 
