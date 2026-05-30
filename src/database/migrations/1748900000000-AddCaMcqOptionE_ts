@@ -1,0 +1,25 @@
+import { MigrationInterface, QueryRunner } from 'typeorm';
+
+export class AddCaMcqOptionE1748900000000 implements MigrationInterface {
+  async up(queryRunner: QueryRunner): Promise<void> {
+    // Add option_e column
+    await queryRunner.query(`
+      ALTER TABLE ca_mcqs
+        ADD COLUMN IF NOT EXISTS option_e TEXT NOT NULL DEFAULT ''
+    `);
+    // Widen the correct CHECK constraint to allow 'e'
+    await queryRunner.query(`
+      ALTER TABLE ca_mcqs DROP CONSTRAINT IF EXISTS ca_mcqs_correct_check
+    `);
+    await queryRunner.query(`
+      ALTER TABLE ca_mcqs
+        ADD CONSTRAINT ca_mcqs_correct_check CHECK (correct IN ('a','b','c','d','e'))
+    `);
+  }
+
+  async down(queryRunner: QueryRunner): Promise<void> {
+    await queryRunner.query(`ALTER TABLE ca_mcqs DROP COLUMN IF EXISTS option_e`);
+    await queryRunner.query(`ALTER TABLE ca_mcqs DROP CONSTRAINT IF EXISTS ca_mcqs_correct_check`);
+    await queryRunner.query(`ALTER TABLE ca_mcqs ADD CONSTRAINT ca_mcqs_correct_check CHECK (correct IN ('a','b','c','d'))`);
+  }
+}

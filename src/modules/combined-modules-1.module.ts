@@ -158,7 +158,8 @@ class CurrentAffairsService {
         option_b     TEXT NOT NULL,
         option_c     TEXT NOT NULL,
         option_d     TEXT NOT NULL,
-        correct      CHAR(1) NOT NULL CHECK (correct IN ('a','b','c','d')),
+        correct      CHAR(1) NOT NULL CHECK (correct IN ('a','b','c','d','e')),
+        option_e     TEXT NOT NULL DEFAULT '',
         explanation  TEXT,
         difficulty   VARCHAR(10) DEFAULT 'medium',
         created_at   TIMESTAMPTZ DEFAULT NOW()
@@ -177,13 +178,14 @@ class CurrentAffairsService {
 
   async addMcq(affairId: string, data: any) {
     await this.ensureCaMcqTable();
-    if (!data.question || !data.optionA || !data.optionB || !data.optionC || !data.optionD || !data.correct) {
-      throw new BadRequestException('question, optionA-D and correct are required');
+    if (!data.question || !data.optionA || !data.optionB || !data.correct) {
+      throw new BadRequestException('question, optionA, optionB and correct are required');
     }
     const row = await this.db.query(
-      `INSERT INTO ca_mcqs (affair_id, question, option_a, option_b, option_c, option_d, correct, explanation)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
-      [affairId, data.question, data.optionA, data.optionB, data.optionC, data.optionD,
+      `INSERT INTO ca_mcqs (affair_id, question, option_a, option_b, option_c, option_d, option_e, correct, explanation)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
+      [affairId, data.question, data.optionA||'', data.optionB||'', data.optionC||'',
+       data.optionD||'', data.optionE||'',
        data.correct.toLowerCase(), data.explanation || '']
     );
     return successResponse({ mcq: row[0] }, 'MCQ added ✅');
@@ -194,7 +196,7 @@ class CurrentAffairsService {
     const fields: string[] = [], vals: any[] = [];
     let i = 1;
     const map: any = { question:'question', optionA:'option_a', optionB:'option_b',
-      optionC:'option_c', optionD:'option_d', correct:'correct',
+      optionC:'option_c', optionD:'option_d', optionE:'option_e', correct:'correct',
       explanation:'explanation' };
     for (const [k, col] of Object.entries(map)) {
       if (data[k] !== undefined) { fields.push(`${col}=$${i++}`); vals.push(data[k]); }
