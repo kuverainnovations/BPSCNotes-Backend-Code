@@ -311,33 +311,13 @@ const percentile = Number(
   (((totalAttempts - rank) / totalAttempts) * 100).toFixed(2)
 );
 // 🔔 First-time pass notification
-    // if (isPassed && !prevPass && coinsEarned > 0) {
-      console.log('🔥 Sending quiz push befor if', {
-        isPassed,
-        prevPass,
-        coinsEarned,
-      });
-      if (isPassed) {
-        console.log('🔥 Sending quiz push after if', {
-          isPassed,
-          prevPass,
-          coinsEarned,
-        });
-        try {
-          console.log('🔥 BEFORE PUSH');
-        
-          const result = await this.notifService.pushToUser(
-            userId,
-            '🎉 Quiz Passed!',
-            `You scored ${score}% on "${q.title}" · 🪙 +${coinsEarned} coins!`,
-            { type: 'quiz_result', quizId, screen: 'quiz_list' }
-          );
-        
-          console.log('✅ PUSH SUCCESS', result);
-        } catch (e) {
-          console.error('❌ PUSH FAILED', e);
-        }
-      
+    if (isPassed && !prevPass && coinsEarned > 0) {
+      this.notifService.pushToUser(
+        userId,
+        '🎉 Quiz Passed!',
+        `You scored ${score}% on "${q.title}" · 🪙 +${coinsEarned} coins!`,
+        { type: 'quiz_result', quizId, screen: 'quiz_list' }
+      ).catch(() => {});
     }
 
 return successResponse({
@@ -456,17 +436,45 @@ return successResponse({
       throw new BadRequestException('Provide at least one question');
     }
 
-    // Validate each question
+    // Validate each question — supports 2-5 options (admin can choose)
     for (const q of questions) {
       if (!q.question && !q.questionText) throw new BadRequestException('Each question needs a question_text');
-      // For image-type options, text options can be empty (images are the content)
+
       const opType = q.optionType || q.option_type || 'text';
+
       if (opType === 'text') {
-        if (!q.optionA || !q.optionB || !q.optionC || !q.optionD) throw new BadRequestException('Each question needs 4 options (optionA-D)');
+        // Build options array from either:
+        //   (a) options[] array sent by new admin UI
+        //   (b) legacy optionA/optionB/optionC/optionD keys
+        const optsFromArray  = Array.isArray(q.options) ? q.options.filter((o: any) => typeof o === 'string' && o.trim()) : [];
+        const optsFromLegacy = [q.optionA, q.optionB, q.optionC, q.optionD, q.optionE].filter((o: any) => typeof o === 'string' && o.trim());
+        const effectiveOpts  = optsFromArray.length >= 2 ? optsFromArray : optsFromLegacy;
+
+        if (effectiveOpts.length < 2) {
+          throw new BadRequestException('Each question needs at least 2 options');
+        }
+        if (effectiveOpts.length > 5) {
+          throw new BadRequestException('Maximum 5 options allowed per question');
+        }
+
+        // Normalise: fill optionA-E from the array so the INSERT can use them uniformly
+        const LABELS = ['A','B','C','D','E'];
+        LABELS.forEach((l, i) => {
+          (q as any)[`option${l}`] = effectiveOpts[i]?.trim() || null;
+        });
       } else if (opType === 'image') {
-        if (!q.optionAImage && !q.option_a_image) throw new BadRequestException('Image options require option images (optionAImage-D)');
+        if (!q.optionAImage && !q.option_a_image) throw new BadRequestException('Image options require option images');
       }
-      if (!['a','b','c','d'].includes(q.correctOption?.toLowerCase())) throw new BadRequestException(`correctOption must be a, b, c or d. Got: ${q.correctOption}`);
+
+      // correctOption: accept either letter ('a'-'e') or number index (0-4)
+      let co = q.correctOption;
+      if (typeof co === 'number') {
+        co = ['a','b','c','d','e'][co];
+      }
+      if (!co || !['a','b','c','d','e'].includes(String(co).toLowerCase())) {
+        throw new BadRequestException(`correctOption must be a-e or 0-4. Got: ${q.correctOption}`);
+      }
+      q.correctOption = String(co).toLowerCase();
     }
 
     // Get current max sort_order
@@ -488,11 +496,14 @@ return successResponse({
         [
           quizId,
           (q.question || q.questionText).trim(),
-          q.optionA?.trim() || '', q.optionB?.trim() || '', q.optionC?.trim() || '', q.optionD?.trim() || '',
+          q.optionA?.trim() || null,
+          q.optionB?.trim() || null,
+          q.optionC?.trim() || null,
+          q.optionD?.trim() || null,
           q.correctOption.toLowerCase(),
           q.explanation?.trim() || null,
           q.subject?.trim() || null,
-          q.difficulty || 'medium',
+          null, // difficulty removed
           sortOrder++,
           questionType,
           q.questionImageUrl || q.question_image_url || null,
