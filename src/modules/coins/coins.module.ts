@@ -1,6 +1,6 @@
 import {
   Module, Injectable, Controller,
-  Get, Post, Body, Param, Query, Req,OnModuleInit,
+  Get, Post, Put, Delete, Body, Param, Query, Req, OnModuleInit,
   UseGuards, HttpCode, HttpStatus,
   NotFoundException, BadRequestException, Logger,
 } from '@nestjs/common';
@@ -609,23 +609,48 @@ export class AdminCoinsService {
   }
 
   async getRules() {
-    // Return the static task catalogue + per-task claim counts (last 7 days)
-    const taskStats = await this.db.query(`
-      SELECT action, COUNT(*)::int AS claims_7d, COALESCE(SUM(amount), 0)::int AS coins_7d
-      FROM coin_transactions
-      WHERE created_at >= NOW() - INTERVAL '7 days' AND type = 'earned'
-      GROUP BY action
+    const dbRules = await this.db.query(`
+      SELECT cr.*, (SELECT COALESCE(SUM(amount),0)::int FROM coin_transactions WHERE action=cr.action AND type='earned' AND created_at>=NOW()-INTERVAL '7 days') AS coins_7d,
+             (SELECT COUNT(*)::int FROM coin_transactions WHERE action=cr.action AND created_at>=NOW()-INTERVAL '7 days') AS claims_7d
+      FROM coin_rules cr ORDER BY created_at
     `);
-    const statsMap: Record<string, any> = {};
-    taskStats.forEach((r: any) => { statsMap[r.action] = r; });
+    return successResponse({ rules: dbRules });
+  }
 
-    const rules = EARN_TASKS.map(t => ({
-      ...t,
-      claimsLast7d: statsMap[t.action]?.claims_7d ?? 0,
-      coinsLast7d: statsMap[t.action]?.coins_7d ?? 0,
-    }));
+  async createRule(data: any) {
+    const { action, description, coinsAwarded, maxPerDay, isActive } = data;
+    if (!action || !description) throw new BadRequestException('action and description are required');
+    const [existing] = await this.db.query(`SELECT id FROM coin_rules WHERE action=$1`, [action]);
+    if (existing) {
+      await this.db.query(
+        `UPDATE coin_rules SET description=$1, coins_awarded=$2, max_per_day=$3, is_active=$4, updated_at=NOW() WHERE action=$5`,
+        [description, coinsAwarded ?? 5, maxPerDay ?? 1, isActive !== false, action]
+      );
+    } else {
+      await this.db.query(
+        `INSERT INTO coin_rules (action, description, coins_awarded, max_per_day, is_active) VALUES ($1,$2,$3,$4,$5)`,
+        [action, description, coinsAwarded ?? 5, maxPerDay ?? 1, isActive !== false]
+      );
+    }
+    return successResponse(null, 'Rule saved ✅');
+  }
 
-    return successResponse({ rules });
+  async updateRule(ruleId: string, data: any) {
+    const fields: string[] = []; const vals: any[] = []; let i = 1;
+    if (data.description   !== undefined) { fields.push(`description=$${i++}`);   vals.push(data.description); }
+    if (data.coinsAwarded  !== undefined) { fields.push(`coins_awarded=$${i++}`); vals.push(data.coinsAwarded); }
+    if (data.maxPerDay     !== undefined) { fields.push(`max_per_day=$${i++}`);   vals.push(data.maxPerDay); }
+    if (data.isActive      !== undefined) { fields.push(`is_active=$${i++}`);     vals.push(data.isActive); }
+    if (fields.length) {
+      fields.push('updated_at=NOW()');
+      await this.db.query(`UPDATE coin_rules SET ${fields.join(',')} WHERE id=$${i}`, [...vals, ruleId]);
+    }
+    return successResponse(null, 'Rule updated ✅');
+  }
+
+  async deleteRule(ruleId: string) {
+    await this.db.query(`DELETE FROM coin_rules WHERE id=$1`, [ruleId]);
+    return successResponse(null, 'Rule deleted');
   }
 }
 
@@ -638,12 +663,21 @@ export class AdminCoinsController {
   getStats() { return this.svc.getStats(); }
 
   @Get('top-earners')
-  getTopEarners(@Query('limit') limit = 20) {
-    return this.svc.getTopEarners(+limit);
-  }
+  getTopEarners(@Query('limit') limit = 20) { return this.svc.getTopEarners(+limit); }
 
   @Get('rules')
   getRules() { return this.svc.getRules(); }
+
+  @Post('rules')
+  @HttpCode(HttpStatus.CREATED)
+  createRule(@Body() dto: any) { return this.svc.createRule(dto); }
+
+  @Put('rules/:id')
+  updateRule(@Param('id') id: string, @Body() dto: any) { return this.svc.updateRule(id, dto); }
+
+  @Delete('rules/:id')
+  @HttpCode(HttpStatus.OK)
+  deleteRule(@Param('id') id: string) { return this.svc.deleteRule(id); }
 }
 
 @Module({

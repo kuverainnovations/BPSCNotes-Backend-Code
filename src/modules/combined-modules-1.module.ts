@@ -711,11 +711,14 @@ class SubscriptionsService {
   async updateCoupon(couponId: string, data: any) {
     const fields: string[] = [], vals: any[] = [];
     let i = 1;
-    ['is_active','max_uses','expires_at','value'].forEach(col => {
-      const key = col.replace(/_([a-z])/g, g => g[1].toUpperCase());
-      if (data[key] !== undefined || data[col] !== undefined) { fields.push(`${col}=$${i++}`); vals.push(data[key] ?? data[col]); }
-    });
-    if (data.isActive !== undefined) { fields.push(`is_active=$${i++}`); vals.push(data.isActive); }
+    // Map camelCase → snake_case columns (handles isActive→is_active automatically)
+    const colMap: Record<string, string> = {
+      isActive: 'is_active', maxUses: 'max_uses', expiresAt: 'expires_at', value: 'value'
+    };
+    for (const [camel, snake] of Object.entries(colMap)) {
+      const val = data[camel] !== undefined ? data[camel] : data[snake];
+      if (val !== undefined) { fields.push(`${snake}=$${i++}`); vals.push(val); }
+    }
     if (fields.length) { fields.push('updated_at=NOW()'); await this.db.query(`UPDATE coupons SET ${fields.join(',')} WHERE id=$${i}`, [...vals, couponId]); }
     return successResponse(null, 'Coupon updated ✅');
   }
