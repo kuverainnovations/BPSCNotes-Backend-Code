@@ -1135,7 +1135,6 @@ class FlashcardsService {
          f.back      AS answer,
          COALESCE(f.hint,'')    AS hint,
          COALESCE(f.example,'') AS example,
-         f.difficulty,
          COALESCE(f.card_type,'text') AS card_type,
          f.image_url,
          f.back_image_url,
@@ -1178,14 +1177,13 @@ class FlashcardsService {
     const backImageUrl = data.backImageUrl || data.back_image_url || null;
     const result = await this.db.query(
       `INSERT INTO flashcards
-         (front, back, subject, exam_tags, difficulty, card_type, image_url, back_image_url, topic, hint, example, created_by)
+         (front, back, subject, exam_tags, card_type, image_url, back_image_url, topic, hint, example, created_by)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING *`,
       [
         front, back,
         data.subject || 'General',
         data.examTags || data.exam_tags || [],
-        data.difficulty || 'medium',
-        cardType,
+                cardType,
         imageUrl,
         backImageUrl,
         data.topic || data.subject || 'General',
@@ -1205,7 +1203,7 @@ class FlashcardsService {
     let i = 1;
     const map: any = {
       front: 'front', back: 'back', question: 'front', answer: 'back',
-      subject: 'subject', difficulty: 'difficulty', isActive: 'is_active',
+      subject: 'subject', isActive: 'is_active',
       topic: 'topic', hint: 'hint', example: 'example',
     };
     // Handle back_image_url separately (camelCase from admin, snake_case from API)

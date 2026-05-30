@@ -156,10 +156,10 @@ class CurrentAffairsService {
       throw new BadRequestException('question, optionA-D and correct are required');
     }
     const row = await this.db.query(
-      `INSERT INTO ca_mcqs (affair_id, question, option_a, option_b, option_c, option_d, correct, explanation, difficulty)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
+      `INSERT INTO ca_mcqs (affair_id, question, option_a, option_b, option_c, option_d, correct, explanation)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
       [affairId, data.question, data.optionA, data.optionB, data.optionC, data.optionD,
-       data.correct.toLowerCase(), data.explanation || '', data.difficulty || 'medium']
+       data.correct.toLowerCase(), data.explanation || '']
     );
     return successResponse({ mcq: row[0] }, 'MCQ added ✅');
   }
@@ -170,7 +170,7 @@ class CurrentAffairsService {
     let i = 1;
     const map: any = { question:'question', optionA:'option_a', optionB:'option_b',
       optionC:'option_c', optionD:'option_d', correct:'correct',
-      explanation:'explanation', difficulty:'difficulty' };
+      explanation:'explanation' };
     for (const [k, col] of Object.entries(map)) {
       if (data[k] !== undefined) { fields.push(`${col}=$${i++}`); vals.push(data[k]); }
     }
