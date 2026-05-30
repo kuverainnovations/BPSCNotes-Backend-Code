@@ -413,7 +413,7 @@ return successResponse({
 
     const questions = await this.db.query(
       `SELECT id, question_text, option_a, option_b, option_c, option_d,
-       explanation,
+       correct_option, explanation,
        question_type, question_image_url, option_type,
        option_a_image, option_b_image, option_c_image, option_d_image,
        subject, sort_order
