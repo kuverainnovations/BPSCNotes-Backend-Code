@@ -46,7 +46,7 @@ class QuizzesService {
     const [rows, countResult] = await Promise.all([
       this.db.query(
         `SELECT
-           q.id, q.title, q.description, q.subject, q.type, q.difficulty,
+           q.id, q.title, q.description, q.subject, q.type,
            q.total_questions, q.duration_mins, q.passing_score, q.coins_reward,
            q.exam_tags, q.scheduled_for, q.attempt_count, q.avg_score, q.status,
            -- is_attempted: true/false boolean (not a JSON object)
@@ -86,7 +86,7 @@ class QuizzesService {
     }
 
     const quiz = await this.db.query(
-      `SELECT id, title, description, subject, type, difficulty,
+      `SELECT id, title, description, subject, type,
               total_questions, duration_mins, passing_score, coins_reward,
               exam_tags, scheduled_for, attempt_count, avg_score, status
        FROM quizzes WHERE id=$1 AND status='published'`,
@@ -144,7 +144,7 @@ if (q.scheduled_for) {
        explanation,
        question_type, question_image_url, option_type,
        option_a_image, option_b_image, option_c_image, option_d_image,
-       subject, difficulty, sort_order,
+       subject, sort_order,
               COALESCE(question_type, 'text')   AS question_type,
               question_image_url,
               COALESCE(option_type, 'text')     AS option_type,
@@ -368,13 +368,13 @@ return successResponse({
     if (!data.title || !data.subject) throw new BadRequestException('Title and subject required');
     const result = await this.db.query(
       `INSERT INTO quizzes
-         (title, description, subject, type, difficulty, total_questions,
+         (title, description, subject, type, total_questions,
           duration_mins, passing_score, coins_reward, exam_tags, scheduled_for, status, created_by)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
        RETURNING *`,
       [
         data.title, data.description || null, data.subject,
-        data.type || 'daily', data.difficulty || 'medium',
+        data.type || 'daily',
         0,  // total_questions set after questions are added
         data.durationMins || 15, data.passingScore || 60,
         data.coinsReward || 10, data.examTags || [],
@@ -392,7 +392,7 @@ return successResponse({
     let i = 1;
     const map: any = {
       title: 'title', description: 'description', subject: 'subject',
-      type: 'type', difficulty: 'difficulty', durationMins: 'duration_mins',
+      type: 'type', durationMins: 'duration_mins',
       passingScore: 'passing_score', coinsReward: 'coins_reward',
       status: 'status', scheduledFor: 'scheduled_for', examTags: 'exam_tags',
     };
@@ -416,7 +416,7 @@ return successResponse({
        explanation,
        question_type, question_image_url, option_type,
        option_a_image, option_b_image, option_c_image, option_d_image,
-       subject, difficulty, sort_order
+       subject, sort_order
        FROM quiz_questions WHERE quiz_id=$1 ORDER BY sort_order ASC`,
       [quizId]
     );
@@ -453,26 +453,27 @@ return successResponse({
         if (effectiveOpts.length < 2) {
           throw new BadRequestException('Each question needs at least 2 options');
         }
-        if (effectiveOpts.length > 5) {
-          throw new BadRequestException('Maximum 5 options allowed per question');
+        if (effectiveOpts.length > 4) {
+          throw new BadRequestException('Maximum 4 options allowed per question (DB schema limit)');
         }
 
-        // Normalise: fill optionA-E from the array so the INSERT can use them uniformly
-        const LABELS = ['A','B','C','D','E'];
+        // Normalise: fill optionA-D from the array
+        const LABELS = ['A','B','C','D'];
         LABELS.forEach((l, i) => {
-          (q as any)[`option${l}`] = effectiveOpts[i]?.trim() || null;
+          (q as any)[`option${l}`] = effectiveOpts[i]?.trim() || '';  // empty string for missing options
         });
       } else if (opType === 'image') {
         if (!q.optionAImage && !q.option_a_image) throw new BadRequestException('Image options require option images');
       }
 
-      // correctOption: accept either letter ('a'-'e') or number index (0-4)
+      // correctOption: accept letter ('a'-'d') or number index (0-3)
+      // DB schema uses CHAR(1) CHECK IN ('a','b','c','d') — max 4 options
       let co = q.correctOption;
       if (typeof co === 'number') {
-        co = ['a','b','c','d','e'][co];
+        co = ['a','b','c','d'][Math.min(co, 3)]; // cap at d
       }
-      if (!co || !['a','b','c','d','e'].includes(String(co).toLowerCase())) {
-        throw new BadRequestException(`correctOption must be a-e or 0-4. Got: ${q.correctOption}`);
+      if (!co || !['a','b','c','d'].includes(String(co).toLowerCase())) {
+        throw new BadRequestException(`correctOption must be a-d or 0-3. Got: ${q.correctOption}`);
       }
       q.correctOption = String(co).toLowerCase();
     }
@@ -488,22 +489,21 @@ return successResponse({
       const result = await this.db.query(
         `INSERT INTO quiz_questions
            (quiz_id, question_text, option_a, option_b, option_c, option_d,
-            correct_option, explanation, subject, difficulty, sort_order,
+            correct_option, explanation, subject, sort_order,
             question_type, question_image_url, option_type,
             option_a_image, option_b_image, option_c_image, option_d_image)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
          RETURNING id, question_text, sort_order, question_type, option_type`,
         [
           quizId,
           (q.question || q.questionText).trim(),
-          q.optionA?.trim() || null,
-          q.optionB?.trim() || null,
-          q.optionC?.trim() || null,
-          q.optionD?.trim() || null,
+          q.optionA?.trim() || '',   // NOT NULL in schema
+          q.optionB?.trim() || '',   // NOT NULL in schema
+          q.optionC?.trim() || '',   // empty string = no option C (client hides if empty)
+          q.optionD?.trim() || '',   // empty string = no option D
           q.correctOption.toLowerCase(),
           q.explanation?.trim() || null,
           q.subject?.trim() || null,
-          null, // difficulty removed
           sortOrder++,
           questionType,
           q.questionImageUrl || q.question_image_url || null,
@@ -551,7 +551,7 @@ return successResponse({
       correctOption: 'correct_option',
       explanation:  'explanation',
       subject:      'subject',
-      difficulty:   'difficulty',
+      // difficulty removed — not required by client
       sortOrder:    'sort_order',
     };
     for (const [key, col] of Object.entries(map)) {
