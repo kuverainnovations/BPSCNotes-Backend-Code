@@ -813,32 +813,38 @@ class UsersService {
 
   async getLiveClassesAdmin(query: any) {
     const rows = await this.db.query(
-      `SELECT lc.*, (SELECT COUNT(*) FROM live_class_registrations WHERE live_class_id=lc.id) AS registered_count FROM live_classes lc ORDER BY lc.scheduled_at DESC`
+      `SELECT lc.*,
+              lc.status = 'live' AS is_live,
+              lc.meeting_link AS meet_url,
+              (SELECT COUNT(*) FROM live_class_registrations WHERE live_class_id=lc.id) AS registered_count
+       FROM live_classes lc ORDER BY lc.scheduled_at DESC`
     );
     return successResponse({ liveClasses: rows });
   }
 
   async createLiveClass(data: any, adminId: string) {
-    if (!data.title || !data.scheduledAt) throw new BadRequestException('Title and scheduled time required');
+    if (!data.title || !data.instructor) throw new BadRequestException('Title and instructor required');
     const result = await this.db.query(
       `INSERT INTO live_classes (title, instructor, subject, description, meeting_link, scheduled_at, duration_mins, exam_tags, created_by) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
-      [data.title, data.instructor, data.subject, data.description, data.meetingLink, data.scheduledAt, data.durationMins||60, data.examTags||[], adminId]
+      [data.title, data.instructor, data.subject, data.description, data.meetUrl || data.meetingLink || null, data.scheduledAt, data.durationMins||60, data.examTags||[], adminId]
     );
     return successResponse({ liveClass: result[0] }, 'Live class scheduled — visible in app ✅');
   }
 
   async toggleLiveClass(classId: string, isLive: boolean) {
-    await this.db.query(
-      `UPDATE live_classes SET is_live=$1, updated_at=NOW() WHERE id=$2`,
-      [isLive, classId]
+    const newStatus = isLive ? 'live' : 'ended';
+    const result = await this.db.query(
+      `UPDATE live_classes SET status=$1, updated_at=NOW() WHERE id=$2 RETURNING *`,
+      [newStatus, classId]
     );
-    return successResponse({ isLive }, isLive ? 'Class is now LIVE 🔴' : 'Class ended');
+    if (!result.length) throw new NotFoundException('Live class not found');
+    return successResponse({ status: newStatus, isLive }, isLive ? 'Class is now LIVE 🔴' : 'Class ended ⏹');
   }
 
   async updateLiveClass(classId: string, data: any) {
     const fields: string[] = [], vals: any[] = [];
     let i = 1;
-    const map: any = { title:'title', instructor:'instructor', scheduledAt:'scheduled_at', durationMins:'duration_mins', status:'status', meetingLink:'meeting_link' };
+    const map: any = { title:'title', instructor:'instructor', subject:'subject', description:'description', scheduledAt:'scheduled_at', durationMins:'duration_mins', status:'status', meetingLink:'meeting_link', meetUrl:'meeting_link' };
     for (const [key, col] of Object.entries(map)) {
       if (data[key] !== undefined) { fields.push(`${col}=$${i++}`); vals.push(data[key]); }
     }

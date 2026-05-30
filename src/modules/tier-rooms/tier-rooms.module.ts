@@ -292,6 +292,23 @@ export class TierRoomsService {
     return successResponse(null, `User promoted to ${targetTierKey}`);
   }
 
+  async getLiveSessions() {
+    const rows = await this.db.query(`
+      SELECT
+        sr.id, sr.name, sr.status,
+        rt.tier_key, rt.name AS tier_name, rt.icon_emoji,
+        COUNT(DISTINCT ss.user_id)::int AS active_members,
+        MIN(ss.started_at) AS started_at
+      FROM study_rooms sr
+      LEFT JOIN room_tiers rt ON rt.id = sr.tier_id
+      LEFT JOIN study_sessions ss ON ss.room_id = sr.id AND ss.ended_at IS NULL
+      WHERE sr.status = 'active'
+      GROUP BY sr.id, sr.name, sr.status, rt.tier_key, rt.name, rt.icon_emoji
+      ORDER BY active_members DESC
+    `);
+    return successResponse({ sessions: rows });
+  }
+
   async adminTierDistribution() {
     const rows = await this.db.query(`
       SELECT t.tier_key, t.name, t.icon_emoji, t.color_hex,
@@ -1056,6 +1073,7 @@ export class AdminTierRoomsController {
   ) {}
 
   @Get()                 @RequirePermission('study-rooms') findAll()            { return this.tiersService.adminFindAllTiers(); }
+  @Get('live-sessions')  @RequirePermission('study-rooms') liveSessions()       { return this.tiersService.getLiveSessions(); }
   @Get('distribution')   @RequirePermission('study-rooms') distribution()       { return this.tiersService.adminTierDistribution(); }
   @Get('rules')          @RequirePermission('study-rooms') getRules()           { return this.tiersService.adminGetRules(); }
   @Put(':id')            @RequirePermission('study-rooms') updateTier(@Param('id',ParseUUIDPipe) id: string, @Body() dto: any) { return this.tiersService.adminUpdateTier(id, dto); }
