@@ -769,14 +769,7 @@ SET
 
   // ── Save / Wishlist ──────────────────────────────────────────
   async toggleSave(courseId: string, userId: string) {
-    const existing = await this.db.query(
-      `SELECT user_id FROM course_saves WHERE user_id=$1 AND course_id=$2`,
-      [userId, courseId]
-    );
-    if (existing.length) {
-      await this.db.query(`DELETE FROM course_saves WHERE user_id=$1 AND course_id=$2`, [userId, courseId]);
-      return successResponse({ isSaved: false }, 'Removed from saved');
-    }
+    // Ensure table exists FIRST — before any query touches it
     await this.db.query(`
       CREATE TABLE IF NOT EXISTS course_saves (
         user_id   UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -785,6 +778,14 @@ SET
         PRIMARY KEY (user_id, course_id)
       )
     `);
+    const existing = await this.db.query(
+      `SELECT user_id FROM course_saves WHERE user_id=$1 AND course_id=$2`,
+      [userId, courseId]
+    );
+    if (existing.length) {
+      await this.db.query(`DELETE FROM course_saves WHERE user_id=$1 AND course_id=$2`, [userId, courseId]);
+      return successResponse({ isSaved: false }, 'Removed from saved');
+    }
     await this.db.query(
       `INSERT INTO course_saves (user_id, course_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`,
       [userId, courseId]
@@ -793,6 +794,14 @@ SET
   }
 
   async getSavedCourses(userId: string) {
+    await this.db.query(`
+      CREATE TABLE IF NOT EXISTS course_saves (
+        user_id   UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        course_id UUID NOT NULL REFERENCES courses(id) ON DELETE CASCADE,
+        saved_at  TIMESTAMPTZ DEFAULT NOW(),
+        PRIMARY KEY (user_id, course_id)
+      )
+    `);
     const rows = await this.db.query(`
       SELECT c.*,
         COALESCE(e.completed_lessons,0)  AS completed_lessons_count,
