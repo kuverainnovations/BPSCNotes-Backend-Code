@@ -180,14 +180,13 @@ export class TierRoomsService {
     return successResponse({ members }, 'Success', paginationMeta(+countResult[0].count, +page, +limit));
   }
 
-  // ── ONLY THIS METHOD CHANGED — everything else above/below is identical ──
   async getLeaderboard(tierKey: string, period: string = 'weekly') {
     const periodKey = this.getCurrentPeriodKey(period);
     const cacheKey  = `leaderboard:${tierKey}:${period}:${periodKey}`;
     const cached    = await this.cache.get(cacheKey);
     if (cached) return cached;
 
-    // 1. Try pre-computed snapshot first (populated by weekly/monthly cron)
+    // Try snapshot table first
     const snapshot = await this.db.query(`
       SELECT rl.rank_position, rl.study_minutes, rl.coins_earned, rl.xp_earned,
              COALESCE(rl.goals_completed, 0) AS goals_completed, rl.streak_days,
@@ -200,36 +199,38 @@ export class TierRoomsService {
       LIMIT 100
     `, [tierKey, period, periodKey]);
 
+    // Snapshot exists — return it
     if (snapshot.length > 0) {
       const result = successResponse({ leaderboard: snapshot, period, periodKey });
       await this.cache.set(cacheKey, result, 300);
       return result;
     }
 
-    // 2. Snapshot empty (cron hasn't run yet, or alltime which has no cron):
-    //    compute live directly from study_sessions
+    // ── Snapshot is empty: compute live from study_sessions ──
     const tier = await this.db.query(
       `SELECT id FROM room_tiers WHERE tier_key=$1 AND is_active=TRUE LIMIT 1`,
       [tierKey]
     );
     if (!tier.length) return successResponse({ leaderboard: [], period, periodKey });
 
-    const params: any[] = [tier[0].id];
+    // Build date range for the period
+    const now = new Date();
     let dateFilter = '';
+    const params: any[] = [tier[0].id];
     if (period === 'weekly') {
-      params.push(new Date(Date.now() - 7 * 86400000).toISOString());
-      dateFilter = 'AND ss.started_at >= $2';
+      const weekAgo = new Date(now.getTime() - 7 * 86400000);
+      params.push(weekAgo.toISOString());
+      dateFilter = `AND ss.started_at >= $2`;
     } else if (period === 'monthly') {
-      const m = new Date(); m.setDate(1); m.setHours(0, 0, 0, 0);
-      params.push(m.toISOString());
-      dateFilter = 'AND ss.started_at >= $2';
+      const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+      params.push(monthStart.toISOString());
+      dateFilter = `AND ss.started_at >= $2`;
     }
-    // alltime: no date filter, params stays [tier[0].id]
+    // alltime: no date filter
 
     const live = await this.db.query(`
       SELECT
-        ROW_NUMBER() OVER (ORDER BY COALESCE(SUM(ss.active_minutes),0) DESC,
-                                    COALESCE(SUM(ss.coins_earned),0) DESC) AS rank_position,
+        ROW_NUMBER() OVER (ORDER BY COALESCE(SUM(ss.active_minutes),0) DESC, COALESCE(SUM(ss.coins_earned),0) DESC)::int AS rank_position,
         COALESCE(SUM(ss.active_minutes),0)::int  AS study_minutes,
         COALESCE(SUM(ss.coins_earned),0)::int    AS coins_earned,
         COALESCE(SUM(ss.xp_earned),0)::int       AS xp_earned,
@@ -250,7 +251,7 @@ export class TierRoomsService {
     `, params);
 
     const result = successResponse({ leaderboard: live, period, periodKey });
-    await this.cache.set(cacheKey, result, 60); // shorter TTL for live data
+    await this.cache.set(cacheKey, result, 60); // shorter cache for live data
     return result;
   }
 
@@ -344,6 +345,9 @@ export class TierRoomsService {
   }
 
   async getLiveSessions() {
+    // Sessions are started by tier (not a specific room_id).
+    // Count active study_sessions grouped by their tier_id.
+    // A session is "active" if ended_at IS NULL AND last_heartbeat is within 3 minutes.
     const rows = await this.db.query(`
       SELECT
         rt.id,
@@ -378,6 +382,9 @@ export class TierRoomsService {
     return successResponse({ distribution: rows });
   }
 
+  // ── GET "at risk" demotion status for calling user ──────────
+  // Returns: { isAtRisk, progress, threshold, tierKey, graceUntil }
+  // Called by Android on app resume to show the warning banner.
   async getAtRiskStatus(userId: string) {
     const rows = await this.db.query(`
       SELECT
@@ -445,6 +452,7 @@ export class StudySessionsService {
   ) {}
 
   async startSession(userId: string, roomId?: string, mode: string = 'study') {
+    // ── Anti-cheat: session start checks ──────────────────
     const startCheck = await this.antiCheat.checkSessionStart(userId);
     if (startCheck.result === 'BLOCK') {
       throw new BadRequestException(startCheck.reason || 'Session blocked');
@@ -464,6 +472,7 @@ export class StudySessionsService {
     const validModes = ['study','pomodoro','silent'];
     const sessionMode = validModes.includes(mode) ? mode : 'study';
 
+    // ── Anti-cheat: block session velocity + concurrent session abuse ──
     const acStart = await this.antiCheat.checkSessionStart(userId);
     if (acStart.result === 'BLOCK') {
       throw new BadRequestException(`Session blocked: ${acStart.reason}. ${acStart.details?.message || ''}`);
@@ -474,13 +483,21 @@ export class StudySessionsService {
       VALUES ($1,$2,$3,$4,NOW()) RETURNING id, started_at, mode, tier_id
     `, [userId, roomId || null, tierId, sessionMode]);
 
+    // Track in Redis for fast concurrent-session detection
+
+
     this.logger.log(`Session started: user=${userId} id=${session[0].id}`);
 
+    // Broadcast presence update + member_joined event so other users see
+    // the new member immediately (without waiting 30s for polling refresh)
     if (tierRow[0]?.tier_key) {
       const tierKey = tierRow[0].tier_key;
+      // Get user's name for the member_joined broadcast
       const [userRow] = await this.db.query(`SELECT name FROM users WHERE id=$1`, [userId]);
       const userName  = userRow?.name ?? 'Member';
+      // Emit presence update (updates count in lobby)
       this.gateway['broadcastPresenceUpdate'](tierKey);
+      // Emit member_joined (updates members list in StudyFocusScreen immediately)
       this.gateway.server?.to(`tier:${tierKey}`).emit('room:member_joined', {
         tierKey, userId, userName,
       });
@@ -507,8 +524,10 @@ export class StudySessionsService {
     const s = sessions[0];
     const gapSecs = (Date.now() - new Date(s.last_heartbeat).getTime()) / 1000;
 
+    // ── Anti-cheat: heartbeat checks ───────────────────────
     const hbCheck = await this.antiCheat.checkHeartbeat(userId, sessionId, gapSecs, s);
     if (hbCheck.result === 'BLOCK') {
+      // Revoke session — don't award any more coins
       await this.db.query(`UPDATE study_sessions SET ended_at=NOW() WHERE id=$1`, [sessionId]);
       await this.antiCheat.clearActiveSession(userId);
       await this.antiCheat.flagForReview(userId, hbCheck.reason || 'Anti-cheat block', hbCheck.details || {});
@@ -516,6 +535,7 @@ export class StudySessionsService {
     }
     const antiCheatWarn = hbCheck.result === 'WARN';
 
+    // ── Anti-cheat: check heartbeat + coin velocity ──────────────
     const acHb = await this.antiCheat.checkHeartbeat(userId, sessionId, gapSecs, s);
     if (acHb.result === 'BLOCK') {
       this.logger.warn(`Heartbeat BLOCKED for user=${userId}: ${acHb.reason}`);
@@ -526,6 +546,7 @@ export class StudySessionsService {
         message: 'Unusual activity detected. Coins not awarded.',
       });
     }
+    // ─────────────────────────────────────────────────────────────
 
     if (gapSecs > this.AFK_THRESHOLD_S) {
       await this.db.query(
@@ -546,6 +567,9 @@ export class StudySessionsService {
     const xpMultiplier   = +s.xp_multiplier   || 1.0;
     let coinsThisBeat    = Math.floor((activeMins / 60) * this.BASE_COINS_PER_HOUR * coinMultiplier);
     let xpThisBeat       = Math.floor(activeMins * this.BASE_XP_PER_MINUTE * xpMultiplier);
+
+    // Anti-cheat WARN reduces coins to 50% for this beat
+
 
     if (coinsThisBeat > 0) {
       const capped = await this.checkDailyCap(userId, 'study_time');
@@ -603,7 +627,9 @@ export class StudySessionsService {
       SET ended_at=NOW(), duration_minutes=$1, coins_earned=coins_earned+$2
       WHERE id=$3
     `, [durationMins, bonusCoins, sessionId]);
-
+    // ── Update streak + last_study_date ─────────────────────────
+    // Only count study days with at least 1 active minute to prevent
+    // AFK-only sessions from counting as a study day.
     if (s.active_minutes >= 1) {
       const todayUTC = new Date().toISOString().slice(0, 10);
       const [lastStudy] = await this.db.query(
@@ -614,10 +640,18 @@ export class StudySessionsService {
         : null;
       const yesterdayUTC = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
 
+      // Streak logic:
+      // - Same day as last study → keep current streak (no double-count)
+      // - Yesterday → increment streak
+      // - Anything else (gap) → reset to 1
       let streakSql = '';
       if (lastDate === todayUTC) {
-        streakSql = `UPDATE users SET last_active_at=NOW(), last_study_date=CURRENT_DATE WHERE id=$1`;
+        // Already counted today — only update last_active_at
+        streakSql = `
+          UPDATE users SET last_active_at=NOW(), last_study_date=CURRENT_DATE WHERE id=$1
+        `;
       } else if (lastDate === yesterdayUTC) {
+        // Consecutive day — increment streak
         streakSql = `
           UPDATE users SET
             last_active_at=NOW(),
@@ -627,6 +661,7 @@ export class StudySessionsService {
           WHERE id=$1
         `;
       } else {
+        // Gap or first session ever — reset to 1
         streakSql = `
           UPDATE users SET
             last_active_at=NOW(),
@@ -642,14 +677,19 @@ export class StudySessionsService {
     }
 
     await this.cache.del(`user_tier:${userId}`);
-    await this.cache.del(`user:${userId}`);
-    await this.cache.del(`profile:${userId}`);
+    await this.cache.del(`user:${userId}`);       // invalidate getMe() cache
+    await this.cache.del(`profile:${userId}`);    // invalidate profile cache
 
+
+    // ── Anti-cheat: check session end ─────────────────────────────
     const durationSecs = durationMins * 60;
     await this.antiCheat.checkSessionEnd(userId, sessionId, durationSecs, s.active_minutes);
+    // ─────────────────────────────────────────────────────────────
 
     this.logger.log(`Session ended: user=${userId} active=${s.active_minutes}min coins=${s.coins_earned}`);
 
+    // Broadcast member_left + presence update so lobby and room members list
+    // update immediately when a user ends their session
     if (s.tier_key) {
       this.gateway['broadcastPresenceUpdate'](s.tier_key);
       this.gateway.server?.to(`tier:${s.tier_key}`).emit('room:member_left', {
@@ -810,6 +850,9 @@ export class TierRoomsCronService {
     }
   }
 
+  // ── Every 30 min during study hours — live leaderboard tick ─
+  // Broadcasts current top-3 of each tier to WS-connected clients.
+  // Cheap: reads from the already-computed room_leaderboard snapshot.
   @Cron('*/30 6-23 * * *')
   async broadcastLeaderboardTick() {
     const tiers      = await this.db.query(`SELECT id, tier_key FROM room_tiers WHERE is_active=TRUE`);
@@ -841,10 +884,12 @@ export class TierRoomsCronService {
     return `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}`;
   }
 
+  // ── 1st of month at 01:00 — monthly leaderboard snapshot ──
   @Cron('0 1 1 * *')
   async snapshotMonthlyLeaderboard() {
     this.logger.log('Snapshotting monthly leaderboard...');
     const now        = new Date();
+    // Previous month
     const prevMonth  = new Date(now.getFullYear(), now.getMonth() - 1, 1);
     const periodKey  = `${prevMonth.getFullYear()}-${String(prevMonth.getMonth()+1).padStart(2,'0')}`;
     const monthStart = prevMonth;
@@ -875,6 +920,7 @@ export class TierRoomsCronService {
             study_minutes=$4,coins_earned=$5,xp_earned=$6,streak_days=$7,rank_position=$8,computed_at=NOW()
         `, [tier.id,s.user_id,periodKey,s.study_minutes,s.coins_earned,s.xp_earned,s.streak_days,i+1]);
       }
+      // Top 3 monthly bonus (2× weekly rewards)
       const rewards = [100, 60, 40];
       for (let i = 0; i < Math.min(3, stats.length); i++) {
         await this.authService.awardCoins(stats[i].user_id, 'leaderboard_reward', tier.id);
@@ -921,6 +967,7 @@ export class TierRoomsCronService {
         `, [tier.id, s.user_id, periodKey, s.study_minutes, s.coins_earned, s.xp_earned, s.streak_days, i+1]);
       }
 
+      // Award top 3
       const rewards = [50, 30, 20];
       for (let i = 0; i < Math.min(3, stats.length); i++) {
         await this.authService.awardCoins(stats[i].user_id, 'leaderboard_reward', tier.id);
@@ -959,12 +1006,14 @@ export class TierRoomsCronService {
     await this.authService.awardCoins(userId, 'tier_promotion', toTierId);
     await this.cache.del(`user_tier:${userId}`);
     await this.cache.del('tier_rooms:all');
+    // Emit WS event first (instant if user online), then push notif as fallback
     const tierInfo = await this.db.query(
       `SELECT tier_key, name, icon_emoji FROM room_tiers WHERE id=$1 LIMIT 1`, [toTierId]
     );
     if (tierInfo.length) {
       const t = tierInfo[0];
       const wsDelivered = this.gateway.emitPromotion(userId, t.tier_key, t.name, t.icon_emoji);
+      // If user offline (WS not connected), fall back to push notification
       if (!wsDelivered) {
         this.notifService.notifyPromotion(userId, t.tier_key, t.name, t.icon_emoji)
           .catch(e => this.logger.error(`Promotion push failed: ${e.message}`));
@@ -1047,17 +1096,25 @@ export class TierRoomsController {
     return this.sessionsService.getActiveSession(r.user.id);
   }
 
+  /** GET /rooms/tiers/at-risk — is the user at risk of demotion? */
   @Get('tiers/at-risk')
   getAtRiskStatus(@Req() r: any) {
     return this.tiersService.getAtRiskStatus(r.user.id);
   }
 
+  /**
+   * GET /rooms/tiers/:tierKey/messages?limit=50
+   * Returns last N chat messages for a tier room, oldest-first.
+   * Called by ChatSheet on open to load history before live WS messages.
+   * FIX: This endpoint was MISSING — causing chat history to always fail (404).
+   */
   @Get('tiers/:tierKey/messages')
   async getChatHistory(
     @Param('tierKey') tierKey: string,
     @Query('limit')   limit:   number = 50,
   ) {
     const msgs = await this.gateway.getChatHistory(tierKey, Math.min(+limit || 50, 100));
+    // gateway returns newest-first from DB; reverse for oldest-first display
     return successResponse({ messages: msgs.reverse() });
   }
 }
@@ -1091,6 +1148,7 @@ export class AdminTierRoomsController {
     return this.tiersService.adminPromoteUser(dto.userId, dto.targetTierKey);
   }
 
+  // ── Anti-cheat review endpoints ───────────────────────────
   @Get('flagged-users')
   @RequirePermission('study-rooms')
   getFlaggedUsers(@Query() q: any) {
@@ -1117,7 +1175,7 @@ export class AdminTierRoomsController {
     TierRoomsCronService,
     TierNotificationsService,
     TierRoomsGateway,
-    AntiCheatService,
+    AntiCheatService,         // Anti-cheat layer
   ],
   exports: [TierRoomsService, StudySessionsService, TierNotificationsService, TierRoomsGateway, AntiCheatService],
 })
