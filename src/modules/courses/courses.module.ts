@@ -766,6 +766,47 @@ SET
     // In production, use Redis SCAN to delete all course:* keys
     // For simplicity we set a short TTL on course caches
   }
+
+  // ── Save / Wishlist ──────────────────────────────────────────
+  async toggleSave(courseId: string, userId: string) {
+    const existing = await this.db.query(
+      `SELECT user_id FROM course_saves WHERE user_id=$1 AND course_id=$2`,
+      [userId, courseId]
+    );
+    if (existing.length) {
+      await this.db.query(`DELETE FROM course_saves WHERE user_id=$1 AND course_id=$2`, [userId, courseId]);
+      return successResponse({ isSaved: false }, 'Removed from saved');
+    }
+    await this.db.query(`
+      CREATE TABLE IF NOT EXISTS course_saves (
+        user_id   UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        course_id UUID NOT NULL REFERENCES courses(id) ON DELETE CASCADE,
+        saved_at  TIMESTAMPTZ DEFAULT NOW(),
+        PRIMARY KEY (user_id, course_id)
+      )
+    `);
+    await this.db.query(
+      `INSERT INTO course_saves (user_id, course_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`,
+      [userId, courseId]
+    );
+    return successResponse({ isSaved: true }, 'Course saved');
+  }
+
+  async getSavedCourses(userId: string) {
+    const rows = await this.db.query(`
+      SELECT c.*,
+        COALESCE(e.completed_lessons,0)  AS completed_lessons_count,
+        e.last_studied_at, e.completed_at,
+        (SELECT COUNT(*) FROM course_chapters WHERE course_id=c.id)::int AS total_chapters,
+        TRUE AS is_saved
+      FROM course_saves cs
+      JOIN courses c ON c.id = cs.course_id
+      LEFT JOIN enrollments e ON e.course_id=c.id AND e.user_id=$1
+      WHERE cs.user_id=$1
+      ORDER BY cs.saved_at DESC
+    `, [userId]);
+    return successResponse({ courses: rows });
+  }
 }
 
 // ── Mobile Controller ─────────────────────────────────────────
@@ -815,6 +856,23 @@ export class CoursesController {
       lessonId,
       req.user.id
     );
+  }
+
+  @Post(':id/save')
+  @HttpCode(200)
+  toggleSave(@Param('id', ParseUUIDPipe) id: string, @Req() r: any) {
+    return this.service.toggleSave(id, r.user.id);
+  }
+
+  @Delete(':id/save')
+  @HttpCode(200)
+  unsaveCourse(@Param('id', ParseUUIDPipe) id: string, @Req() r: any) {
+    return this.service.toggleSave(id, r.user.id); // same toggle logic
+  }
+
+  @Get('saved')
+  getSaved(@Req() r: any) {
+    return this.service.getSavedCourses(r.user.id);
   }
 
   @Post(':id/review')
