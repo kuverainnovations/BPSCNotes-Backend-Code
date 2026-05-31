@@ -883,3 +883,5 @@ export class CoursesController {
     @Req() req: any,
   ) { return this.service.submitReview(id, req.user.id, dto); }
 }
+
+export class CoursesModule {}
