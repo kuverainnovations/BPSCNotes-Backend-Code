@@ -832,9 +832,25 @@ export class CoursesController {
     return this.service.findAll(query, req.user?.id);
   }
 
+  // !! MUST be before @Get(':id') — NestJS matches routes top-down
+  @Get('saved')
+  getSaved(@Req() r: any) { return this.service.getSavedCourses(r.user.id); }
+
   @Get(':id')
   findOne(@Param('id', ParseUUIDPipe) id: string, @Req() req: any) {
     return this.service.findOne(id, req.user?.id);
+  }
+
+  @Post(':id/save')
+  @HttpCode(200)
+  toggleSave(@Param('id', ParseUUIDPipe) id: string, @Req() r: any) {
+    return this.service.toggleSave(id, r.user.id);
+  }
+
+  @Delete(':id/save')
+  @HttpCode(200)
+  unsaveCourse(@Param('id', ParseUUIDPipe) id: string, @Req() r: any) {
+    return this.service.toggleSave(id, r.user.id);
   }
 
   @Post(':id/enroll')
@@ -848,142 +864,22 @@ export class CoursesController {
   completeLesson(
     @Param('courseId', ParseUUIDPipe) courseId: string,
     @Param('lessonId', ParseUUIDPipe) lessonId: string,
-    @Req() req: any,
     @Body() dto: CompleteLessonDto,
-  ) {
-    return this.service.completeLesson(courseId, lessonId, req.user.id, dto);
-  }
+    @Req() req: any,
+  ) { return this.service.completeLesson(courseId, lessonId, req.user.id, dto); }
 
   @Get(':courseId/lessons/:lessonId')
-  getLessonDetail(
+  getLesson(
     @Param('courseId', ParseUUIDPipe) courseId: string,
     @Param('lessonId', ParseUUIDPipe) lessonId: string,
-    @Req() req: any
-  ) {
-    return this.service.getLessonDetail(
-      courseId,
-      lessonId,
-      req.user.id
-    );
-  }
-
-  @Post(':id/save')
-  @HttpCode(200)
-  toggleSave(@Param('id', ParseUUIDPipe) id: string, @Req() r: any) {
-    return this.service.toggleSave(id, r.user.id);
-  }
-
-  @Delete(':id/save')
-  @HttpCode(200)
-  unsaveCourse(@Param('id', ParseUUIDPipe) id: string, @Req() r: any) {
-    return this.service.toggleSave(id, r.user.id); // same toggle logic
-  }
-
-  @Get('saved')
-  getSaved(@Req() r: any) {
-    return this.service.getSavedCourses(r.user.id);
-  }
+    @Req() req: any,
+  ) { return this.service.getLessonDetail(courseId, lessonId, req.user.id); }
 
   @Post(':id/review')
   @HttpCode(HttpStatus.CREATED)
-  submitReview(
+  addReview(
     @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: any,
     @Req() req: any,
-    @Body() dto: SubmitReviewDto,
-  ) {
-    return this.service.submitReview(id, req.user.id, dto);
-  }
+  ) { return this.service.submitReview(id, req.user.id, dto); }
 }
-
-// ── Admin Controller ──────────────────────────────────────────
-@ApiTags('Admin — Courses')
-@ApiBearerAuth()
-@Public()
-@UseGuards(AdminJwtGuard, PermissionGuard)
-@Controller('admin/courses')
-export class AdminCoursesController {
-  constructor(private readonly service: CoursesService) {}
-
-  @Get()
-  @RequirePermission('courses')
-  findAll(@Query() query: CourseQueryDto) {
-    return this.service.findAllAdmin(query);
-  }
-
-  @Post()
-  @RequirePermission('courses')
-  @HttpCode(HttpStatus.CREATED)
-  create(@Body() dto: CreateCourseDto, @Req() req: any) {
-    return this.service.adminCreate(dto, req.admin.id);
-  }
-
-  @Put(':id')
-  @RequirePermission('courses')
-  update(@Param('id', ParseUUIDPipe) id: string, @Body() dto: Partial<CreateCourseDto>) {
-    return this.service.adminUpdate(id, dto);
-  }
-
-  @Delete(':id')
-  @RequirePermission('courses')
-  remove(@Param('id', ParseUUIDPipe) id: string) {
-    return this.service.adminDelete(id);
-  }
-
-  @Post(':id/thumbnail')
-  @RequirePermission('courses')
-  @UseInterceptors(FileInterceptor('thumbnail'))
-  uploadThumbnail(@Param('id', ParseUUIDPipe) id: string, @UploadedFile() file: Express.Multer.File) {
-    return this.service.uploadThumbnail(id, file);
-  }
-
-  @Get(':id/chapters')
-  @RequirePermission('courses')
-  getChapters(@Param('id', ParseUUIDPipe) id: string) { return this.service.getChapters(id); }
-
-  @Post(':id/chapters')
-  @RequirePermission('courses')
-  createChapter(@Param('id', ParseUUIDPipe) id: string, @Body() dto: any) {
-    return this.service.createChapter(id, dto);
-  }
-
-  @Put(':id/chapters/:chapterId')
-  @RequirePermission('courses')
-  updateChapter(@Param('chapterId', ParseUUIDPipe) chapterId: string, @Body() dto: any) {
-    return this.service.updateChapter(chapterId, dto);
-  }
-
-  @Delete(':id/chapters/:chapterId')
-  @RequirePermission('courses')
-  @HttpCode(HttpStatus.OK)
-  deleteChapter(@Param('chapterId', ParseUUIDPipe) chapterId: string) {
-    return this.service.deleteChapter(chapterId);
-  }
-
-  @Post(':id/chapters/:chapterId/lessons')
-  @RequirePermission('courses')
-  createLesson(@Param('id', ParseUUIDPipe) courseId: string, @Param('chapterId', ParseUUIDPipe) chapterId: string, @Body() dto: any) {
-    return this.service.createLesson(courseId, chapterId, dto);
-  }
-
-  @Put(':id/lessons/:lessonId')
-  @RequirePermission('courses')
-  updateLesson(@Param('lessonId', ParseUUIDPipe) lessonId: string, @Body() dto: any) {
-    return this.service.updateLesson(lessonId, dto);
-  }
-
-  @Delete(':id/lessons/:lessonId')
-  @RequirePermission('courses')
-  @HttpCode(HttpStatus.OK)
-  deleteLesson(@Param('lessonId', ParseUUIDPipe) lessonId: string) {
-    return this.service.deleteLesson(lessonId);
-  }
-}
-
-// ── Module ────────────────────────────────────────────────────
-@Module({
-  imports:     [AuthModule, NotificationsModule],
-  controllers: [CoursesController, AdminCoursesController],
-  providers:   [CoursesService, CoursesRepository, NotificationService],
-  exports:     [CoursesService],
-})
-export class CoursesModule {}
