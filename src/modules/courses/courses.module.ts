@@ -832,12 +832,12 @@ export class CoursesController {
     return this.service.findAll(query, req.user?.id);
   }
 
-  // !! MUST be before @Get(':id') — NestJS matches routes top-down
   @Get('saved')
   getSaved(@Req() r: any) { return this.service.getSavedCourses(r.user.id); }
 
   @Get(':id')
-  findOne(@Param('id', ParseUUIDPipe) id: string, @Req() req: any) {
+  findOne(@Param('id') id: string, @Req() req: any) {
+    // No ParseUUIDPipe here — prevents 'saved' from crashing if routing mismatch
     return this.service.findOne(id, req.user?.id);
   }
 
