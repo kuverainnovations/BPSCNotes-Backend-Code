@@ -637,8 +637,6 @@ export class UserJwtStrategy extends PassportStrategy(Strategy as any, 'jwt') {
     // Update last_active async (fire-and-forget)
     this.db.query(`UPDATE users SET last_active_at = NOW() WHERE id = $1`, [user.id]).catch(() => {});
 
-    console.log("ADMIN PAYLOAD:", payload);
-
     return user;
     // return user;
   }
