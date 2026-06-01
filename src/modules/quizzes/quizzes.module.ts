@@ -231,9 +231,19 @@ if (q.scheduled_for) {
     );
 
     // Update user stats
+    // quizzes_attempted counts unique quizzes solved (passed), not total attempts
+    // accuracy updates on every attempt so it reflects real performance
+    const alreadyPassed = isPassed ? await this.db.query(
+      `SELECT id FROM quiz_attempts
+       WHERE user_id=$1 AND quiz_id=$2 AND is_passed=true AND id != $3
+       LIMIT 1`,
+      [userId, quizId, attempt[0].id]
+    ) : [];
+    const isFirstPass = isPassed && alreadyPassed.length === 0;
+
     await this.db.query(
       `UPDATE users SET
-         quizzes_attempted    = quizzes_attempted + 1,
+         quizzes_attempted    = quizzes_attempted + ${isFirstPass ? 1 : 0},
          accuracy             = ROUND(((accuracy * quizzes_attempted) + $1) / (quizzes_attempted + 1), 1),
          total_study_minutes  = total_study_minutes + $2,
          last_active_at       = NOW()
@@ -245,30 +255,16 @@ if (q.scheduled_for) {
     await this.cache.del(`quiz_meta:${quizId}`);
 
     // ANTI-CHEAT: Only award coins on the FIRST passing attempt for this quiz
-    // Prevents farming by re-taking quizzes repeatedly
     let coinsEarned = 0;
-    let prevPass: any = null;
-    if (isPassed) {
-      [prevPass] = await this.db.query(
-        `SELECT id FROM quiz_attempts
-         WHERE user_id=$1 AND quiz_id=$2 AND is_passed=true AND id != $3
-         LIMIT 1`,
-        [userId, quizId, attempt[0].id]
-      );
-      if (!prevPass) {
-        // First time passing this quiz — award using type-specific action
-        // so daily/mock/topic each have independent daily limits
+    if (isFirstPass) {
         const quizType = q.type || 'daily';
         const coinAction = quizType === 'mock'  ? 'mock_quiz'
                          : quizType === 'topic' ? 'topic_quiz'
                          : 'daily_quiz';
-        // Pass the quiz's specific coins_reward set by admin as the override
-        // so admin-configured rewards are always honoured over global defaults
         const quizCoinsReward = Number(q.coins_reward) || 0;
         coinsEarned = await this.authService.awardCoins(
           userId, coinAction, attempt[0].id, quizCoinsReward
         );
-      }
     }
 
     // ── Async achievement + challenge checks (fire-and-forget) ──
@@ -310,7 +306,7 @@ const percentile = Number(
   (((totalAttempts - rank) / totalAttempts) * 100).toFixed(2)
 );
 // 🔔 First-time pass notification
-    if (isPassed && !prevPass && coinsEarned > 0) {
+    if (isFirstPass && coinsEarned > 0) {
       this.notifService.pushToUser(
         userId,
         '🎉 Quiz Passed!',
