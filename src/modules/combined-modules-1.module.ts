@@ -45,6 +45,7 @@ class CurrentAffairsService {
     const [rows, countResult] = await Promise.all([
       this.db.query(
         `SELECT ca.id,ca.title,ca.summary,ca.category,ca.date,ca.is_important,ca.exam_tags,ca.tags,ca.view_count,ca.bookmark_count,
+           COALESCE(ca.read_time, 1) AS read_time,
            (SELECT TRUE FROM affairs_bookmarks ab WHERE ab.user_id=$${params.length+1} AND ab.affair_id=ca.id) AS is_bookmarked,
            (SELECT COUNT(*) FROM ca_mcqs m WHERE m.affair_id=ca.id)::int AS mcq_count
          FROM current_affairs ca WHERE ${where}
@@ -96,7 +97,7 @@ class CurrentAffairsService {
       this.db.query(
         `SELECT ca.id, ca.title, ca.summary, ca.full_content, ca.category,
                 ca.date, ca.is_important, ca.exam_tags, ca.tags, ca.status,
-                ca.view_count, ca.bookmark_count, ca.created_at,
+                ca.view_count, ca.bookmark_count, ca.created_at, ca.read_time,
                 (SELECT COUNT(*) FROM ca_mcqs m WHERE m.affair_id=ca.id)::int AS mcq_count
          FROM current_affairs ca
          WHERE ${where}
@@ -117,9 +118,9 @@ class CurrentAffairsService {
     // Always ensure the type is in exam_tags as first element
     const mergedTags = [typeTag, ...examTagsWithType.filter((t: string) => !['prelims','mains','both'].includes(t))];
     const result = await this.db.query(
-      `INSERT INTO current_affairs (title, summary, full_content, category, source, date, is_important, exam_tags, tags, status, author, created_by)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING *`,
-      [data.title, data.summary, data.fullContent, data.category, data.source, data.date||new Date().toISOString().split('T')[0], data.isImportant||false, mergedTags, data.tags||[], data.status||'draft', data.author, adminId]
+      `INSERT INTO current_affairs (title, summary, full_content, category, source, date, is_important, exam_tags, tags, status, author, read_time, created_by)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *`,
+      [data.title, data.summary, data.fullContent, data.category, data.source, data.date||new Date().toISOString().split('T')[0], data.isImportant||false, mergedTags, data.tags||[], data.status||'draft', data.author, data.readTime||1, adminId]
     );
     return successResponse({ affair: result[0] }, 'Article created — live in app ✅');
   }
@@ -127,7 +128,7 @@ class CurrentAffairsService {
   async adminUpdate(affairId: string, data: any) {
     const fields: string[] = [], vals: any[] = [];
     let i = 1;
-    const map: any = { title:'title', summary:'summary', fullContent:'full_content', category:'category', source:'source', date:'date', isImportant:'is_important', status:'status' };
+    const map: any = { title:'title', summary:'summary', fullContent:'full_content', category:'category', source:'source', date:'date', isImportant:'is_important', status:'status', readTime:'read_time' };
     for (const [key, col] of Object.entries(map)) {
       if (data[key] !== undefined) { fields.push(`${col}=$${i++}`); vals.push(data[key]); }
     }
@@ -310,7 +311,11 @@ COALESCE(j.salary_range,'')                                AS salary_range,
         ADD COLUMN IF NOT EXISTS salary_range      TEXT DEFAULT '',
         ADD COLUMN IF NOT EXISTS brief_description TEXT DEFAULT '',
         ADD COLUMN IF NOT EXISTS pdf_url           TEXT DEFAULT ''
-    `).catch(() => {});  // ignore if already exists
+    `).catch(() => {});
+    await this.db.query(`
+      ALTER TABLE current_affairs
+        ADD COLUMN IF NOT EXISTS read_time INTEGER DEFAULT 1
+    `).catch(() => {});
   }
 
   async toggleSave(jobId: string, userId: string) {
