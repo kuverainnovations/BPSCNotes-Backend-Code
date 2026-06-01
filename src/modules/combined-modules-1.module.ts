@@ -2,7 +2,7 @@ import {
   Module, Injectable, Controller, Get, Post, Put, Delete,
   Body, Param, Query, Req, HttpCode, HttpStatus,
   NotFoundException, BadRequestException, ConflictException,
-  UseGuards, ParseUUIDPipe,
+  UseGuards, ParseUUIDPipe, OnModuleInit,
 } from '@nestjs/common';
 import { InjectDataSource } from '@nestjs/typeorm';
 import { DataSource } from 'typeorm';
@@ -245,12 +245,16 @@ export class CurrentAffairsModule {}
 // JOBS MODULE
 // ════════════════════════════════════════════════════════════
 @Injectable()
-class JobsService {
+class JobsService implements OnModuleInit {
   constructor(
     @InjectDataSource() private readonly db: DataSource,
     @Inject(CACHE_MANAGER) private readonly cache: Cache,
     @Inject('NOTIFICATION_SERVICE') @Optional() private readonly notifService?: { pushToAll: (title: string, body: string, data?: Record<string, string>) => Promise<void> },
   ) {}
+
+  async onModuleInit() {
+    await this.ensureColumns();
+  }
 
   async findAll(query: any, userId: string) {
     const { page=1, limit=20, status='active', category, exam } = query;
