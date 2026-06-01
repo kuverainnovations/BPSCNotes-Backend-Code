@@ -351,9 +351,9 @@ CASE WHEN j.last_date <= NOW() + INTERVAL '3 days'
   async adminCreate(data: any, adminId: string) {
     if (!data.title || !data.organization || !data.lastDate) throw new BadRequestException('Title, organization and last date required');
     const result = await this.db.query(
-      `INSERT INTO job_vacancies (title, organization, category, total_posts, notification_date, last_date, exam_date, age_limit, qualification, application_link, description, brief_description, pdf_url, exam_tags, created_by)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15) RETURNING *`,
-      [data.title, data.organization, data.category, data.totalPosts||0, data.notificationDate||null, data.lastDate, data.examDate||null, data.ageLimit, data.qualification, data.applicationLink, data.description, data.briefDescription||'', data.pdfUrl||'', data.examTags||[], adminId]
+      `INSERT INTO job_vacancies (title, organization, category, total_posts, notification_date, last_date, exam_date, age_limit, qualification, application_link, description, brief_description, pdf_url, location, salary_range, exam_tags, created_by)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) RETURNING *`,
+      [data.title, data.organization, data.category, data.totalPosts||data.totalVacancies||0, data.notificationDate||null, data.lastDate, data.examDate||null, data.ageLimit||'', data.qualification||'', data.applicationLink||data.applicationUrl||'', data.description||'', data.briefDescription||'', data.pdfUrl||'', data.location||'', data.salary||data.salaryRange||'', data.examTags||[], adminId]
     );
     // 🔔 New job alert to all users (only if notification service available)
     this.notifService?.pushToAll(
@@ -368,7 +368,15 @@ CASE WHEN j.last_date <= NOW() + INTERVAL '3 days'
   async adminUpdate(jobId: string, data: any) {
     const fields: string[] = [], vals: any[] = [];
     let i = 1;
-    const map: any = { title:'title', organization:'organization', category:'category', totalPosts:'total_posts', lastDate:'last_date', examDate:'exam_date', status:'status', applicationLink:'application_link', description:'description', briefDescription:'brief_description', pdfUrl:'pdf_url' };
+    const map: any = {
+      title:'title', organization:'organization', category:'category',
+      totalPosts:'total_posts', totalVacancies:'total_posts',
+      lastDate:'last_date', examDate:'exam_date', status:'status',
+      applicationLink:'application_link', applicationUrl:'application_link',
+      description:'description', briefDescription:'brief_description', pdfUrl:'pdf_url',
+      location:'location', salary:'salary_range', salaryRange:'salary_range',
+      ageLimit:'age_limit', qualification:'qualification',
+    };
     for (const [key, col] of Object.entries(map)) {
       if (data[key] !== undefined) { fields.push(`${col}=$${i++}`); vals.push(data[key]); }
     }
