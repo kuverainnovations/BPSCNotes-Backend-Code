@@ -46,11 +46,8 @@ const ALLOWED_MIME_TYPES = [
   'image/jpeg', 'image/png', 'image/webp',
   'application/msword',
   'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-  // Video formats
-  'video/mp4', 'video/quicktime', 'video/x-msvideo', 'video/webm',
-  'video/3gpp', 'video/x-matroska',
 ];
-const MAX_FILE_SIZE_BYTES = 200 * 1024 * 1024; // 200 MB — covers large videos
+const MAX_FILE_SIZE_BYTES = 50 * 1024 * 1024; // 50 MB
 
 // ─────────────────────────────────────────────────────────────
 // Multer disk-storage config
@@ -126,11 +123,6 @@ export class StudyMaterialsService {
     const offset = (page - 1) * limit;
 
     const conditions: string[] = [`sm.status = 'approved'`];
-    // FIX: Uploader should NOT see their own materials in the public Explore list.
-    // They have a dedicated "My Uploads" tab where they see those with full access.
-    if (query.userId) {
-      conditions.push(`sm.uploader_id != '${query.userId}'`);
-    }
     const params: any[] = [];
     let pi = 1;
 
