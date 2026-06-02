@@ -309,7 +309,14 @@ class DailyTargetsService {
 
     // Support both single object and batch array
     const inputs: any[] = Array.isArray(data.titles)
-      ? data.titles.map((t: string) => ({ title: t }))
+      ? data.titles.map((t: string) => ({
+          title:             t,
+          subject:           data.subject           || 'General',
+          difficulty:        data.difficulty         || 'medium',
+          timeSlot:          data.timeSlot           || data.time_slot || 'morning',
+          estimatedMinutes:  data.estimatedMinutes   || data.estimated_minutes || 25,
+          totalQuestions:    data.totalQuestions     || data.total_questions   || 10,
+        }))
       : [data];
 
     if (!inputs.length || !inputs[0].title) {
