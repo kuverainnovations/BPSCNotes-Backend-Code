@@ -123,6 +123,11 @@ export class StudyMaterialsService {
     const offset = (page - 1) * limit;
 
     const conditions: string[] = [`sm.status = 'approved'`];
+    // FIX: Uploader should NOT see their own materials in the public Explore list.
+    // They have a dedicated "My Uploads" tab where they see those with full access.
+    if (query.userId) {
+      conditions.push(`sm.uploader_id != '${query.userId}'`);
+    }
     const params: any[] = [];
     let pi = 1;
 
@@ -659,6 +664,15 @@ if (query.search)  { conditions.push(`sm.title ILIKE $${pi++}`); params.push(`%$
     });
   }
 
+  // ── DELETE: remove a download from history ───────────────
+  async removeDownload(materialId: string, userId: string) {
+    await this.db.query(
+      `DELETE FROM material_downloads WHERE material_id=$1 AND user_id=$2`,
+      [materialId, userId]
+    );
+    return successResponse(null, 'Removed from downloads');
+  }
+
   // ── GET: record download in history table ─────────────────
   async recordDownloadHistory(materialId: string, userId: string) {
     // Ensure table exists
@@ -818,6 +832,12 @@ export class StudyMaterialsController {
   @Get('my-downloads')
   getMyDownloads(@Query('page') page = 1, @Query('limit') limit = 50, @Req() r: any) {
     return this.svc.myDownloads(r.user.id, +page, +limit);
+  }
+
+  @Delete('my-downloads/:materialId')
+  @HttpCode(HttpStatus.OK)
+  removeDownload(@Param('materialId', ParseUUIDPipe) materialId: string, @Req() r: any) {
+    return this.svc.removeDownload(materialId, r.user.id);
   }
 
   @Post(':id/purchase')
