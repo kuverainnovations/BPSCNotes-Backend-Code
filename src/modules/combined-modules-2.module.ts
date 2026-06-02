@@ -309,14 +309,7 @@ class DailyTargetsService {
 
     // Support both single object and batch array
     const inputs: any[] = Array.isArray(data.titles)
-      ? data.titles.map((t: string) => ({
-          title:             t,
-          subject:           data.subject           || 'General',
-          difficulty:        data.difficulty         || 'medium',
-          timeSlot:          data.timeSlot           || data.time_slot || 'morning',
-          estimatedMinutes:  data.estimatedMinutes   || data.estimated_minutes || 25,
-          totalQuestions:    data.totalQuestions     || data.total_questions   || 10,
-        }))
+      ? data.titles.map((t: string) => ({ title: t }))
       : [data];
 
     if (!inputs.length || !inputs[0].title) {
@@ -430,18 +423,24 @@ class DailyTargetsService {
     }
     
 
-    // Award coin for first completion (not if toggling back)
-    // FIX: Use authService.awardCoins() so it uses COIN_DEFAULTS fallback
-    // The old code read directly from coin_rules table which may be empty
+    // Award coin only on first-ever completion of this specific target
+    // If user uncompletes and re-completes, no extra coin awarded
     let coinsEarned = 0;
     if (nowComplete) {
-      coinsEarned = await this.authService.awardCoins(userId, 'target_complete', targetId);
-
-      // Update user's study minutes (+estimated time)
-      await this.db.query(
-        `UPDATE users SET total_study_minutes=total_study_minutes+$1 WHERE id=$2`,
-        [target.estimated_minutes, userId]
+      const alreadyAwarded = await this.db.query(
+        `SELECT id FROM coin_transactions
+         WHERE user_id=$1 AND action='target_complete' AND ref_id=$2
+         LIMIT 1`,
+        [userId, targetId]
       );
+      if (!alreadyAwarded.length) {
+        coinsEarned = await this.authService.awardCoins(userId, 'target_complete', targetId);
+        // Only add study minutes on first completion
+        await this.db.query(
+          `UPDATE users SET total_study_minutes=total_study_minutes+$1 WHERE id=$2`,
+          [target.estimated_minutes, userId]
+        );
+      }
     }
 
     // Invalidate user cache so stats refresh
