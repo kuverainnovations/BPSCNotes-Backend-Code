@@ -401,7 +401,7 @@ export class StudyMaterialsService {
   // ── POST: toggle bookmark ─────────────────────────────────
   async toggleBookmark(materialId: string, userId: string) {
     const exists = await this.db.query(
-      `SELECT id FROM material_bookmarks WHERE material_id=$1 AND user_id=$2`, [materialId, userId]
+      `SELECT material_id FROM material_bookmarks WHERE material_id=$1 AND user_id=$2`, [materialId, userId]
     );
     if (exists.length) {
       await this.db.query(`DELETE FROM material_bookmarks WHERE material_id=$1 AND user_id=$2`, [materialId, userId]);
