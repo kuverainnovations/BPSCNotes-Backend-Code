@@ -55,6 +55,16 @@ async function bootstrap() {
     bufferLogs: true,
   });
 
+  // ── Increase body size limit for video/file uploads (200MB) ─
+  // Default NestJS/Express limit is 100KB — way too small for videos
+  app.use(require('express').json({ limit: '10mb' }));
+  app.use(require('express').urlencoded({ limit: '200mb', extended: true }));
+
+  // ── Increase request timeout for large file uploads ─────────
+  // Default Node.js HTTP timeout is 5s — videos need much longer
+  const server = app.getHttpServer();
+  server.setTimeout(10 * 60 * 1000); // 10 minutes
+
   const config = app.get(ConfigService);
 
   // ── Serve uploaded files statically ──────────────────────

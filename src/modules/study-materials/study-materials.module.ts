@@ -46,8 +46,11 @@ const ALLOWED_MIME_TYPES = [
   'image/jpeg', 'image/png', 'image/webp',
   'application/msword',
   'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  // Video formats
+  'video/mp4', 'video/quicktime', 'video/x-msvideo', 'video/webm',
+  'video/3gpp', 'video/x-matroska',
 ];
-const MAX_FILE_SIZE_BYTES = 50 * 1024 * 1024; // 50 MB
+const MAX_FILE_SIZE_BYTES = 200 * 1024 * 1024; // 200 MB — covers large videos
 
 // ─────────────────────────────────────────────────────────────
 // Multer disk-storage config
