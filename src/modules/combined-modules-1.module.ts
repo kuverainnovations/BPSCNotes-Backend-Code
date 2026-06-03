@@ -153,48 +153,29 @@ class CurrentAffairsService {
   async ensureCaMcqTable() {
     await this.db.query(`
       CREATE TABLE IF NOT EXISTS ca_mcqs (
-        id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        affair_id         UUID NOT NULL REFERENCES current_affairs(id) ON DELETE CASCADE,
-        question          TEXT NOT NULL,
-        option_a          TEXT NOT NULL,
-        option_b          TEXT NOT NULL,
-        option_c          TEXT NOT NULL,
-        option_d          TEXT NOT NULL,
-        correct           CHAR(1) NOT NULL CHECK (correct IN ('a','b','c','d','e')),
-        option_e          TEXT NOT NULL DEFAULT '',
-        explanation       TEXT,
-        difficulty        VARCHAR(10) DEFAULT 'medium',
-        time_per_question INT DEFAULT 0,  -- seconds per question (0 = no timer, admin-controlled)
-        created_at        TIMESTAMPTZ DEFAULT NOW()
+        id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        affair_id    UUID NOT NULL REFERENCES current_affairs(id) ON DELETE CASCADE,
+        question     TEXT NOT NULL,
+        option_a     TEXT NOT NULL,
+        option_b     TEXT NOT NULL,
+        option_c     TEXT NOT NULL,
+        option_d     TEXT NOT NULL,
+        correct      CHAR(1) NOT NULL CHECK (correct IN ('a','b','c','d','e')),
+        option_e     TEXT NOT NULL DEFAULT '',
+        explanation  TEXT,
+        difficulty   VARCHAR(10) DEFAULT 'medium',
+        created_at   TIMESTAMPTZ DEFAULT NOW()
       )
     `);
   }
 
   async getMcqs(affairId: string) {
     await this.ensureCaMcqTable();
-    // ANTI-CHEAT: exclude 'correct' field — client must not know correct answer before answering
-    // correct answer returned after user submits (handled client-side on tap in learning mode)
-    // Also ensure time_per_question column exists (migration-safe)
-    await this.db.query(`
-      ALTER TABLE ca_mcqs ADD COLUMN IF NOT EXISTS time_per_question INT DEFAULT 0
-    `).catch(() => {});
     const rows = await this.db.query(
-      `SELECT id, affair_id, question, option_a, option_b, option_c, option_d, option_e,
-              explanation, difficulty, time_per_question
-       FROM ca_mcqs WHERE affair_id=$1 ORDER BY created_at ASC`,
+      `SELECT * FROM ca_mcqs WHERE affair_id=$1 ORDER BY created_at ASC`,
       [affairId]
     );
     return successResponse({ mcqs: rows });
-  }
-
-  async getMcqAnswer(mcqId: string) {
-    // Separate endpoint to reveal correct answer after user has answered
-    const rows = await this.db.query(
-      `SELECT id, correct, explanation FROM ca_mcqs WHERE id=$1`,
-      [mcqId]
-    );
-    if (!rows.length) throw new Error('MCQ not found');
-    return successResponse({ correct: rows[0].correct, explanation: rows[0].explanation });
   }
 
   async addMcq(affairId: string, data: any) {
@@ -232,6 +213,40 @@ class CurrentAffairsService {
     await this.db.query(`DELETE FROM ca_mcqs WHERE id=$1`, [mcqId]);
     return successResponse(null, 'MCQ deleted');
   }
+
+  async getMcqAnswer(mcqId: string) {
+    const rows = await this.db.query(
+      `SELECT id, correct, explanation FROM ca_mcqs WHERE id=$1`,
+      [mcqId]
+    );
+    if (!rows.length) throw new Error('MCQ not found');
+    return successResponse({ correct: rows[0].correct, explanation: rows[0].explanation });
+  }
+
+  // ── Activity Logging ─────────────────────────────────────────
+  async logActivity(userId: string, dto: { activityType: string; durationSecs: number }) {
+    // Migration-safe table creation
+    await this.db.query(`
+      CREATE TABLE IF NOT EXISTS ca_activity (
+        id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id       UUID NOT NULL,
+        activity_type VARCHAR(20) NOT NULL DEFAULT 'reading',
+        duration_secs INT NOT NULL DEFAULT 0,
+        logged_at     TIMESTAMPTZ DEFAULT NOW()
+      )
+    `).catch(() => {});
+
+    // Ignore < 10s sessions, cap at 3600s to prevent inflation
+    const secs = Math.min(Math.max(dto.durationSecs || 0, 0), 3600);
+    if (secs < 10) return { logged: false, reason: 'too_short' };
+
+    await this.db.query(
+      `INSERT INTO ca_activity (user_id, activity_type, duration_secs)
+       VALUES ($1, $2, $3)`,
+      [userId, dto.activityType || 'reading', secs]
+    );
+    return successResponse({ logged: true, durationSecs: secs });
+  }
 }
 
 @ApiTags('Current Affairs') @ApiBearerAuth() @UseGuards(JwtAuthGuard) @Controller('current-affairs')
@@ -241,6 +256,8 @@ class CurrentAffairsController {
   @Get(':id') findOne(@Param('id', ParseUUIDPipe) id: string, @Req() r: any) { return this.s.findOne(id, r.user.id); }
   @Post(':id/bookmark') @HttpCode(200) toggleBookmark(@Param('id', ParseUUIDPipe) id: string, @Req() r: any) { return this.s.toggleBookmark(id, r.user.id); }
   @Get(':id/mcqs') getMcqs(@Param('id', ParseUUIDPipe) id: string) { return this.s.getMcqs(id); }
+  @Get('mcqs/:mcqId/answer') getMcqAnswer(@Param('mcqId', ParseUUIDPipe) mcqId: string) { return this.s.getMcqAnswer(mcqId); }
+  @Post('log-activity') @HttpCode(200) logActivity(@Req() r: any, @Body() dto: any) { return this.s.logActivity(r.user.id, dto); }
 }
 
 @ApiTags('Admin — Current Affairs') @ApiBearerAuth() @Public()

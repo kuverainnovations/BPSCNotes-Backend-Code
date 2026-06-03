@@ -679,6 +679,17 @@ class UsersService {
              AND ss.started_at >= NOW() - INTERVAL '28 days'
            GROUP BY DATE(ss.started_at)
          ),
+
+         ca_reading_activity AS (
+           -- Current affairs reading + MCQ time tracked from Android app
+           SELECT
+             DATE(ca.logged_at) AS date,
+             SUM(CEIL(ca.duration_secs::numeric / 60))::int AS study_mins
+           FROM ca_activity ca
+           WHERE ca.user_id = $1
+             AND ca.logged_at >= NOW() - INTERVAL '28 days'
+           GROUP BY DATE(ca.logged_at)
+         ),
       
          combined AS (
            SELECT
@@ -688,6 +699,8 @@ class UsersService {
              SELECT date, study_mins FROM quiz_activity
              UNION ALL
              SELECT date, study_mins FROM session_activity
+             UNION ALL
+             SELECT date, study_mins FROM ca_reading_activity
            ) src
            GROUP BY date
          )
