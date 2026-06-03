@@ -450,6 +450,42 @@ if (query.search)  { conditions.push(`sm.title ILIKE $${pi++}`); params.push(`%$
     });
   }
 
+  // ── Inline referral milestone award ─────────────────────────
+  // Avoids circular dependency with AuthService by using DB directly
+  private async awardReferralMilestoneInline(refereeId: string, milestone: string) {
+    try {
+      const rows = await this.db.query(`SELECT referred_by FROM users WHERE id=$1`, [refereeId]);
+      if (!rows.length || !rows[0].referred_by) return;
+      const referrerId = rows[0].referred_by;
+      const coins = 50;
+
+      // Idempotency — UNIQUE constraint prevents double-award
+      const existing = await this.db.query(
+        `SELECT id FROM referral_milestones WHERE referrer_id=$1 AND referee_id=$2 AND milestone=$3`,
+        [referrerId, refereeId, milestone]
+      );
+      if (existing.length) return;
+
+      await this.db.query(
+        `INSERT INTO referral_milestones (referrer_id, referee_id, milestone, coins) VALUES ($1,$2,$3,$4)`,
+        [referrerId, refereeId, milestone, coins]
+      );
+      await this.db.query(
+        `UPDATE users SET coins = coins + $1, total_coins_earned = total_coins_earned + $1 WHERE id=$2`,
+        [coins, referrerId]
+      );
+      const bal = (await this.db.query(`SELECT coins FROM users WHERE id=$1`, [referrerId]))[0]?.coins ?? 0;
+      await this.db.query(
+        `INSERT INTO coin_transactions (user_id, type, amount, description, action, ref_id, balance)
+         VALUES ($1,'earned',$2,'Friend uploaded notes — referral bonus (2/3)','referral_engagement',$3,$4)`,
+        [referrerId, coins, refereeId, bal]
+      );
+      await this.cache.del(`user:${referrerId}`);
+    } catch (err: any) {
+      this.logger.warn(`awardReferralMilestoneInline failed: ${err.message}`);
+    }
+  }
+
   async adminApprove(id: string) {
     await this.db.query(`UPDATE study_materials SET status='approved', updated_at=NOW() WHERE id=$1`, [id]);
 
@@ -462,7 +498,8 @@ if (query.search)  { conditions.push(`sm.title ILIKE $${pi++}`); params.push(`%$
       if (mat?.uploader_id) {
         await this.coinsService.claimTask('upload_note', mat.uploader_id);
         // ── Referral milestone 2 — engagement: friend uploaded a material ──
-        this.authService.awardReferralMilestone(mat.uploader_id, 'engagement').catch(() => {});
+        // Done inline to avoid circular dependency with AuthService
+        this.awardReferralMilestoneInline(mat.uploader_id, 'engagement').catch(() => {});
       }
     } catch (_) { /* non-blocking — approval still succeeds */ }
 
