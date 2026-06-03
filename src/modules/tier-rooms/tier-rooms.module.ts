@@ -617,20 +617,27 @@ export class StudySessionsService {
 
     const s = sessions[0];
     const durationMins = Math.round((Date.now() - new Date(s.started_at).getTime()) / 60000);
+
+    // FIX: If no heartbeat has fired yet (active_minutes=0) but user actually studied,
+    // use wall-clock duration as active minutes (capped at 5 to prevent abuse).
+    // This ensures short sessions (<5 min) still show actual time instead of 0m.
+    const wallClockActiveMins = Math.min(durationMins, 5);
+    const finalActiveMins = s.active_minutes > 0 ? s.active_minutes : wallClockActiveMins;
     let bonusCoins = 0;
-    if (s.active_minutes >= 30) {
+    if (finalActiveMins >= 30) {
       bonusCoins = await this.authService.awardCoins(userId, 'study_room', sessionId);
     }
 
     await this.db.query(`
       UPDATE study_sessions
-      SET ended_at=NOW(), duration_minutes=$1, coins_earned=coins_earned+$2
+      SET ended_at=NOW(), duration_minutes=$1, coins_earned=coins_earned+$2,
+          active_minutes=GREATEST(active_minutes, $4)
       WHERE id=$3
-    `, [durationMins, bonusCoins, sessionId]);
+    `, [durationMins, bonusCoins, sessionId, finalActiveMins]);
     // ── Update streak + last_study_date ─────────────────────────
     // Only count study days with at least 1 active minute to prevent
     // AFK-only sessions from counting as a study day.
-    if (s.active_minutes >= 1) {
+    if (finalActiveMins >= 1) {
       const todayUTC = new Date().toISOString().slice(0, 10);
       const [lastStudy] = await this.db.query(
         `SELECT last_study_date FROM users WHERE id=$1`, [userId]
@@ -683,10 +690,10 @@ export class StudySessionsService {
 
     // ── Anti-cheat: check session end ─────────────────────────────
     const durationSecs = durationMins * 60;
-    await this.antiCheat.checkSessionEnd(userId, sessionId, durationSecs, s.active_minutes);
+    await this.antiCheat.checkSessionEnd(userId, sessionId, durationSecs, finalActiveMins);
     // ─────────────────────────────────────────────────────────────
 
-    this.logger.log(`Session ended: user=${userId} active=${s.active_minutes}min coins=${s.coins_earned}`);
+    this.logger.log(`Session ended: user=${userId} active=${finalActiveMins}min coins=${s.coins_earned}`);
 
     // Broadcast member_left + presence update so lobby and room members list
     // update immediately when a user ends their session
@@ -698,10 +705,10 @@ export class StudySessionsService {
     }
 
     return successResponse({
-      sessionId, durationMinutes: durationMins, activeMinutes: s.active_minutes,
+      sessionId, durationMinutes: durationMins, activeMinutes: finalActiveMins,
       totalCoins: s.coins_earned + bonusCoins, totalXp: s.xp_earned, bonusCoins,
-      message: s.active_minutes >= 60
-        ? `Great session! ${(s.active_minutes / 60).toFixed(1)} hours of focused study.`
+      message: finalActiveMins >= 60
+        ? `Great session! ${(finalActiveMins / 60).toFixed(1)} hours of focused study.`
         : 'Good work! Keep building your daily habit.',
     }, 'Session ended');
   }
