@@ -470,17 +470,47 @@ class DailyTargetsService {
   // ── DELETE /users/daily-targets/:id ──────────────────────
   async deleteTarget(targetId: string, userId: string) {
     const rows = await this.db.query(
-      `SELECT id FROM daily_targets WHERE id=$1 AND user_id=$2`,
+      `SELECT id, is_completed FROM daily_targets WHERE id=$1 AND user_id=$2`,
       [targetId, userId]
     );
     if (!rows.length) throw new NotFoundException('Target not found');
-    if (rows[0].is_completed) throw new BadRequestException('Cannot delete a completed target');
+
+    const wasCompleted = rows[0].is_completed;
+
+    // If coins were awarded for completing this target, debit them back
+    if (wasCompleted) {
+      const coinTx = await this.db.query(
+        `SELECT amount FROM coin_transactions
+         WHERE user_id=$1 AND action='target_complete' AND ref_id=$2
+         LIMIT 1`,
+        [userId, targetId]
+      );
+      if (coinTx.length) {
+        const amount = Math.abs(coinTx[0].amount);
+        // Append debit transaction — never edit history, only append
+        await this.db.query(
+          `INSERT INTO coin_transactions (user_id, action, amount, ref_id, note)
+           VALUES ($1, 'target_deleted', $2, $3, 'Target deleted — coins reversed')`,
+          [userId, -amount, targetId]
+        );
+        await this.db.query(
+          `UPDATE users SET coins = GREATEST(0, coins - $1) WHERE id=$2`,
+          [amount, userId]
+        );
+        await this.cache.del(`user:${userId}`);
+        await this.cache.del(`profile:${userId}`);
+      }
+    }
 
     await this.db.query(
       `DELETE FROM daily_targets WHERE id=$1 AND user_id=$2`,
       [targetId, userId]
     );
-    return successResponse(null, 'Target deleted');
+
+    return successResponse(
+      { coinsDebited: wasCompleted },
+      wasCompleted ? 'Target deleted — coins reversed' : 'Target deleted'
+    );
   }
 }
 
@@ -609,17 +639,6 @@ class UsersService {
   }
 
   async getStats(userId: string) {
-    // Ensure ca_activity table exists — safe to run every time (IF NOT EXISTS)
-    await this.db.query(`
-      CREATE TABLE IF NOT EXISTS ca_activity (
-        id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        user_id       UUID NOT NULL,
-        activity_type VARCHAR(20) NOT NULL DEFAULT 'reading',
-        duration_secs INT NOT NULL DEFAULT 0,
-        logged_at     TIMESTAMPTZ DEFAULT NOW()
-      )
-    `).catch(() => {});
-
     const [userRow, subjectStats, recentQuizzes, weeklyActivity] = await Promise.all([
       // Fetch user-level stats so Android header (rank/accuracy/study) always has data
       this.db.query(
@@ -690,17 +709,6 @@ class UsersService {
              AND ss.started_at >= NOW() - INTERVAL '28 days'
            GROUP BY DATE(ss.started_at)
          ),
-
-         ca_reading_activity AS (
-           -- Current affairs reading + MCQ time tracked from Android app
-           SELECT
-             DATE(ca.logged_at) AS date,
-             SUM(CEIL(ca.duration_secs::numeric / 60))::int AS study_mins
-           FROM ca_activity ca
-           WHERE ca.user_id = $1
-             AND ca.logged_at >= NOW() - INTERVAL '28 days'
-           GROUP BY DATE(ca.logged_at)
-         ),
       
          combined AS (
            SELECT
@@ -710,8 +718,6 @@ class UsersService {
              SELECT date, study_mins FROM quiz_activity
              UNION ALL
              SELECT date, study_mins FROM session_activity
-             UNION ALL
-             SELECT date, study_mins FROM ca_reading_activity
            ) src
            GROUP BY date
          )
