@@ -5,6 +5,7 @@ import {
   NotFoundException, BadRequestException, ForbiddenException,
   UseGuards, ParseUUIDPipe,
 } from '@nestjs/common';
+import { Throttle } from '@nestjs/throttler';
 import { InjectDataSource } from '@nestjs/typeorm';
 import { AchievementsService, WeeklyChallengesService, AchievementsModule } from '../achievements/achievements.module';
 import { NotificationsModule, NotificationService } from '../combined-modules-1.module';
@@ -233,6 +234,8 @@ if (q.scheduled_for) {
     // Cap at quiz duration * 60 + 30s grace period to handle network delays
     const maxSecs = (q.duration_mins || 60) * 60 + 30;
     const timeTakenSecs = Math.min(serverTimeSecs, maxSecs);
+
+    const total    = questions.length;
     const score    = total > 0 ? Math.round((correct / total) * 100) : 0;
     const accuracy = score;
     const isPassed = score >= q.passing_score;
@@ -349,7 +352,7 @@ return successResponse({
   accuracy,
   isPassed,
   coinsEarned,
-  timeTakenSecs: dto.timeTakenSecs || 0,
+  timeTakenSecs,
 
   rank,
   percentile,
