@@ -343,6 +343,16 @@ const percentile = Number(
       ).catch(() => {});
     }
 
+    // ── Referral milestone 3 — active: friend completed 5th quiz ──
+    try {
+      const attemptCount = await this.db.query(
+        `SELECT COUNT(*) FROM quiz_attempts WHERE user_id=$1`, [userId]
+      );
+      if (parseInt(attemptCount[0].count) === 5) {
+        this.authService?.awardReferralMilestone?.(userId, 'active').catch(() => {});
+      }
+    } catch (_) {}
+
 return successResponse({
   attemptId: attempt[0].id,
   score,

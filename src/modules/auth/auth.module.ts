@@ -305,13 +305,58 @@ export class AuthService {
     await this.awardCoins(newUser.id, 'daily_login');
 
     if (referrerId) {
-      await this.awardCoins(referrerId, 'referral', newUser.id);
-      const refBonus = parseInt(this.config.get('business.referralCoinsReferee'));
-      await this.db.query(`UPDATE users SET coins = coins + $1 WHERE id = $2`, [refBonus, newUser.id]);
-      const bal = (await this.db.query(`SELECT coins FROM users WHERE id=$1`, [newUser.id]))[0].coins;
+      // ── Ensure referral_milestones table exists (migration-safe) ──
+      await this.db.query(`
+        CREATE TABLE IF NOT EXISTS referral_milestones (
+          id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+          referrer_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          referee_id  UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+          milestone   VARCHAR(30) NOT NULL,   -- 'signup' | 'engagement' | 'active'
+          coins       INT NOT NULL DEFAULT 0,
+          awarded_at  TIMESTAMPTZ DEFAULT NOW(),
+          UNIQUE (referrer_id, referee_id, milestone)
+        )
+      `).catch(() => {});
+
+      // Milestone 1 — signup: award 50 coins to referrer
+      const M1_COINS = 50;
+      const existing = await this.db.query(
+        `SELECT id FROM referral_milestones
+         WHERE referrer_id=$1 AND referee_id=$2 AND milestone='signup'`,
+        [referrerId, newUser.id]
+      );
+      if (!existing.length) {
+        await this.db.query(
+          `INSERT INTO referral_milestones (referrer_id, referee_id, milestone, coins)
+           VALUES ($1,$2,'signup',$3)`,
+          [referrerId, newUser.id, M1_COINS]
+        );
+        await this.db.query(
+          `UPDATE users SET coins = coins + $1, total_coins_earned = total_coins_earned + $1
+           WHERE id = $2`,
+          [M1_COINS, referrerId]
+        );
+        const bal = (await this.db.query(`SELECT coins FROM users WHERE id=$1`, [referrerId]))[0].coins;
+        await this.db.query(
+          `INSERT INTO coin_transactions (user_id, type, amount, description, action, ref_id, balance)
+           VALUES ($1,'earned',$2,'Friend signed up — referral bonus (1/3)','referral_signup',$3,$4)`,
+          [referrerId, M1_COINS, newUser.id, bal]
+        );
+        await this.cache.del(`user:${referrerId}`);
+      }
+
+      // Bonus coins to the new user for signing up via referral
+      const REFEREE_BONUS = 25;
       await this.db.query(
-        `INSERT INTO coin_transactions (user_id, type, amount, description, action, balance) VALUES ($1,'earned',$2,'Referral signup bonus','referral_signup',$3)`,
-        [newUser.id, refBonus, bal]
+        `UPDATE users SET coins = coins + $1, total_coins_earned = total_coins_earned + $1
+         WHERE id = $2`,
+        [REFEREE_BONUS, newUser.id]
+      );
+      const refBal = (await this.db.query(`SELECT coins FROM users WHERE id=$1`, [newUser.id]))[0].coins;
+      await this.db.query(
+        `INSERT INTO coin_transactions (user_id, type, amount, description, action, balance)
+         VALUES ($1,'earned',$2,'Joined via referral — welcome bonus','referral_joined',$3)`,
+        [newUser.id, REFEREE_BONUS, refBal]
       );
     }
 
@@ -508,6 +553,131 @@ export class AuthService {
     // Subscriptions
     subscription_bonus: { coins: 0,   maxPerDay: 1 },
   };
+
+  // ─────────────────────────────────────────────────────────────
+  // awardReferralMilestone — called from any module when a
+  // milestone-triggering action happens (enrollment, upload, quiz)
+  // Safe to call multiple times — UNIQUE constraint prevents double-award
+  // ─────────────────────────────────────────────────────────────
+  async awardReferralMilestone(refereeId: string, milestone: 'engagement' | 'active') {
+    try {
+      // Find who referred this user
+      const rows = await this.db.query(
+        `SELECT referred_by FROM users WHERE id=$1`, [refereeId]
+      );
+      if (!rows.length || !rows[0].referred_by) return;
+      const referrerId = rows[0].referred_by;
+
+      const MILESTONE_COINS: Record<string, number> = {
+        engagement: 50,  // friend enrolled in course or uploaded material
+        active:     50,  // friend completed 5 quizzes
+      };
+      const coins = MILESTONE_COINS[milestone] ?? 0;
+      if (coins <= 0) return;
+
+      // Check if already awarded (UNIQUE constraint prevents duplicates but check first for clarity)
+      const existing = await this.db.query(
+        `SELECT id FROM referral_milestones
+         WHERE referrer_id=$1 AND referee_id=$2 AND milestone=$3`,
+        [referrerId, refereeId, milestone]
+      );
+      if (existing.length) return;  // already awarded
+
+      await this.db.query(
+        `INSERT INTO referral_milestones (referrer_id, referee_id, milestone, coins)
+         VALUES ($1,$2,$3,$4)`,
+        [referrerId, refereeId, milestone, coins]
+      );
+      await this.db.query(
+        `UPDATE users SET coins = coins + $1, total_coins_earned = total_coins_earned + $1
+         WHERE id = $2`,
+        [coins, referrerId]
+      );
+      const bal = (await this.db.query(`SELECT coins FROM users WHERE id=$1`, [referrerId]))[0].coins;
+      const descriptions: Record<string, string> = {
+        engagement: 'Friend enrolled in course / uploaded notes (2/3)',
+        active:     'Friend completed 5 quizzes — fully active! (3/3)',
+      };
+      await this.db.query(
+        `INSERT INTO coin_transactions (user_id, type, amount, description, action, ref_id, balance)
+         VALUES ($1,'earned',$2,$3,$4,$5,$6)`,
+        [referrerId, coins, descriptions[milestone], `referral_${milestone}`, refereeId, bal]
+      );
+      await this.cache.del(`user:${referrerId}`);
+    } catch (err: any) {
+      console.error('awardReferralMilestone error:', err.message);
+    }
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // getReferralStats — returns referral list with milestone progress
+  // Used by Android wallet screen referral tab
+  // ─────────────────────────────────────────────────────────────
+  async getReferralStats(userId: string) {
+    // Ensure table exists
+    await this.db.query(`
+      CREATE TABLE IF NOT EXISTS referral_milestones (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        referrer_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        referee_id  UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        milestone   VARCHAR(30) NOT NULL,
+        coins       INT NOT NULL DEFAULT 0,
+        awarded_at  TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE (referrer_id, referee_id, milestone)
+      )
+    `).catch(() => {});
+
+    // All users referred by this user, with their milestone status
+    const referees = await this.db.query(`
+      SELECT
+        u.id,
+        u.name,
+        u.created_at              AS joined_at,
+        COALESCE(rm_signup.coins,     0)  AS coins_signup,
+        COALESCE(rm_engage.coins,     0)  AS coins_engagement,
+        COALESCE(rm_active.coins,     0)  AS coins_active,
+        rm_signup.awarded_at              AS signup_at,
+        rm_engage.awarded_at              AS engagement_at,
+        rm_active.awarded_at              AS active_at
+      FROM users u
+      LEFT JOIN referral_milestones rm_signup
+             ON rm_signup.referee_id  = u.id
+            AND rm_signup.referrer_id = $1
+            AND rm_signup.milestone   = 'signup'
+      LEFT JOIN referral_milestones rm_engage
+             ON rm_engage.referee_id  = u.id
+            AND rm_engage.referrer_id = $1
+            AND rm_engage.milestone   = 'engagement'
+      LEFT JOIN referral_milestones rm_active
+             ON rm_active.referee_id  = u.id
+            AND rm_active.referrer_id = $1
+            AND rm_active.milestone   = 'active'
+      WHERE u.referred_by = $1
+      ORDER BY u.created_at DESC
+    `, [userId]);
+
+    const totalEarned = referees.reduce((s: number, r: any) =>
+      s + Number(r.coins_signup) + Number(r.coins_engagement) + Number(r.coins_active), 0);
+
+    const user = await this.db.query(`SELECT referral_code FROM users WHERE id=$1`, [userId]);
+
+    return {
+      referralCode:  user[0]?.referral_code ?? '',
+      totalReferrals: referees.length,
+      totalEarned,
+      referees: referees.map((r: any) => ({
+        id:            r.id,
+        name:          r.name,
+        joinedAt:      r.joined_at,
+        milestones: {
+          signup:     { earned: Number(r.coins_signup)     > 0, coins: Number(r.coins_signup),     awardedAt: r.signup_at },
+          engagement: { earned: Number(r.coins_engagement) > 0, coins: Number(r.coins_engagement), awardedAt: r.engagement_at },
+          active:     { earned: Number(r.coins_active)     > 0, coins: Number(r.coins_active),     awardedAt: r.active_at },
+        },
+        totalCoinsEarned: Number(r.coins_signup) + Number(r.coins_engagement) + Number(r.coins_active),
+      })),
+    };
+  }
 
   async awardCoins(userId: string, action: string, refId?: string, coinsOverride?: number): Promise<number> {
     try {
@@ -734,6 +904,13 @@ export class AuthController {
   async getMe(@Req() req: any) {
     const user = await this.authService.getMe(req.user.id);
     return successResponse({ user });
+  }
+
+  @Get('referrals')
+  @UseGuards(JwtAuthGuard)
+  async getReferralStats(@Req() req: any) {
+    const stats = await this.authService.getReferralStats(req.user.id);
+    return successResponse(stats);
   }
 
 

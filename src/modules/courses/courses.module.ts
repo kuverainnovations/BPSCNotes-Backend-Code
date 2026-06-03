@@ -445,6 +445,10 @@ export class CoursesService {
     await this.db.query(`UPDATE courses SET enrollment_count = enrollment_count + 1 WHERE id = $1`, [courseId]);
     const keys = await this.cache.store.keys('courses:*');
     for (const k of keys) await this.cache.del(k);
+
+    // ── Referral milestone 2 — engagement: friend enrolled in a course ──
+    this.authService.awardReferralMilestone(userId, 'engagement').catch(() => {});
+
     this.notifService.pushToUser(
       userId,
       '📚 Enrolled!',

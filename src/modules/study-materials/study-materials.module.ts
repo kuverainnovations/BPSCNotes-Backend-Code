@@ -461,6 +461,8 @@ if (query.search)  { conditions.push(`sm.title ILIKE $${pi++}`); params.push(`%$
       );
       if (mat?.uploader_id) {
         await this.coinsService.claimTask('upload_note', mat.uploader_id);
+        // ── Referral milestone 2 — engagement: friend uploaded a material ──
+        this.authService.awardReferralMilestone(mat.uploader_id, 'engagement').catch(() => {});
       }
     } catch (_) { /* non-blocking — approval still succeeds */ }
 
