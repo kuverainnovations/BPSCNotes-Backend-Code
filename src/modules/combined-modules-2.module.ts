@@ -470,18 +470,41 @@ class DailyTargetsService {
   // ── DELETE /users/daily-targets/:id ──────────────────────
   async deleteTarget(targetId: string, userId: string) {
     const rows = await this.db.query(
-      `SELECT id, is_completed FROM daily_targets WHERE id=$1 AND user_id=$2`,
+      `SELECT id, title, is_completed, is_carried_forward, target_date
+       FROM daily_targets WHERE id=$1 AND user_id=$2`,
       [targetId, userId]
     );
     if (!rows.length) throw new NotFoundException('Target not found');
 
-    const wasCompleted = rows[0].is_completed;
+    const target      = rows[0];
+    const wasCompleted = target.is_completed;
+
+    // ── KEY FIX: if this is a carried-forward copy, also delete ALL
+    // source originals (same title, same user, not carried forward, incomplete)
+    // so getTargets() cannot re-create this target on next load.
+    if (target.is_carried_forward) {
+      await this.db.query(
+        `DELETE FROM daily_targets
+         WHERE user_id=$1
+           AND title=$2
+           AND is_carried_forward = FALSE
+           AND is_completed = FALSE`,
+        [userId, target.title]
+      );
+      // Also delete any other carried-forward copies of the same title today
+      await this.db.query(
+        `DELETE FROM daily_targets
+         WHERE user_id=$1
+           AND title=$2
+           AND is_carried_forward = TRUE
+           AND id != $3`,
+        [userId, target.title, targetId]
+      );
+    }
 
     // If completed, try to debit the coins that were awarded — safe, non-blocking
     if (wasCompleted) {
       try {
-        // Find the original credit for completing this target
-        // Use only safe columns that exist in all schema versions
         const coinTx = await this.db.query(
           `SELECT id, amount FROM coin_transactions
            WHERE user_id=$1 AND action='target_complete'
@@ -500,7 +523,7 @@ class DailyTargetsService {
               `INSERT INTO coin_transactions (user_id, type, amount, description, action, balance)
                VALUES ($1, 'spent', $2, 'Target deleted — coins reversed', 'target_deleted', $3)`,
               [userId, -amount, bal]
-            ).catch(() => {}); // non-blocking — delete succeeds even if history insert fails
+            ).catch(() => {});
           }
         }
       } catch (_) {
@@ -508,6 +531,7 @@ class DailyTargetsService {
       }
     }
 
+    // Delete the target itself
     await this.db.query(
       `DELETE FROM daily_targets WHERE id=$1 AND user_id=$2`,
       [targetId, userId]
