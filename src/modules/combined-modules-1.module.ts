@@ -153,29 +153,48 @@ class CurrentAffairsService {
   async ensureCaMcqTable() {
     await this.db.query(`
       CREATE TABLE IF NOT EXISTS ca_mcqs (
-        id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        affair_id    UUID NOT NULL REFERENCES current_affairs(id) ON DELETE CASCADE,
-        question     TEXT NOT NULL,
-        option_a     TEXT NOT NULL,
-        option_b     TEXT NOT NULL,
-        option_c     TEXT NOT NULL,
-        option_d     TEXT NOT NULL,
-        correct      CHAR(1) NOT NULL CHECK (correct IN ('a','b','c','d','e')),
-        option_e     TEXT NOT NULL DEFAULT '',
-        explanation  TEXT,
-        difficulty   VARCHAR(10) DEFAULT 'medium',
-        created_at   TIMESTAMPTZ DEFAULT NOW()
+        id                UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        affair_id         UUID NOT NULL REFERENCES current_affairs(id) ON DELETE CASCADE,
+        question          TEXT NOT NULL,
+        option_a          TEXT NOT NULL,
+        option_b          TEXT NOT NULL,
+        option_c          TEXT NOT NULL,
+        option_d          TEXT NOT NULL,
+        correct           CHAR(1) NOT NULL CHECK (correct IN ('a','b','c','d','e')),
+        option_e          TEXT NOT NULL DEFAULT '',
+        explanation       TEXT,
+        difficulty        VARCHAR(10) DEFAULT 'medium',
+        time_per_question INT DEFAULT 0,  -- seconds per question (0 = no timer, admin-controlled)
+        created_at        TIMESTAMPTZ DEFAULT NOW()
       )
     `);
   }
 
   async getMcqs(affairId: string) {
     await this.ensureCaMcqTable();
+    // ANTI-CHEAT: exclude 'correct' field — client must not know correct answer before answering
+    // correct answer returned after user submits (handled client-side on tap in learning mode)
+    // Also ensure time_per_question column exists (migration-safe)
+    await this.db.query(`
+      ALTER TABLE ca_mcqs ADD COLUMN IF NOT EXISTS time_per_question INT DEFAULT 0
+    `).catch(() => {});
     const rows = await this.db.query(
-      `SELECT * FROM ca_mcqs WHERE affair_id=$1 ORDER BY created_at ASC`,
+      `SELECT id, affair_id, question, option_a, option_b, option_c, option_d, option_e,
+              explanation, difficulty, time_per_question
+       FROM ca_mcqs WHERE affair_id=$1 ORDER BY created_at ASC`,
       [affairId]
     );
     return successResponse({ mcqs: rows });
+  }
+
+  async getMcqAnswer(mcqId: string) {
+    // Separate endpoint to reveal correct answer after user has answered
+    const rows = await this.db.query(
+      `SELECT id, correct, explanation FROM ca_mcqs WHERE id=$1`,
+      [mcqId]
+    );
+    if (!rows.length) throw new Error('MCQ not found');
+    return successResponse({ correct: rows[0].correct, explanation: rows[0].explanation });
   }
 
   async addMcq(affairId: string, data: any) {
