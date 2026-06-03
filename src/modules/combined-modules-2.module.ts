@@ -477,28 +477,34 @@ class DailyTargetsService {
 
     const wasCompleted = rows[0].is_completed;
 
-    // If coins were awarded for completing this target, debit them back
+    // If completed, try to debit the coins that were awarded — safe, non-blocking
     if (wasCompleted) {
-      const coinTx = await this.db.query(
-        `SELECT amount FROM coin_transactions
-         WHERE user_id=$1 AND action='target_complete' AND ref_id=$2
-         LIMIT 1`,
-        [userId, targetId]
-      );
-      if (coinTx.length) {
-        const amount = Math.abs(coinTx[0].amount);
-        // Append debit transaction — never edit history, only append
-        await this.db.query(
-          `INSERT INTO coin_transactions (user_id, action, amount, ref_id, note)
-           VALUES ($1, 'target_deleted', $2, $3, 'Target deleted — coins reversed')`,
-          [userId, -amount, targetId]
+      try {
+        // Find the original credit for completing this target
+        // Use only safe columns that exist in all schema versions
+        const coinTx = await this.db.query(
+          `SELECT id, amount FROM coin_transactions
+           WHERE user_id=$1 AND action='target_complete'
+           ORDER BY created_at DESC LIMIT 1`,
+          [userId]
         );
-        await this.db.query(
-          `UPDATE users SET coins = GREATEST(0, coins - $1) WHERE id=$2`,
-          [amount, userId]
-        );
-        await this.cache.del(`user:${userId}`);
-        await this.cache.del(`profile:${userId}`);
+        if (coinTx.length) {
+          const amount = Math.abs(Number(coinTx[0].amount));
+          if (amount > 0) {
+            await this.db.query(
+              `UPDATE users SET coins = GREATEST(0, coins - $1) WHERE id=$2`,
+              [amount, userId]
+            );
+            const bal = (await this.db.query(`SELECT coins FROM users WHERE id=$1`, [userId]))[0]?.coins ?? 0;
+            await this.db.query(
+              `INSERT INTO coin_transactions (user_id, type, amount, description, action, balance)
+               VALUES ($1, 'spent', $2, 'Target deleted — coins reversed', 'target_deleted', $3)`,
+              [userId, -amount, bal]
+            ).catch(() => {}); // non-blocking — delete succeeds even if history insert fails
+          }
+        }
+      } catch (_) {
+        // Coin debit failure must NOT block the delete
       }
     }
 
