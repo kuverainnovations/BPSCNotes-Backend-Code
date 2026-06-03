@@ -669,6 +669,17 @@ class UsersService {
   }
 
   async getStats(userId: string) {
+    // Ensure ca_activity table exists before querying it — migration-safe
+    await this.db.query(`
+      CREATE TABLE IF NOT EXISTS ca_activity (
+        id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id       UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        activity_type VARCHAR(50) NOT NULL DEFAULT 'ca_reading',
+        duration_secs INT NOT NULL DEFAULT 0,
+        created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `).catch(() => {});
+
     const [userRow, subjectStats, recentQuizzes, weeklyActivity] = await Promise.all([
       // Fetch user-level stats so Android header (rank/accuracy/study) always has data
       this.db.query(
@@ -707,7 +718,7 @@ class UsersService {
       ),
       this.db.query(
         `-- FIX: 28-day activity for heatmap
-         -- Combines quiz attempts + study session minutes per day
+         -- Combines quiz attempts + study session minutes + CA reading time per day
       
          WITH days AS (
            SELECT generate_series(
@@ -739,6 +750,17 @@ class UsersService {
              AND ss.started_at >= NOW() - INTERVAL '28 days'
            GROUP BY DATE(ss.started_at)
          ),
+
+         ca_reading_activity AS (
+           -- Current affairs reading + MCQ time (logged by Android TrackStudyTime)
+           SELECT
+             DATE(ca.created_at) AS date,
+             CEIL(SUM(ca.duration_secs)::numeric / 60)::int AS study_mins
+           FROM ca_activity ca
+           WHERE ca.user_id = $1
+             AND ca.created_at >= NOW() - INTERVAL '28 days'
+           GROUP BY DATE(ca.created_at)
+         ),
       
          combined AS (
            SELECT
@@ -748,6 +770,8 @@ class UsersService {
              SELECT date, study_mins FROM quiz_activity
              UNION ALL
              SELECT date, study_mins FROM session_activity
+             UNION ALL
+             SELECT date, study_mins FROM ca_reading_activity
            ) src
            GROUP BY date
          )

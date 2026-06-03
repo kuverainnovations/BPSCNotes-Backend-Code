@@ -178,6 +178,38 @@ class CurrentAffairsService {
     return successResponse({ mcqs: rows });
   }
 
+  async logActivity(userId: string, activityType: string, durationSecs: number) {
+    // Ensure table exists — migration-safe
+    await this.db.query(`
+      CREATE TABLE IF NOT EXISTS ca_activity (
+        id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id      UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        activity_type VARCHAR(50) NOT NULL DEFAULT 'ca_reading',
+        duration_secs INT NOT NULL DEFAULT 0,
+        created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `).catch(() => {});
+
+    const safeDuration = Math.max(0, Math.min(durationSecs, 3600)); // cap at 1hr
+    if (safeDuration < 10) return successResponse(null, 'Too short to log');
+
+    await this.db.query(
+      `INSERT INTO ca_activity (user_id, activity_type, duration_secs)
+       VALUES ($1, $2, $3)`,
+      [userId, activityType || 'ca_reading', safeDuration]
+    );
+
+    // Add to total_study_minutes on users table too
+    const durationMins = Math.ceil(safeDuration / 60);
+    await this.db.query(
+      `UPDATE users SET total_study_minutes = total_study_minutes + $1 WHERE id=$2`,
+      [durationMins, userId]
+    );
+    await this.cache.del(`user:${userId}`);
+
+    return successResponse({ logged: true, durationSecs: safeDuration });
+  }
+
   async addMcq(affairId: string, data: any) {
     await this.ensureCaMcqTable();
     if (!data.question || !data.optionA || !data.optionB || !data.correct) {
@@ -213,40 +245,6 @@ class CurrentAffairsService {
     await this.db.query(`DELETE FROM ca_mcqs WHERE id=$1`, [mcqId]);
     return successResponse(null, 'MCQ deleted');
   }
-
-  async getMcqAnswer(mcqId: string) {
-    const rows = await this.db.query(
-      `SELECT id, correct, explanation FROM ca_mcqs WHERE id=$1`,
-      [mcqId]
-    );
-    if (!rows.length) throw new Error('MCQ not found');
-    return successResponse({ correct: rows[0].correct, explanation: rows[0].explanation });
-  }
-
-  // ── Activity Logging ─────────────────────────────────────────
-  async logActivity(userId: string, dto: { activityType: string; durationSecs: number }) {
-    // Migration-safe table creation
-    await this.db.query(`
-      CREATE TABLE IF NOT EXISTS ca_activity (
-        id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        user_id       UUID NOT NULL,
-        activity_type VARCHAR(20) NOT NULL DEFAULT 'reading',
-        duration_secs INT NOT NULL DEFAULT 0,
-        logged_at     TIMESTAMPTZ DEFAULT NOW()
-      )
-    `).catch(() => {});
-
-    // Ignore < 10s sessions, cap at 3600s to prevent inflation
-    const secs = Math.min(Math.max(dto.durationSecs || 0, 0), 3600);
-    if (secs < 10) return { logged: false, reason: 'too_short' };
-
-    await this.db.query(
-      `INSERT INTO ca_activity (user_id, activity_type, duration_secs)
-       VALUES ($1, $2, $3)`,
-      [userId, dto.activityType || 'reading', secs]
-    );
-    return successResponse({ logged: true, durationSecs: secs });
-  }
 }
 
 @ApiTags('Current Affairs') @ApiBearerAuth() @UseGuards(JwtAuthGuard) @Controller('current-affairs')
@@ -256,8 +254,9 @@ class CurrentAffairsController {
   @Get(':id') findOne(@Param('id', ParseUUIDPipe) id: string, @Req() r: any) { return this.s.findOne(id, r.user.id); }
   @Post(':id/bookmark') @HttpCode(200) toggleBookmark(@Param('id', ParseUUIDPipe) id: string, @Req() r: any) { return this.s.toggleBookmark(id, r.user.id); }
   @Get(':id/mcqs') getMcqs(@Param('id', ParseUUIDPipe) id: string) { return this.s.getMcqs(id); }
-  @Get('mcqs/:mcqId/answer') getMcqAnswer(@Param('mcqId', ParseUUIDPipe) mcqId: string) { return this.s.getMcqAnswer(mcqId); }
-  @Post('log-activity') @HttpCode(200) logActivity(@Req() r: any, @Body() dto: any) { return this.s.logActivity(r.user.id, dto); }
+  @Post('log-activity') @HttpCode(200) logActivity(@Body() body: any, @Req() r: any) {
+    return this.s.logActivity(r.user.id, body.activityType, body.durationSecs);
+  }
 }
 
 @ApiTags('Admin — Current Affairs') @ApiBearerAuth() @Public()
