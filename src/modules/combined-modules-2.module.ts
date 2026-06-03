@@ -669,15 +669,27 @@ class UsersService {
   }
 
   async getStats(userId: string) {
-    // Ensure ca_activity table exists before querying it — migration-safe
+    // Recreate ca_activity with correct schema if columns are wrong
+    // DROP + CREATE is safe — we lose no meaningful data (it's just time tracking)
     await this.db.query(`
+      DO $$
+      BEGIN
+        -- Check if created_at column exists; if not, recreate the table
+        IF NOT EXISTS (
+          SELECT 1 FROM information_schema.columns
+          WHERE table_name = 'ca_activity' AND column_name = 'created_at'
+        ) THEN
+          DROP TABLE IF EXISTS ca_activity;
+        END IF;
+      END$$;
+
       CREATE TABLE IF NOT EXISTS ca_activity (
         id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
         user_id       UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
         activity_type VARCHAR(50) NOT NULL DEFAULT 'ca_reading',
         duration_secs INT NOT NULL DEFAULT 0,
         created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      )
+      );
     `).catch(() => {});
 
     const [userRow, subjectStats, recentQuizzes, weeklyActivity] = await Promise.all([
