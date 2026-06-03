@@ -609,6 +609,17 @@ class UsersService {
   }
 
   async getStats(userId: string) {
+    // Ensure ca_activity table exists — safe to run every time (IF NOT EXISTS)
+    await this.db.query(`
+      CREATE TABLE IF NOT EXISTS ca_activity (
+        id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id       UUID NOT NULL,
+        activity_type VARCHAR(20) NOT NULL DEFAULT 'reading',
+        duration_secs INT NOT NULL DEFAULT 0,
+        logged_at     TIMESTAMPTZ DEFAULT NOW()
+      )
+    `).catch(() => {});
+
     const [userRow, subjectStats, recentQuizzes, weeklyActivity] = await Promise.all([
       // Fetch user-level stats so Android header (rank/accuracy/study) always has data
       this.db.query(
