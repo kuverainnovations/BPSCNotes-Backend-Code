@@ -137,17 +137,15 @@ if (q.scheduled_for) {
   }
 }
 
-    // Fetch questions — THIS is the only place questions are returned
+    // Fetch questions — correct_option and explanation deliberately excluded
+    // to prevent cheating. They are only returned in the /submit response.
     const questions = await this.db.query(
       `SELECT id, question_text, option_a, option_b, option_c, option_d,
-       explanation,
        question_type, question_image_url, option_type,
        option_a_image, option_b_image, option_c_image, option_d_image,
        subject, sort_order,
               COALESCE(question_type, 'text')   AS question_type,
-              question_image_url,
-              COALESCE(option_type, 'text')     AS option_type,
-              option_a_image, option_b_image, option_c_image, option_d_image
+              COALESCE(option_type, 'text')     AS option_type
        FROM quiz_questions
        WHERE quiz_id=$1
        ORDER BY sort_order ASC`,
@@ -175,6 +173,23 @@ if (q.scheduled_for) {
     if (!quiz.length) throw new NotFoundException('Quiz not found');
     const q = quiz[0];
 
+    // ANTI-CHEAT: Verify user actually started this quiz via /start
+    // Prevents direct API submit without loading questions first
+    const startedAttempt = await this.db.query(
+      `SELECT id FROM quiz_attempts
+       WHERE user_id=$1 AND quiz_id=$2
+       ORDER BY attempted_at DESC LIMIT 1`,
+      [userId, quizId]
+    );
+    if (!startedAttempt.length) {
+      throw new BadRequestException('You must start the quiz before submitting answers.');
+    }
+
+    // Validate answers array
+    if (!Array.isArray(dto.answers)) {
+      throw new BadRequestException('answers must be an array.');
+    }
+
     // Fetch correct answers + explanations
     const questions = await this.db.query(
       `SELECT id, correct_option, explanation, question_text,
@@ -194,7 +209,10 @@ if (q.scheduled_for) {
     );
 
     let correct = 0;
-    const evaluated = dto.answers.map((a: any) => {
+    // ANTI-CHEAT: Only evaluate answers for questionIds that belong to THIS quiz
+    // Filters out any injected fake questionIds from the payload
+    const validAnswers = dto.answers.filter((a: any) => qMap[a.questionId]);
+    const evaluated = validAnswers.map((a: any) => {
       const info      = qMap[a.questionId];
       const isCorrect = info?.correct === a.answer;
       if (isCorrect) correct++;
@@ -207,7 +225,14 @@ if (q.scheduled_for) {
       };
     });
 
-    const total    = questions.length;
+    // ANTI-CHEAT: Calculate time server-side — don't trust client timeTakenSecs
+    // Use attempted_at from the start record vs NOW()
+    const serverTimeSecs = Math.round(
+      (Date.now() - new Date(startedAttempt[0].attempted_at).getTime()) / 1000
+    );
+    // Cap at quiz duration * 60 + 30s grace period to handle network delays
+    const maxSecs = (q.duration_mins || 60) * 60 + 30;
+    const timeTakenSecs = Math.min(serverTimeSecs, maxSecs);
     const score    = total > 0 ? Math.round((correct / total) * 100) : 0;
     const accuracy = score;
     const isPassed = score >= q.passing_score;
@@ -217,7 +242,7 @@ if (q.scheduled_for) {
          (user_id, quiz_id, score, total_questions, correct_answers, time_taken_secs, coins_earned, answers, is_passed, submitted_at)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW())
        RETURNING id, attempted_at`,
-      [userId, quizId, score, total, correct, dto.timeTakenSecs || 0, isPassed ? q.coins_reward : 0, JSON.stringify(evaluated), isPassed]
+      [userId, quizId, score, total, correct, timeTakenSecs, isPassed ? q.coins_reward : 0, JSON.stringify(evaluated), isPassed]
     );
 
     // Update quiz stats
@@ -671,6 +696,7 @@ class QuizzesController {
 
   /** POST /quizzes/:id/submit */
   @Post(':id/submit')
+  @Throttle({ default: { limit: 5, ttl: 60000 } })  // ANTI-CHEAT: max 5 submits/min
   @HttpCode(HttpStatus.OK)
   submit(@Param('id', ParseUUIDPipe) id: string, @Req() r: any, @Body() dto: any) {
     return this.s.submit(id, r.user.id, dto);
