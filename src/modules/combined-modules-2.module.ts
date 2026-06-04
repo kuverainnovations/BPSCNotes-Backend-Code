@@ -668,7 +668,8 @@ class UsersService {
     const ext      = path.extname(file.originalname) || '.jpg';
     const filename = `avatar_${userId}${ext}`;
     const destPath = path.join(avatarDir, filename);
-    fs.renameSync(file.path, destPath);
+    fs.copyFileSync(file.path, destPath);
+    try { fs.unlinkSync(file.path); } catch (_) {}   // clean up temp, non-blocking
     const baseUrl  = process.env.APP_URL ?? 'https://api.bpscnotes.in';
     const url      = `${baseUrl}/uploads/avatars/${filename}`;
     await this.db.query(`UPDATE users SET avatar_url=$1, updated_at=NOW() WHERE id=$2`, [url, userId]);
