@@ -648,7 +648,7 @@ class UsersService {
   async updateProfile(userId: string, data: any) {
     const fields: string[] = [], vals: any[] = [];
     let i = 1;
-    const allowed = ['name','bio','email','district','state'];
+    const allowed = ['name','bio','email','district','state','avatar_url'];
     for (const key of allowed) {
       if (data[key] !== undefined) { fields.push(`${key}=$${i++}`); vals.push(data[key]); }
     }
@@ -656,6 +656,25 @@ class UsersService {
     await this.cache.del(`profile:${userId}`);
     await this.cache.del(`user:${userId}`);
     return successResponse(null, 'Profile updated');
+  }
+
+  async uploadAvatar(userId: string, file: Express.Multer.File) {
+    if (!file) throw new Error('No file uploaded');
+    const path     = require('path');
+    const fs       = require('fs');
+    const uploadDir = process.env.UPLOAD_DIR ?? path.join(process.cwd(), 'uploads');
+    const avatarDir = path.join(uploadDir, 'avatars');
+    fs.mkdirSync(avatarDir, { recursive: true });
+    const ext      = path.extname(file.originalname) || '.jpg';
+    const filename = `avatar_${userId}${ext}`;
+    const destPath = path.join(avatarDir, filename);
+    fs.renameSync(file.path, destPath);
+    const baseUrl  = process.env.APP_URL ?? 'https://api.bpscnotes.in';
+    const url      = `${baseUrl}/uploads/avatars/${filename}`;
+    await this.db.query(`UPDATE users SET avatar_url=$1, updated_at=NOW() WHERE id=$2`, [url, userId]);
+    await this.cache.del(`profile:${userId}`);
+    await this.cache.del(`user:${userId}`);
+    return successResponse({ url }, 'Avatar updated');
   }
 
   async updateExamTarget(userId: string, data: any) {
@@ -960,6 +979,11 @@ class UsersController {
   constructor(private s: UsersService) {}
   @Get('profile')     getProfile(@Req() r: any) { return this.s.getProfile(r.user.id); }
   @Put('profile')     updateProfile(@Req() r: any, @Body() dto: any) { return this.s.updateProfile(r.user.id, dto); }
+  @Post('upload-avatar')
+  @UseInterceptors(FileInterceptor('avatar', { dest: '/tmp/bpsc-uploads' }))
+  uploadAvatar(@Req() r: any, @UploadedFile() file: Express.Multer.File) {
+    return this.s.uploadAvatar(r.user.id, file);
+  }
   @Put('exam-target') updateExamTarget(@Req() r: any, @Body() dto: any) { return this.s.updateExamTarget(r.user.id, dto); }
   @Get('stats')       getStats(@Req() r: any) { return this.s.getStats(r.user.id); }
   @Get('leaderboard') getLeaderboard(@Query() q: any, @Req() r: any) { return this.s.getLeaderboard(q, r.user.id); }
