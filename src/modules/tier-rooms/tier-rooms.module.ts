@@ -704,8 +704,22 @@ export class StudySessionsService {
       });
     }
 
+    // Calculate total study minutes for today (all sessions combined)
+    const todayRows = await this.db.query(`
+      SELECT COALESCE(SUM(
+        CASE WHEN ended_at IS NOT NULL THEN duration_minutes
+             ELSE GREATEST(active_minutes, $2)  -- include current session
+        END
+      ), 0)::int AS today_mins
+      FROM study_sessions
+      WHERE user_id=$1
+        AND DATE(started_at AT TIME ZONE 'UTC') = CURRENT_DATE
+    `, [userId, finalActiveMins]);
+    const todayStudyMins = todayRows[0]?.today_mins ?? durationMins;
+
     return successResponse({
       sessionId, durationMinutes: durationMins, activeMinutes: finalActiveMins,
+      todayStudyMinutes: todayStudyMins,
       totalCoins: s.coins_earned + bonusCoins, totalXp: s.xp_earned, bonusCoins,
       message: finalActiveMins >= 60
         ? `Great session! ${(finalActiveMins / 60).toFixed(1)} hours of focused study.`
