@@ -666,7 +666,7 @@ class UsersService {
     const avatarDir = path.join(uploadDir, 'avatars');
     fs.mkdirSync(avatarDir, { recursive: true });
     const ext      = path.extname(file.originalname) || '.jpg';
-    const filename = `avatar_${userId}${ext}`;
+    const filename = `avatar_${userId}_${Date.now()}${ext}`;
     const destPath = path.join(avatarDir, filename);
     fs.copyFileSync(file.path, destPath);
     try { fs.unlinkSync(file.path); } catch (_) {}   // clean up temp, non-blocking
