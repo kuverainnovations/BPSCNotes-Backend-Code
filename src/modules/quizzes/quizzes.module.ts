@@ -514,6 +514,8 @@ return successResponse({
       throw e;
     }
   }
+
+  async update(quizId: string, data: any) {
     const fields: string[] = [];
     const vals: any[]      = [];
     let i = 1;
