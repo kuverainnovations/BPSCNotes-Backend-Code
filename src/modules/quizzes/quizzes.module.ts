@@ -514,6 +514,25 @@ return successResponse({
     }
   }
 
+  // POST /admin/quizzes/bulk-import-multi
+  // Accepts array of { quiz, questions } — creates multiple quizzes in one call
+  async bulkImportMulti(groups: any[], adminId: string) {
+    if (!Array.isArray(groups) || groups.length === 0)
+      throw new BadRequestException('Provide at least one quiz group');
+    if (groups.length > 50)
+      throw new BadRequestException('Maximum 50 quizzes per bulk import');
+
+    const results = [];
+    for (const group of groups) {
+      const res = await this.bulkImport({ quiz: group.quiz, questions: group.questions }, adminId);
+      results.push(res.data);
+    }
+    return successResponse(
+      { quizzes: results, totalQuizzes: results.length, totalQuestions: results.reduce((s: number, r: any) => s + (r.questionsInserted || 0), 0) },
+      `✅ Imported ${results.length} quizzes`
+    );
+  }
+
   async update(quizId: string, data: any) {
     const fields: string[] = [];
     const vals: any[]      = [];
@@ -837,6 +856,17 @@ class AdminQuizzesController {
   @RequirePermission('quizzes')
   @HttpCode(HttpStatus.CREATED)
   create(@Body() dto: any, @Req() r: any) { return this.s.create(dto, r.admin.id); }
+
+  /**
+   * POST /admin/quizzes/bulk-import-multi
+   * Creates multiple quizzes in one call.
+   * Body: { groups: [{ quiz: {...}, questions: [...] }] }
+   * MUST be before bulk-import to avoid route conflict.
+   */
+  @Post('bulk-import-multi')
+  @RequirePermission('quizzes')
+  @HttpCode(HttpStatus.CREATED)
+  bulkImportMulti(@Body() dto: any, @Req() r: any) { return this.s.bulkImportMulti(dto.groups || [], r.admin.id); }
 
   /**
    * POST /admin/quizzes/bulk-import
