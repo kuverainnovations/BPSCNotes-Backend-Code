@@ -1,7 +1,7 @@
 // ── quizzes.module.ts — Complete production version ──────────────────────────
 import {
   Module, Injectable, Controller, Get, Post, Put, Delete, Body,
-  Param, Query, Req, HttpCode, HttpStatus,
+  Param, Query, Req, HttpCode, HttpStatus, Logger,
   NotFoundException, BadRequestException, ForbiddenException,
   UseGuards, ParseUUIDPipe,
 } from '@nestjs/common';
@@ -22,6 +22,7 @@ import { AuthService } from '../auth/auth.module';
 
 @Injectable()
 class QuizzesService {
+  private readonly logger = new Logger(QuizzesService.name);
   constructor(
     @InjectDataSource() private readonly db: DataSource,
     private readonly authService: AuthService,
@@ -420,7 +421,99 @@ return successResponse({
     return successResponse({ quiz: result[0] }, 'Quiz created. Add questions next.');
   }
 
-  async update(quizId: string, data: any) {
+  // ── POST /admin/quizzes/bulk-import ───────────────────────────
+  // Creates quiz shell + inserts all questions in one transaction.
+  // Body: { quiz: { title, subject, type, ... }, questions: [...] }
+  async bulkImport(data: any, adminId: string) {
+    const { quiz: quizMeta, questions } = data;
+
+    if (!quizMeta?.title)   throw new BadRequestException('quiz.title is required');
+    if (!quizMeta?.subject) throw new BadRequestException('quiz.subject is required');
+    if (!Array.isArray(questions) || questions.length === 0)
+      throw new BadRequestException('Provide at least one question');
+    if (questions.length > 500)
+      throw new BadRequestException('Maximum 500 questions per bulk import');
+
+    // Validate & normalise questions before touching DB
+    const LETTERS = ['a','b','c','d'];
+    const normalised = questions.map((q: any, idx: number) => {
+      const qText = (q.question || q.question_text || q.questionText || '').trim();
+      if (!qText) throw new BadRequestException(`Row ${idx + 2}: question text is empty`);
+
+      // Build options array — accepts option_a/b/c/d columns OR options[]
+      const opts: string[] = [];
+      ['option_a','option_b','option_c','option_d','option_e'].forEach(k => {
+        const v = (q[k] || q[k.replace('option_','option')] || '').toString().trim();
+        if (v) opts.push(v);
+      });
+      if (opts.length < 2) throw new BadRequestException(`Row ${idx + 2}: need at least 2 options`);
+      if (opts.length > 4) opts.length = 4; // DB enforces max 4
+
+      // Pad to 4 (DB NOT NULL columns)
+      while (opts.length < 4) opts.push('');
+
+      // correct_option: accept a/b/c/d or 1/2/3/4 or 0/1/2/3
+      let co = String(q.correct_option || q.correctOption || q.answer || 'a').trim().toLowerCase();
+      if (/^[1-4]$/.test(co)) co = LETTERS[parseInt(co) - 1];       // 1-based
+      else if (/^[0-3]$/.test(co)) co = LETTERS[parseInt(co)];      // 0-based
+      if (!LETTERS.includes(co)) throw new BadRequestException(`Row ${idx + 2}: correct_option must be a/b/c/d`);
+
+      return {
+        questionText: qText,
+        optionA: opts[0], optionB: opts[1], optionC: opts[2], optionD: opts[3],
+        correctOption: co,
+        explanation: (q.explanation || '').toString().trim() || null,
+        subject: (q.subject || quizMeta.subject || '').toString().trim() || null,
+        difficulty: (q.difficulty || 'medium').toString().toLowerCase(),
+      };
+    });
+
+    // Single transaction — all or nothing
+    await this.db.query('BEGIN');
+    try {
+      const [quiz] = await this.db.query(
+        `INSERT INTO quizzes
+           (title, description, subject, type, total_questions,
+            duration_mins, passing_score, coins_reward, status, created_by)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
+         RETURNING *`,
+        [
+          quizMeta.title.trim(),
+          quizMeta.description?.trim() || null,
+          quizMeta.subject.trim(),
+          quizMeta.type || 'topic',
+          normalised.length,
+          quizMeta.durationMins || 15,
+          quizMeta.passingScore || 60,
+          quizMeta.coinsReward || 10,
+          quizMeta.status || 'published',
+          adminId,
+        ]
+      );
+
+      for (let i = 0; i < normalised.length; i++) {
+        const q = normalised[i];
+        await this.db.query(
+          `INSERT INTO quiz_questions
+             (quiz_id, question_text, option_a, option_b, option_c, option_d,
+              correct_option, explanation, subject, difficulty, sort_order)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+          [quiz.id, q.questionText, q.optionA, q.optionB, q.optionC, q.optionD,
+           q.correctOption, q.explanation, q.subject, q.difficulty, i]
+        );
+      }
+
+      await this.db.query('COMMIT');
+      this.logger.log(`Bulk import: ${normalised.length} questions → quiz ${quiz.id}`);
+      return successResponse(
+        { quizId: quiz.id, title: quiz.title, questionsInserted: normalised.length },
+        `✅ Imported ${normalised.length} questions into "${quiz.title}"`
+      );
+    } catch (e) {
+      await this.db.query('ROLLBACK');
+      throw e;
+    }
+  }
     const fields: string[] = [];
     const vals: any[]      = [];
     let i = 1;
@@ -744,6 +837,17 @@ class AdminQuizzesController {
   @RequirePermission('quizzes')
   @HttpCode(HttpStatus.CREATED)
   create(@Body() dto: any, @Req() r: any) { return this.s.create(dto, r.admin.id); }
+
+  /**
+   * POST /admin/quizzes/bulk-import
+   * Creates a new quiz + inserts all questions in one transaction.
+   * MUST be before :id routes — NestJS matches top-down.
+   * Body: { quiz: { title, subject, type, ... }, questions: [...] }
+   */
+  @Post('bulk-import')
+  @RequirePermission('quizzes')
+  @HttpCode(HttpStatus.CREATED)
+  bulkImport(@Body() dto: any, @Req() r: any) { return this.s.bulkImport(dto, r.admin.id); }
 
   /** PUT /admin/quizzes/:id — update quiz metadata or publish */
   @Put(':id')
