@@ -29,6 +29,10 @@ import { AuthService } from '../auth/auth.module';
 import { AuthModule } from '../auth/auth.module';
 import * as cloudinary from 'cloudinary';
 import { NotificationService, NotificationsModule } from '@modules/combined-modules-1.module';
+import { diskStorage } from 'multer';
+import { extname, join } from 'path';
+import * as fs from 'fs';
+import * as crypto from 'crypto';
 
 // ── DTOs ──────────────────────────────────────────────────────
 class CourseQueryDto extends PaginationDto {
@@ -772,6 +776,27 @@ export class CoursesService {
     return successResponse(null, 'Course removed from app');
   }
 
+  // ── Lesson file upload (local disk, same pattern as study-materials) ──
+  async uploadLessonFile(file: Express.Multer.File): Promise<{ fileUrl: string; fileSizeBytes: number }> {
+    const baseUrl = this.config.get<string>('BASE_URL') ?? 'https://api.bpscnotes.in';
+    const uploadDir = './uploads';
+    const now = new Date();
+    const subDir = `${now.getFullYear()}/${String(now.getMonth() + 1).padStart(2, '0')}`;
+    const dest = join(uploadDir, 'lessons', subDir);
+    fs.mkdirSync(dest, { recursive: true });
+
+    const uniqueId = crypto.randomUUID().replace(/-/g, '').slice(0, 16);
+    const safeExt  = extname(file.originalname).toLowerCase().replace(/[^a-z0-9.]/g, '');
+    const fileName = `${Date.now()}_${uniqueId}${safeExt}`;
+    const fullPath = join(dest, fileName);
+
+    fs.writeFileSync(fullPath, file.buffer);
+
+    const relativePath = `uploads/lessons/${subDir}/${fileName}`;
+    const fileUrl = `${baseUrl}/${relativePath}`;
+    return successResponse({ fileUrl, fileSizeBytes: file.size });
+  }
+
   async uploadThumbnail(courseId: string, file: Express.Multer.File) {
     const cloudinaryConfig = this.config.get('cloudinary');
     cloudinary.v2.config(cloudinaryConfig);
@@ -925,6 +950,35 @@ export class AdminCoursesController {
   @RequirePermission('courses')
   @HttpCode(HttpStatus.OK)
   deleteLesson(@Param('lessonId', ParseUUIDPipe) lessonId: string) { return this.service.deleteLesson(lessonId); }
+
+  /**
+   * POST /admin/courses/:id/lessons/upload-file
+   * Accepts a PDF (max 50 MB) or video (max 500 MB), saves to local disk,
+   * returns { fileUrl, fileSizeBytes }.
+   * The admin page stores the returned URL in notesUrl / videoUrl.
+   */
+  @Post(':id/lessons/upload-file')
+  @RequirePermission('courses')
+  @UseInterceptors(FileInterceptor('file', {
+    storage: require('multer').memoryStorage(),
+    limits: { fileSize: 500 * 1024 * 1024 }, // 500 MB hard cap (video)
+    fileFilter: (_req: any, file: any, cb: any) => {
+      const ALLOWED = [
+        'application/pdf',
+        'video/mp4', 'video/x-m4v', 'video/quicktime',
+        'video/x-msvideo', 'video/webm', 'video/mkv', 'video/x-matroska',
+      ];
+      if (ALLOWED.includes(file.mimetype)) return cb(null, true);
+      cb(new BadRequestException(`File type not allowed: ${file.mimetype}`), false);
+    },
+  }))
+  uploadLessonFile(
+    @Param('id') _courseId: string,
+    @UploadedFile() file: Express.Multer.File,
+  ) {
+    if (!file) throw new BadRequestException('No file provided');
+    return this.service.uploadLessonFile(file);
+  }
 
   // ── Free-course lesson lock fix endpoints ────────────────────
   /** POST /admin/courses/bulk-fix-free-locks — unlock lessons on ALL free courses */
