@@ -777,7 +777,7 @@ export class CoursesService {
   }
 
   // ── Lesson file upload (local disk, same pattern as study-materials) ──
-  async uploadLessonFile(file: Express.Multer.File): Promise<{ fileUrl: string; fileSizeBytes: number }> {
+  async uploadLessonFile(file: Express.Multer.File) {
     const baseUrl = this.config.get<string>('BASE_URL') ?? 'https://api.bpscnotes.in';
     const uploadDir = './uploads';
     const now = new Date();
@@ -942,20 +942,10 @@ export class AdminCoursesController {
     @Body() dto: any,
   ) { return this.service.createLesson(courseId, chapterId, dto); }
 
-  @Put(':id/lessons/:lessonId')
-  @RequirePermission('courses')
-  updateLesson(@Param('lessonId', ParseUUIDPipe) lessonId: string, @Body() dto: any) { return this.service.updateLesson(lessonId, dto); }
-
-  @Delete(':id/lessons/:lessonId')
-  @RequirePermission('courses')
-  @HttpCode(HttpStatus.OK)
-  deleteLesson(@Param('lessonId', ParseUUIDPipe) lessonId: string) { return this.service.deleteLesson(lessonId); }
-
   /**
    * POST /admin/courses/:id/lessons/upload-file
-   * Accepts a PDF (max 50 MB) or video (max 500 MB), saves to local disk,
-   * returns { fileUrl, fileSizeBytes }.
-   * The admin page stores the returned URL in notesUrl / videoUrl.
+   * MUST be before :id/lessons/:lessonId — NestJS matches top-down and
+   * "upload-file" would otherwise be captured as lessonId → UUID parse fail → 404.
    */
   @Post(':id/lessons/upload-file')
   @RequirePermission('courses')
@@ -979,6 +969,15 @@ export class AdminCoursesController {
     if (!file) throw new BadRequestException('No file provided');
     return this.service.uploadLessonFile(file);
   }
+
+  @Put(':id/lessons/:lessonId')
+  @RequirePermission('courses')
+  updateLesson(@Param('lessonId', ParseUUIDPipe) lessonId: string, @Body() dto: any) { return this.service.updateLesson(lessonId, dto); }
+
+  @Delete(':id/lessons/:lessonId')
+  @RequirePermission('courses')
+  @HttpCode(HttpStatus.OK)
+  deleteLesson(@Param('lessonId', ParseUUIDPipe) lessonId: string) { return this.service.deleteLesson(lessonId); }
 
   // ── Free-course lesson lock fix endpoints ────────────────────
   /** POST /admin/courses/bulk-fix-free-locks — unlock lessons on ALL free courses */
