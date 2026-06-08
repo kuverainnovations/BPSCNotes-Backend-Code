@@ -179,7 +179,7 @@ if (q.scheduled_for) {
     const coinsReward  = parseInt(q.coins_reward,  10) || 0;
     // Prevents direct API submit without loading questions first
     const startedAttempt = await this.db.query(
-      `SELECT id FROM quiz_attempts
+      `SELECT id, attempted_at FROM quiz_attempts
        WHERE user_id=$1 AND quiz_id=$2
        ORDER BY attempted_at DESC LIMIT 1`,
       [userId, quizId]
