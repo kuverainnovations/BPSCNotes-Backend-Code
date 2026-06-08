@@ -464,7 +464,6 @@ return successResponse({
         correctOption: co,
         explanation: (q.explanation || '').toString().trim() || null,
         subject: (q.subject || quizMeta.subject || '').toString().trim() || null,
-        difficulty: (q.difficulty || 'medium').toString().toLowerCase(),
       };
     });
 
@@ -496,10 +495,10 @@ return successResponse({
         await this.db.query(
           `INSERT INTO quiz_questions
              (quiz_id, question_text, option_a, option_b, option_c, option_d,
-              correct_option, explanation, subject, difficulty, sort_order)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+              correct_option, explanation, subject, sort_order)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
           [quiz.id, q.questionText, q.optionA, q.optionB, q.optionC, q.optionD,
-           q.correctOption, q.explanation, q.subject, q.difficulty, i]
+           q.correctOption, q.explanation, q.subject, i]
         );
       }
 
@@ -680,7 +679,6 @@ return successResponse({
       correctOption: 'correct_option',
       explanation:  'explanation',
       subject:      'subject',
-      // difficulty removed — not required by client
       sortOrder:    'sort_order',
     };
     for (const [key, col] of Object.entries(map)) {
