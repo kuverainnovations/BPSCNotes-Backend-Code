@@ -1064,7 +1064,7 @@ class LeaderboardCronService implements OnModuleInit {
   }
 }
 
-@Module({ imports:[ScheduleModule.forFeature()], controllers:[UsersController, AdminUsersExtraController], providers:[UsersService, LeaderboardCronService], exports:[UsersService] })
+@Module({ imports:[], controllers:[UsersController, AdminUsersExtraController], providers:[UsersService, LeaderboardCronService], exports:[UsersService] })
 export class UsersModule {}
 
 // ════════════════════════════════════════════════════════════
