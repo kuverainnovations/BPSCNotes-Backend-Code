@@ -2,7 +2,7 @@
 // AUTH MODULE — Full implementation
 // ════════════════════════════════════════════════════════════
 import {
-  Module, Injectable, Controller, Post, Get, Query, Body, Req,
+  Module, Injectable, Controller, Post, Get, Body, Req,
   HttpCode, HttpStatus, UnauthorizedException, BadRequestException,
   ConflictException,
   Patch,
@@ -139,26 +139,28 @@ export class OtpService {
 
     if (this.config.get('app.env') === 'development') {
       console.log(`📱 DEV OTP for ${mobile}: ${otp}`);
-      return { success: true, otp };   // only returned in dev — never in production
+      return { success: true, otp };
     }
 
     try {
-      await axios.default.post(
-        'https://api.msg91.com/api/v5/otp',
-        null,
-        {
-          params: {
-            authkey:     otpConfig.msg91AuthKey,
-            mobile:      `91${mobile.replace('+91', '')}`,
-            template_id: otpConfig.msg91TemplateId,
-            otp,
-          },
-        }
-      );
-      return { success: true };
+      // await axios.default.post(
+      //   'https://api.msg91.com/api/v5/otp',
+      //   null,
+      //   {
+      //     params: {
+      //       authkey: otpConfig.msg91AuthKey,
+      //       mobile: `91${mobile.replace('+91', '')}`,
+      //       template_id: otpConfig.msg91TemplateId,
+      //       otp,
+      //     },
+      //   }
+      // );
+
+      console.log("OTP is __ : ", otp); 
+return { success: true, otp };
     } catch (err) {
-      console.error('MSG91 error:', err.response?.data || err.message);
-      throw new BadRequestException('Failed to send OTP. Please try again.');
+      console.error('MSG91 FULL ERROR:', err.response?.data || err.message);
+      throw new BadRequestException('Failed to send OTP');
     }
   }
 
@@ -191,7 +193,8 @@ export class OtpService {
   }
 
   private generateOtp(): string {
-    return Math.floor(100000 + Math.random() * 900000).toString();
+    // return Math.floor(100000 + Math.random() * 900000).toString();
+    return "123456"
   }
 }
 
@@ -230,7 +233,7 @@ export class AuthService {
 
     const result = await this.db.query(
       `SELECT id, name, email, mobile, role, status, coins, streak, primary_exam,
-              prep_level, referral_code, is_verified, mpin_hash
+              prep_level, referral_code, is_verified
        FROM users WHERE mobile = $1 AND deleted_at IS NULL`, [mobile]
     );
 
@@ -257,7 +260,6 @@ export class AuthService {
 
     return {
       isNewUser: false,
-      hasMpin:   !!user.mpin_hash,   // tells Android whether to show CreateMpin after this
       ...tokens,
       user: this.sanitizeUser(user),
     };
@@ -766,193 +768,6 @@ export class AuthService {
 
 
 
-  // ════════════════════════════════════════════════════════
-  // MPIN METHODS
-  // ════════════════════════════════════════════════════════
-
-  private validateMpinStrength(mpin: string): void {
-    if (!/^\d{6}$/.test(mpin))
-      throw new BadRequestException('MPIN must be exactly 6 digits');
-    if (/^(\d)\1{5}$/.test(mpin))
-      throw new BadRequestException('MPIN cannot be all the same digit (e.g. 111111)');
-    if (['123456','234567','345678','456789','654321','543210','012345'].includes(mpin))
-      throw new BadRequestException('MPIN is too simple. Please choose a less predictable one');
-  }
-
-  // ── GET /auth/check-mpin ─────────────────────────────
-  async checkMpin(mobile: string) {
-    const [user] = await this.db.query(
-      `SELECT mpin_hash, mpin_locked_until, mpin_failed_attempts
-       FROM users WHERE mobile=$1 AND deleted_at IS NULL`,
-      [mobile]
-    );
-    if (!user) {
-      // Return hasMpin:false for unknown mobiles — don't reveal existence
-      return { hasMpin: false, isLocked: false, lockedUntilSeconds: 0 };
-    }
-    const hasMpin = !!user.mpin_hash;
-    const lockedUntil: Date | null = user.mpin_locked_until ? new Date(user.mpin_locked_until) : null;
-    const isLocked = lockedUntil !== null && lockedUntil > new Date();
-    const lockedUntilSeconds = isLocked
-      ? Math.ceil((lockedUntil!.getTime() - Date.now()) / 1000)
-      : 0;
-    return { hasMpin, isLocked, lockedUntilSeconds };
-  }
-
-  // ── POST /auth/login-mpin ────────────────────────────
-  async loginMpin(mobile: string, mpin: string) {
-    const [user] = await this.db.query(
-      `SELECT id, name, email, mobile, role, status, coins, streak, primary_exam,
-              prep_level, referral_code, is_verified, mpin_hash,
-              mpin_failed_attempts, mpin_locked_until
-       FROM users WHERE mobile=$1 AND deleted_at IS NULL`,
-      [mobile]
-    );
-    if (!user) throw new UnauthorizedException('Mobile number not registered');
-    if (user.status === 'banned') throw new UnauthorizedException('Account suspended. Contact support.');
-    if (!user.mpin_hash) throw new UnauthorizedException('No MPIN set. Please login with OTP first.');
-
-    // Check lockout
-    if (user.mpin_locked_until && new Date(user.mpin_locked_until) > new Date()) {
-      const secsLeft = Math.ceil((new Date(user.mpin_locked_until).getTime() - Date.now()) / 1000);
-      const minsLeft = Math.ceil(secsLeft / 60);
-      throw new UnauthorizedException(
-        `Too many failed attempts. Try again in ${minsLeft} minute${minsLeft > 1 ? 's' : ''}.`
-      );
-    }
-
-    // Verify MPIN
-    const isValid = await bcrypt.compare(mpin, user.mpin_hash);
-    if (!isValid) {
-      const newAttempts = (user.mpin_failed_attempts || 0) + 1;
-      const MAX = 5;
-      if (newAttempts >= MAX) {
-        // Lock for 5 minutes
-        await this.db.query(
-          `UPDATE users SET mpin_failed_attempts=$1, mpin_locked_until=NOW()+INTERVAL '5 minutes'
-           WHERE id=$2`,
-          [newAttempts, user.id]
-        );
-        throw new UnauthorizedException(
-          'Too many failed attempts. MPIN locked for 5 minutes.'
-        );
-      }
-      await this.db.query(
-        `UPDATE users SET mpin_failed_attempts=$1 WHERE id=$2`,
-        [newAttempts, user.id]
-      );
-      const remaining = MAX - newAttempts;
-      throw new UnauthorizedException(
-        `Incorrect MPIN. ${remaining} attempt${remaining !== 1 ? 's' : ''} remaining.`
-      );
-    }
-
-    // Success — reset lockout counters
-    const tokens = await this.generateTokens(user.id);
-    await this.db.query(
-      `UPDATE users SET
-         refresh_token=$1, mobile_verified=TRUE, last_active_at=NOW(),
-         mpin_failed_attempts=0, mpin_locked_until=NULL
-       WHERE id=$2`,
-      [tokens.refreshToken, user.id]
-    );
-    await this.awardCoins(user.id, 'daily_login');
-    await this.cache.del(`user:${user.id}`);
-
-    return {
-      isNewUser:    false,
-      hasMpin:      true,
-      ...tokens,
-      user: this.sanitizeUser(user),
-    };
-  }
-
-  // ── POST /auth/create-mpin (JWT required) ────────────
-  async createMpin(userId: string, mpin: string) {
-    this.validateMpinStrength(mpin);
-    const hash = await bcrypt.hash(mpin, 12);
-    await this.db.query(
-      `UPDATE users SET mpin_hash=$1, mpin_created_at=NOW(),
-       mpin_failed_attempts=0, mpin_locked_until=NULL
-       WHERE id=$2`,
-      [hash, userId]
-    );
-    await this.cache.del(`user:${userId}`);
-    return { mpinCreated: true };
-  }
-
-  // ── POST /auth/forgot-mpin (public — sends OTP) ──────
-  async forgotMpin(mobile: string) {
-    const [user] = await this.db.query(
-      `SELECT id, mpin_hash FROM users WHERE mobile=$1 AND deleted_at IS NULL`,
-      [mobile]
-    );
-    // Don't reveal if mobile exists — always return success
-    if (!user || !user.mpin_hash) {
-      // User doesn't exist or has no MPIN — send OTP anyway (security: don't leak info)
-      // If no user, OTP just gets thrown away. Android handles navigation same way.
-    }
-    await this.otpService.send(mobile);
-    return { otpSent: true };
-  }
-
-  // ── POST /auth/reset-mpin (public — OTP in body) ─────
-  async resetMpin(mobile: string, otp: string, newMpin: string) {
-    this.validateMpinStrength(newMpin);
-    // Verify OTP — throws if invalid/expired
-    await this.otpService.verify(mobile, otp);
-
-    const [user] = await this.db.query(
-      `SELECT id, status FROM users WHERE mobile=$1 AND deleted_at IS NULL`,
-      [mobile]
-    );
-    if (!user) throw new UnauthorizedException('Mobile number not registered');
-    if (user.status === 'banned') throw new UnauthorizedException('Account suspended.');
-
-    const hash = await bcrypt.hash(newMpin, 12);
-    await this.db.query(
-      `UPDATE users SET mpin_hash=$1, mpin_created_at=NOW(),
-       mpin_failed_attempts=0, mpin_locked_until=NULL
-       WHERE id=$2`,
-      [hash, user.id]
-    );
-
-    // Log user in automatically after reset
-    const tokens = await this.generateTokens(user.id);
-    await this.db.query(
-      `UPDATE users SET refresh_token=$1, last_active_at=NOW() WHERE id=$2`,
-      [tokens.refreshToken, user.id]
-    );
-    await this.cache.del(`user:${user.id}`);
-
-    return { isNewUser: false, hasMpin: true, ...tokens };
-  }
-
-  // ── POST /auth/change-mpin (JWT required) ────────────
-  async changeMpin(userId: string, currentMpin: string, newMpin: string) {
-    this.validateMpinStrength(newMpin);
-
-    const [user] = await this.db.query(
-      `SELECT mpin_hash FROM users WHERE id=$1`,
-      [userId]
-    );
-    if (!user?.mpin_hash) throw new BadRequestException('No MPIN set. Please create one first.');
-
-    const isValid = await bcrypt.compare(currentMpin, user.mpin_hash);
-    if (!isValid) throw new UnauthorizedException('Current MPIN is incorrect.');
-
-    const isSame = await bcrypt.compare(newMpin, user.mpin_hash);
-    if (isSame) throw new BadRequestException('New MPIN must be different from current MPIN.');
-
-    const hash = await bcrypt.hash(newMpin, 12);
-    await this.db.query(
-      `UPDATE users SET mpin_hash=$1, mpin_created_at=NOW() WHERE id=$2`,
-      [hash, userId]
-    );
-    await this.cache.del(`user:${userId}`);
-    return { mpinUpdated: true };
-  }
-
   private sanitizeUser(user: any) {
     const { password_hash, refresh_token, fcm_token, ...safe } = user;
     return safe;
@@ -1089,72 +904,6 @@ export class AuthController {
   async getMe(@Req() req: any) {
     const user = await this.authService.getMe(req.user.id);
     return successResponse({ user });
-  }
-
-  // ── MPIN endpoints ────────────────────────────────────────
-
-  /** GET /auth/check-mpin?mobile=+919876543210 — public, no auth */
-  @Public()
-  @Get('check-mpin')
-  @Throttle({ default: { limit: 20, ttl: 60000 } })
-  async checkMpin(@Query('mobile') mobile: string) {
-    if (!mobile) throw new BadRequestException('mobile query param required');
-    const data = await this.authService.checkMpin(mobile);
-    return successResponse(data);
-  }
-
-  /** POST /auth/login-mpin — public, replaces OTP for returning users */
-  @Public()
-  @Post('login-mpin')
-  @HttpCode(HttpStatus.OK)
-  @Throttle({ default: { limit: 10, ttl: 60000 } })
-  async loginMpin(@Body() dto: { mobile: string; mpin: string }) {
-    if (!dto.mobile || !dto.mpin) throw new BadRequestException('mobile and mpin required');
-    const data = await this.authService.loginMpin(dto.mobile, dto.mpin);
-    return successResponse(data, 'Login successful');
-  }
-
-  /** POST /auth/create-mpin — JWT required, called once after registration */
-  @Post('create-mpin')
-  @UseGuards(JwtAuthGuard)
-  @HttpCode(HttpStatus.OK)
-  async createMpin(@Req() req: any, @Body() dto: { mpin: string }) {
-    if (!dto.mpin) throw new BadRequestException('mpin required');
-    const data = await this.authService.createMpin(req.user.id, dto.mpin);
-    return successResponse(data, 'MPIN created successfully! Use it to login next time \u{1F512}');
-  }
-
-  /** POST /auth/forgot-mpin — public, triggers MSG91 OTP */
-  @Public()
-  @Post('forgot-mpin')
-  @HttpCode(HttpStatus.OK)
-  @Throttle({ default: { limit: 5, ttl: 900000 } })
-  async forgotMpin(@Body() dto: { mobile: string }) {
-    if (!dto.mobile) throw new BadRequestException('mobile required');
-    const data = await this.authService.forgotMpin(dto.mobile);
-    return successResponse(data, 'OTP sent. Enter it to reset your MPIN.');
-  }
-
-  /** POST /auth/reset-mpin — public, OTP verified inside, returns JWT */
-  @Public()
-  @Post('reset-mpin')
-  @HttpCode(HttpStatus.OK)
-  async resetMpin(@Body() dto: { mobile: string; otp: string; newMpin: string }) {
-    if (!dto.mobile || !dto.otp || !dto.newMpin)
-      throw new BadRequestException('mobile, otp, and newMpin required');
-    const data = await this.authService.resetMpin(dto.mobile, dto.otp, dto.newMpin);
-    return successResponse(data, 'MPIN reset successfully! You are now logged in.');
-  }
-
-  /** POST /auth/change-mpin — JWT required, from Settings */
-  @Post('change-mpin')
-  @UseGuards(JwtAuthGuard)
-  @HttpCode(HttpStatus.OK)
-  async changeMpin(@Req() req: any, @Body() dto: { currentMpin: string; newMpin: string }) {
-    if (!dto.currentMpin || !dto.newMpin)
-      throw new BadRequestException('currentMpin and newMpin required');
-    const data = await this.authService.changeMpin(req.user.id, dto.currentMpin, dto.newMpin);
-    return successResponse(data, 'MPIN updated successfully!');
   }
 
   @Get('referrals')

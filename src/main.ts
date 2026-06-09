@@ -50,6 +50,19 @@ import { AppModule } from './app.module';
 async function bootstrap() {
   const logger = new Logger('Bootstrap');
 
+  // ── Validate required secrets before accepting any traffic ─
+  const required = ['JWT_SECRET', 'ADMIN_JWT_SECRET'];
+  const missing  = required.filter(k => !process.env[k]);
+  if (missing.length) {
+    logger.error(`FATAL: Missing required environment variables: ${missing.join(', ')}`);
+    logger.error('Set these in your .env file or deployment config before starting.');
+    process.exit(1);
+  }
+  if (process.env.JWT_SECRET === process.env.ADMIN_JWT_SECRET) {
+    logger.error('FATAL: JWT_SECRET and ADMIN_JWT_SECRET must be different values.');
+    process.exit(1);
+  }
+
   const app = await NestFactory.create<NestExpressApplication>(AppModule, {
     logger: ['error', 'warn', 'log'],
     bufferLogs: true,

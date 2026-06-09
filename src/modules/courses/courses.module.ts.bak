@@ -463,99 +463,6 @@ export class CoursesService {
     return successResponse(null, 'Enrolled successfully! Start learning 🚀');
   }
 
-  // ─────────────────────────────────────────────────────────────
-  // POST /courses/:id/purchase/confirm
-  // Called by Android after Razorpay payment succeeds.
-  // Verifies signature, marks purchase completed, grants enrollment.
-  // ─────────────────────────────────────────────────────────────
-  async confirmCoursePurchase(
-    courseId: string,
-    userId: string,
-    dto: {
-      razorpayOrderId:   string;
-      razorpayPaymentId: string;
-      razorpaySignature: string;
-      paymentMethod?:    string;
-    }
-  ) {
-    // 1. Idempotency — already completed purchase
-    const [alreadyDone] = await this.db.query(
-      `SELECT id FROM course_purchases WHERE user_id=$1 AND course_id=$2 AND status='completed'`,
-      [userId, courseId]
-    );
-    if (alreadyDone) {
-      await this.db.query(
-        `INSERT INTO user_enrollments (user_id, course_id) VALUES ($1,$2) ON CONFLICT (user_id, course_id) DO NOTHING`,
-        [userId, courseId]
-      );
-      return successResponse(null, 'Course already purchased');
-    }
-
-    // 2. Find pending purchase row created by enroll()
-    const [purchase] = await this.db.query(
-      `SELECT id, amount FROM course_purchases
-       WHERE user_id=$1 AND course_id=$2 AND status='pending'
-       ORDER BY created_at DESC LIMIT 1`,
-      [userId, courseId]
-    );
-    if (!purchase) {
-      throw new NotFoundException('No pending purchase found. Please go back and try again.');
-    }
-
-    // 3. Verify Razorpay HMAC signature — always required, no bypass
-    const rpSecret = process.env.RAZORPAY_KEY_SECRET;
-    if (!rpSecret) {
-      throw new BadRequestException('Payment gateway not configured. Contact support.');
-    }
-    const crypto   = require('crypto');
-    const expected = crypto
-      .createHmac('sha256', rpSecret)
-      .update(`${dto.razorpayOrderId}|${dto.razorpayPaymentId}`)
-      .digest('hex');
-    if (expected !== dto.razorpaySignature) {
-      console.error(
-        `COURSE PAYMENT TAMPER DETECTED: user=${userId} course=${courseId} ` +
-        `order=${dto.razorpayOrderId} payment=${dto.razorpayPaymentId}`
-      );
-      throw new BadRequestException('Payment verification failed. Contact support.');
-    }
-
-    // 4. Mark purchase as completed
-    await this.db.query(
-      `UPDATE course_purchases
-       SET status='completed', razorpay_payment_id=$1, payment_method=$2, updated_at=NOW()
-       WHERE id=$3`,
-      [dto.razorpayPaymentId, dto.paymentMethod || 'upi', purchase.id]
-    );
-
-    // 5. Grant enrollment
-    await this.db.query(
-      `INSERT INTO user_enrollments (user_id, course_id)
-       VALUES ($1,$2) ON CONFLICT (user_id, course_id) DO NOTHING`,
-      [userId, courseId]
-    );
-    await this.db.query(
-      `UPDATE courses SET enrollment_count = enrollment_count + 1 WHERE id=$1`,
-      [courseId]
-    );
-
-    // 6. Invalidate cached course list
-    try {
-      const keys = await (this.cache.store as any).keys?.('courses:*') ?? [];
-      for (const k of keys) await this.cache.del(k);
-    } catch (_) {}
-
-    // 7. Send push notification
-    this.notifService?.pushToUser(
-      userId,
-      'Course Unlocked!',
-      'You now have full access. Start your first lesson!',
-      { type: 'course_purchased', courseId, screen: 'my_courses' }
-    ).catch(() => {});
-
-    return successResponse(null, 'Course purchased successfully! Start learning');
-  }
-
   async completeLesson(courseId: string, lessonId: string, userId: string, dto: CompleteLessonDto) {
     await this.db.query(
       `
@@ -950,21 +857,6 @@ export class CoursesController {
   @HttpCode(HttpStatus.CREATED)
   enroll(@Param('id', ParseUUIDPipe) id: string, @Req() req: any) {
     return this.service.enroll(id, req.user.id);
-  }
-
-  @Post(':id/purchase/confirm')
-  @HttpCode(HttpStatus.OK)
-  confirmCoursePurchase(
-    @Param('id', ParseUUIDPipe) id: string,
-    @Req() req: any,
-    @Body() dto: {
-      razorpayOrderId:   string;
-      razorpayPaymentId: string;
-      razorpaySignature: string;
-      paymentMethod?:    string;
-    }
-  ) {
-    return this.service.confirmCoursePurchase(id, req.user.id, dto);
   }
 
   @Post(':courseId/lessons/:lessonId/complete')

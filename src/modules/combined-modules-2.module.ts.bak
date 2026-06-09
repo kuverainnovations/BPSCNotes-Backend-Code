@@ -3,15 +3,13 @@ import {
   Body, Param, Query, Req, HttpCode, HttpStatus,
   NotFoundException, BadRequestException, ForbiddenException,
   UseGuards, ParseUUIDPipe,
-  Patch, Logger, OnModuleInit,
+  Patch,
 } from '@nestjs/common';
-import { Cron } from '@nestjs/schedule';
-import { ScheduleModule } from '@nestjs/schedule';
 import { InjectDataSource } from '@nestjs/typeorm';
 import { DataSource } from 'typeorm';
 import { CACHE_MANAGER } from '@nestjs/cache-manager';
 import { Cache } from 'cache-manager';
-import { Inject, Optional } from '@nestjs/common';
+import { Inject } from '@nestjs/common';
 import { ApiTags, ApiBearerAuth } from '@nestjs/swagger';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { AuthModule, AuthService } from './auth/auth.module';
@@ -50,7 +48,7 @@ class StudyRoomsService {
     if (subject) { conditions.push(`sr.subject=$${params.length+1}`); params.push(subject); }
     if (exam)    { conditions.push(`$${params.length+1}=ANY(sr.exam_tags)`); params.push(exam); }
     const rows = await this.db.query(
-      `SELECT sr.*, COALESCE(u.name, 'BPSCNotes') AS host_name,
+      `SELECT sr.*, u.name AS host_name,
          COUNT(rm.user_id) FILTER (WHERE rm.left_at IS NULL) AS current_members,
          (SELECT TRUE FROM room_members WHERE room_id=sr.id AND user_id=$${params.length+1} AND left_at IS NULL) AS is_member
        FROM study_rooms sr LEFT JOIN users u ON sr.host_id=u.id
@@ -122,7 +120,7 @@ class StudyRoomsService {
 
   async findAllAdmin() {
     const rows = await this.db.query(
-      `SELECT sr.*, COALESCE(u.name, 'BPSCNotes') AS host_name,
+      `SELECT sr.*, u.name AS host_name,
          COUNT(rm.user_id) FILTER (WHERE rm.left_at IS NULL) AS current_members
        FROM study_rooms sr LEFT JOIN users u ON sr.host_id=u.id
        LEFT JOIN room_members rm ON sr.id=rm.room_id
@@ -206,15 +204,14 @@ export class StudyRoomsModule {}
 // ════════════════════════════════════════════════════════════
 @Injectable()
 class DailyTargetsService {
+  notifService: any;
   constructor(
     @InjectDataSource() private readonly db: DataSource,
     @Inject(CACHE_MANAGER) private readonly cache: Cache,
     private readonly achievementsService: AchievementsService,
     private readonly challengesService: WeeklyChallengesService,
     private readonly authService: AuthService,
-    @Inject('NOTIFICATION_SERVICE') @Optional() private readonly notifService?: {
-      pushToUser: (userId: string, title: string, body: string, data?: Record<string, string>) => Promise<boolean>;
-    },
+
   ) {}
 
   // ── GET /users/daily-targets ──────────────────────────────
@@ -224,46 +221,34 @@ class DailyTargetsService {
   async getTargets(userId: string) {
     const today = new Date().toISOString().split('T')[0]; // YYYY-MM-DD
 
-    // Only run carry-forward if there are actually incomplete past targets.
-    // This pre-check avoids a write query on every Dashboard open when there
-    // is nothing to carry forward (the common case after the first load of day).
-    const [pendingCount] = await this.db.query(
-      `SELECT COUNT(*) FROM daily_targets
-       WHERE user_id = $1
-         AND is_completed = FALSE
-         AND is_carried_forward = FALSE
-         AND target_date >= ($2::date - INTERVAL '3 days')
-         AND target_date < $2::date`,
+    // First: auto-carry-forward any incomplete targets from past 3 days
+    // that haven't already been carried forward (idempotent)
+    await this.db.query(
+      `INSERT INTO daily_targets
+         (user_id, title, subject, difficulty, time_slot, estimated_minutes,
+          total_questions, is_carried_forward, target_date, source_quiz_id, source_note_id)
+       SELECT
+         dt.user_id, dt.title, dt.subject, dt.difficulty, dt.time_slot,
+         dt.estimated_minutes, dt.total_questions,
+         TRUE, -- is_carried_forward
+         $2::date, -- today
+         dt.source_quiz_id, dt.source_note_id
+       FROM daily_targets dt
+       WHERE dt.user_id = $1
+         AND dt.is_completed = FALSE
+         AND dt.is_carried_forward = FALSE
+         AND dt.target_date >= ($2::date - INTERVAL '3 days')
+         AND dt.target_date < $2::date
+         -- Don't duplicate: skip if already carried forward today
+         AND NOT EXISTS (
+           SELECT 1 FROM daily_targets existing
+           WHERE existing.user_id = dt.user_id
+             AND existing.title = dt.title
+             AND existing.target_date = $2::date
+             AND existing.is_carried_forward = TRUE
+         )`,
       [userId, today]
     );
-
-    if (parseInt(pendingCount.count) > 0) {
-      await this.db.query(
-        `INSERT INTO daily_targets
-           (user_id, title, subject, difficulty, time_slot, estimated_minutes,
-            total_questions, is_carried_forward, target_date, source_quiz_id, source_note_id)
-         SELECT
-           dt.user_id, dt.title, dt.subject, dt.difficulty, dt.time_slot,
-           dt.estimated_minutes, dt.total_questions,
-           TRUE, -- is_carried_forward
-           $2::date, -- today
-           dt.source_quiz_id, dt.source_note_id
-         FROM daily_targets dt
-         WHERE dt.user_id = $1
-           AND dt.is_completed = FALSE
-           AND dt.is_carried_forward = FALSE
-           AND dt.target_date >= ($2::date - INTERVAL '3 days')
-           AND dt.target_date < $2::date
-           AND NOT EXISTS (
-             SELECT 1 FROM daily_targets existing
-             WHERE existing.user_id = dt.user_id
-               AND existing.title = dt.title
-               AND existing.target_date = $2::date
-               AND existing.is_carried_forward = TRUE
-           )`,
-        [userId, today]
-      );
-    }
 
     // Fetch today's targets + carried-forward ones
     const rows = await this.db.query(
@@ -517,15 +502,14 @@ class DailyTargetsService {
       );
     }
 
-    // If completed, debit the exact coins awarded for THIS specific target
+    // If completed, try to debit the coins that were awarded — safe, non-blocking
     if (wasCompleted) {
       try {
-        // Look up by ref_id which is set to targetId when coins are awarded
         const coinTx = await this.db.query(
           `SELECT id, amount FROM coin_transactions
-           WHERE user_id=$1 AND action='target_complete' AND ref_id=$2
-           LIMIT 1`,
-          [userId, targetId]
+           WHERE user_id=$1 AND action='target_complete'
+           ORDER BY created_at DESC LIMIT 1`,
+          [userId]
         );
         if (coinTx.length) {
           const amount = Math.abs(Number(coinTx[0].amount));
@@ -1025,46 +1009,7 @@ class AdminUsersExtraController {
   @Put('live-classes/:id/toggle') @RequirePermission('live-classes') toggleLiveClass(@Param('id', ParseUUIDPipe) id: string, @Body() dto: any) { return this.s.toggleLiveClass(id, dto.isLive ?? false); }
 }
 
-// ─────────────────────────────────────────────────────────────
-// Leaderboard Cron — runs every hour to keep ranks fresh.
-// Avoids the manual admin click requirement.
-// ─────────────────────────────────────────────────────────────
-@Injectable()
-class LeaderboardCronService implements OnModuleInit {
-  private readonly logger = new Logger(LeaderboardCronService.name);
-
-  constructor(
-    @InjectDataSource() private readonly db: DataSource,
-  ) {}
-
-  // Run once on startup so ranks are fresh after a restart
-  async onModuleInit() {
-    await this.recalculate().catch(e =>
-      this.logger.warn('Startup rank recalculation failed: ' + e.message)
-    );
-  }
-
-  // Recalculate every hour
-  @Cron('0 * * * *')
-  async recalculate() {
-    await this.db.query(
-      `UPDATE users u
-       SET rank = ranks.new_rank
-       FROM (
-         SELECT id,
-                ROW_NUMBER() OVER (
-                  ORDER BY coins DESC, accuracy DESC, streak DESC
-                ) AS new_rank
-         FROM users
-         WHERE status='active' AND deleted_at IS NULL
-       ) ranks
-       WHERE u.id = ranks.id`
-    );
-    this.logger.log('Leaderboard ranks recalculated');
-  }
-}
-
-@Module({ imports:[ScheduleModule.forFeature()], controllers:[UsersController, AdminUsersExtraController], providers:[UsersService, LeaderboardCronService], exports:[UsersService] })
+@Module({ controllers:[UsersController, AdminUsersExtraController], providers:[UsersService], exports:[UsersService] })
 export class UsersModule {}
 
 // ════════════════════════════════════════════════════════════

@@ -36,6 +36,7 @@ import {
 import { TierRoomsModule }    from './modules/tier-rooms/tier-rooms.module';
 import { AchievementsModule } from './modules/achievements/achievements.module';
 import { StudyMaterialsModule } from '@modules/study-materials/study-materials.module';
+import { MarketplaceModule }   from './modules/marketplace.module';
 
 @Module({
   imports: [
@@ -64,11 +65,10 @@ import { StudyMaterialsModule } from '@modules/study-materials/study-materials.m
           autoLoadEntities: true,
           migrations: [join(__dirname, 'database/migrations/*{.ts,.js}')],
 
-          // BUG FIX 6: synchronize:true in production is DANGEROUS.
-          // It runs ALTER TABLE on every restart, can cause data loss and
-          // startup race conditions. Use explicit migrations instead.
-          synchronize: !isProd,   // true in dev, false in production
-          migrationsRun: !isProd,  // auto-run migrations on start in production
+          // synchronize:true drops/alters columns on every restart — never in production.
+          // Defaults to false unless explicitly in 'development' or 'test' mode.
+          synchronize: ['development', 'test'].includes(config.get('app.env', 'production')),
+          migrationsRun: config.get('app.isProd', true)
 
           logging:  config.get('database.logging'),
           extra: {
@@ -128,6 +128,7 @@ import { StudyMaterialsModule } from '@modules/study-materials/study-materials.m
     TierRoomsModule,
     AchievementsModule,
     StudyMaterialsModule,
+    MarketplaceModule,
     CoinsModule
   ],
 

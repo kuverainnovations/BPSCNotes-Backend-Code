@@ -3,6 +3,7 @@ import { InjectDataSource }    from '@nestjs/typeorm';
 import { DataSource }          from 'typeorm';
 import { Cron }                from '@nestjs/schedule';
 import * as admin              from 'firebase-admin';
+import { ensureFirebaseAdmin } from '../../common/firebase/firebase-admin';
 
 // ════════════════════════════════════════════════════════════
 // FILE: backend/src/modules/tier-rooms/tier-notifications.service.ts
@@ -228,7 +229,7 @@ export class TierNotificationsService {
     body:   string,
     data:   Record<string, string> = {},
   ): Promise<boolean> {
-    if (!admin.apps.length) return false;
+    if (!ensureFirebaseAdmin()) return false;
     try {
       await admin.messaging().sendEachForMulticast({
         tokens,

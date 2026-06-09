@@ -17,6 +17,7 @@ import { JwtAuthGuard, AdminJwtGuard, PermissionGuard, RequirePermission, Public
 import { PaginationDto } from '../common/dtos/pagination.dto';
 import { successResponse, paginationMeta } from '../common/utils/response.util';
 import { AuthService } from './auth/auth.module';
+import { ensureFirebaseAdmin } from '../common/firebase/firebase-admin';
 
 // ════════════════════════════════════════════════════════════
 // CURRENT AFFAIRS MODULE
@@ -460,12 +461,13 @@ class SubscriptionsService {
     quarterly: { price: 499, originalPrice: 899,  duration: '3 months', bonusCoins: 60 },
     annual:    { price: 1499,originalPrice: 2999, duration: '12 months',bonusCoins: 200 },
   };
-  pushToUser: any;
-
   constructor(
     @InjectDataSource() private readonly db: DataSource,
     private readonly config: ConfigService,
     @Inject(CACHE_MANAGER) private readonly cache: Cache,
+    @Inject('NOTIFICATION_SERVICE') @Optional() private readonly notifService?: {
+      pushToUser: (userId: string, title: string, body: string, data?: Record<string, string>) => Promise<boolean>;
+    },
   ) {}
 
   async getPlans() {
@@ -581,18 +583,22 @@ class SubscriptionsService {
     const dupCheck = await this.db.query(`SELECT id FROM subscriptions WHERE razorpay_payment_id=$1`, [data.transactionId]);
     if (dupCheck.length) throw new ConflictException('Transaction already processed');
 
-    // Verify Razorpay signature to ensure payment authenticity
-    if (data.razorpaySignature && sub.razorpay_order_id) {
-      const crypto = require('crypto');
-      const expectedSig = crypto
-        .createHmac('sha256', process.env.RAZORPAY_KEY_SECRET || '')
-        .update(`${sub.razorpay_order_id}|${data.transactionId}`)
-        .digest('hex');
-      if (expectedSig !== data.razorpaySignature) {
-        // Log tamper attempt
-        console.error(`PAYMENT TAMPER DETECTED: user=${userId} order=${sub.razorpay_order_id} payment=${data.transactionId}`);
-        throw new BadRequestException('Payment signature verification failed');
-      }
+    // Verify Razorpay signature — mandatory, no bypass
+    const rpSecret = process.env.RAZORPAY_KEY_SECRET;
+    if (!rpSecret) {
+      throw new BadRequestException('Payment gateway not configured. Contact support.');
+    }
+    if (!data.razorpaySignature || !sub.razorpay_order_id) {
+      throw new BadRequestException('Missing payment verification data.');
+    }
+    const crypto = require('crypto');
+    const expectedSig = crypto
+      .createHmac('sha256', rpSecret)
+      .update(`${sub.razorpay_order_id}|${data.transactionId}`)
+      .digest('hex');
+    if (expectedSig !== data.razorpaySignature) {
+      console.error(`PAYMENT TAMPER DETECTED: user=${userId} order=${sub.razorpay_order_id} payment=${data.transactionId}`);
+      throw new BadRequestException('Payment signature verification failed');
     }
 
     const endsAt = new Date();
@@ -624,7 +630,7 @@ class SubscriptionsService {
     await this.cache.del(`user:${userId}`);
 
     // 🔔 Subscription welcome push
-    this.pushToUser(
+    this.notifService?.pushToUser(
       userId,
       '🎉 BPSCNotes Pro Activated!',
       `Your ${sub.plan} plan is live. Enjoy unlimited access + 🪙 ${plan.bonusCoins} bonus coins!`,
@@ -825,36 +831,7 @@ export class NotificationService {
   }
 
   private initFirebase() {
-    try {
-      if (!admin.apps.length) {
-  
-        const serviceAccountPath =
-        process.env.FIREBASE_SERVICE_ACCOUNT_PATH ||
-        '/app/firebase-service-account.json';
-      
-      console.log('Firebase path:', serviceAccountPath);
-      
-  
-        admin.initializeApp({
-          credential: admin.credential.cert(
-            require(serviceAccountPath)
-          ),
-        });
-  
-        this.firebaseInitialized = true;
-  
-        console.log('✅ Firebase initialized');
-  
-      } else {
-        this.firebaseInitialized = true;
-      }
-  
-    } catch (err: any) {
-      console.error(
-        '❌ Firebase initialization failed:',
-        err.message
-      );
-    }
+    this.firebaseInitialized = ensureFirebaseAdmin();
   }
 
   async send(data: any, adminId: string) {
