@@ -68,7 +68,7 @@ import { MarketplaceModule }   from './modules/marketplace.module';
           // synchronize:true drops/alters columns on every restart — never in production.
           // Defaults to false unless explicitly in 'development' or 'test' mode.
           synchronize: ['development', 'test'].includes(config.get('app.env', 'production')),
-          migrationsRun: config.get('app.isProd', true)
+          migrationsRun: config.get('app.isProd', true),
 
           logging:  config.get('database.logging'),
           extra: {
