@@ -1442,10 +1442,11 @@ class FlashcardsService {
   /** GET /flashcards/progress — return user's mastered/weak card IDs */
   async getUserProgress(userId: string) {
     const rows = await this.db.query(
-      `SELECT flashcard_id AS "flashcardId", status, streak,
-              ease_factor AS "easeFactor", repetitions, next_review AS "nextReview"
-       FROM user_flashcard_progress
-       WHERE user_id = $1`,
+      `SELECT ufp.flashcard_id AS "flashcardId", ufp.status, ufp.streak,
+              ufp.ease_factor AS "easeFactor", ufp.repetitions, ufp.next_review AS "nextReview"
+       FROM user_flashcard_progress ufp
+       INNER JOIN flashcards f ON f.id = ufp.flashcard_id AND f.is_active = TRUE
+       WHERE ufp.user_id = $1`,
       [userId]
     ).catch(() => []);
 
@@ -1493,10 +1494,6 @@ class FlashcardsService {
 class FlashcardsController {
   constructor(private s: FlashcardsService) {}
 
-  /** GET /api/v1/flashcards?subject=Polity&limit=200 */
-  @Get()
-  findAll(@Query() q: any) { return this.s.findAll(q); }
-
   /** GET /api/v1/flashcards/progress — user's mastered/weak card IDs */
   @Get('progress')
   getProgress(@Req() r: any) { return this.s.getUserProgress(r.user.id); }
@@ -1507,6 +1504,10 @@ class FlashcardsController {
   saveProgress(@Body() dto: any, @Req() r: any) {
     return this.s.saveProgress(r.user.id, dto);
   }
+
+  /** GET /api/v1/flashcards?subject=Polity&limit=200 */
+  @Get()
+  findAll(@Query() q: any) { return this.s.findAll(q); }
 }
 
 @ApiTags('Admin — Flashcards')
