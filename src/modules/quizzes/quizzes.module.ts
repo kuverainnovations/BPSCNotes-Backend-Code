@@ -228,6 +228,20 @@ if (q.scheduled_for) {
       };
     });
 
+    // Include skipped questions in the result so Android can show correct answers for ALL
+    // questions in the review screen, not just submitted ones
+    const submittedIds = new Set(validAnswers.map((a: any) => a.questionId));
+    const skippedResults = questions
+      .filter((q: any) => !submittedIds.has(q.id))
+      .map((q: any) => ({
+        questionId:    q.id,
+        answer:        '',       // empty = skipped
+        isCorrect:     false,
+        correctAnswer: qMap[q.id]?.correct ?? '',
+        explanation:   qMap[q.id]?.explanation ?? '',
+      }));
+    const allAnswers = [...evaluated, ...skippedResults];
+
     // ANTI-CHEAT: Calculate time server-side — don't trust client timeTakenSecs
     // Use attempted_at from the start record vs NOW()
     const serverTimeSecs = Math.round(
@@ -247,7 +261,7 @@ if (q.scheduled_for) {
          (user_id, quiz_id, score, total_questions, correct_answers, time_taken_secs, coins_earned, answers, is_passed, submitted_at)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW())
        RETURNING id, attempted_at`,
-      [userId, quizId, score, total, correct, timeTakenSecs, isPassed ? coinsReward : 0, JSON.stringify(evaluated), isPassed]
+      [userId, quizId, score, total, correct, timeTakenSecs, isPassed ? coinsReward : 0, JSON.stringify(allAnswers), isPassed]
     );
 
     // Update quiz stats
@@ -369,7 +383,7 @@ return successResponse({
   rank,
   percentile,
 
-  answers: evaluated,
+  answers: allAnswers,
 });
   }
 
