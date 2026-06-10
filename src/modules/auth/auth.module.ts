@@ -137,6 +137,10 @@ export class OtpService {
       [mobile, hash, `${expiryMins} minutes`]
     );
 
+    // TEMP: Log OTP to server console while MSG91 KYC is pending
+    // Remove this line before going live
+    console.log(`📱 [TEMP] OTP for ${mobile}: ${otp}`);
+
     if (this.config.get('app.env') === 'development') {
       console.log(`📱 DEV OTP for ${mobile}: ${otp}`);
       return { success: true, otp };   // only returned in dev — never in production
