@@ -32,6 +32,7 @@ import { JwtModule } from '@nestjs/jwt';
 @Injectable()
 export class TierRoomsService {
   private readonly logger = new Logger(TierRoomsService.name);
+  promoteUser: any;
 
   constructor(
     @InjectDataSource() private readonly db: DataSource,
@@ -384,6 +385,36 @@ export class TierRoomsService {
   // ── GET "at risk" demotion status for calling user ──────────
   // Returns: { isAtRisk, progress, threshold, tierKey, graceUntil }
   // Called by Android on app resume to show the warning banner.
+  async claimPromotion(userId: string) {
+    // Get user's current tier and next tier
+    const [urt] = await this.db.query(`
+      SELECT urt.current_tier_id, urt.next_tier_progress,
+             ct.tier_key AS current_key,
+             nt.id AS next_tier_id, nt.tier_key AS next_key, nt.name AS next_name, nt.icon_emoji
+      FROM user_room_tier urt
+      JOIN room_tiers ct ON ct.id = urt.current_tier_id
+      LEFT JOIN room_tiers nt ON nt.id = (
+        SELECT id FROM room_tiers
+        WHERE min_score > ct.min_score AND is_active = TRUE
+        ORDER BY min_score ASC LIMIT 1
+      )
+      WHERE urt.user_id = $1
+    `, [userId]);
+
+    if (!urt) throw new BadRequestException('Tier data not found');
+    if (!urt.next_tier_id) throw new BadRequestException('Already at highest tier');
+
+    const progress = parseFloat(urt.next_tier_progress || '0');
+    if (progress < 100) {
+      throw new BadRequestException(`Not yet eligible. Progress: ${progress.toFixed(1)}%`);
+    }
+
+    await this.promoteUser(userId, urt.next_tier_id, urt.current_tier_id);
+    return successResponse({
+      promotedTo: { key: urt.next_key, name: urt.next_name, emoji: urt.icon_emoji }
+    }, `🎉 Promoted to ${urt.next_name}!`);
+  }
+
   async getAtRiskStatus(userId: string) {
     const rows = await this.db.query(`
       SELECT
@@ -1099,6 +1130,17 @@ export class TierRoomsController {
   @Get('tiers/at-risk')
   getAtRiskStatus(@Req() r: any) {
     return this.tiersService.getAtRiskStatus(r.user.id);
+  }
+
+  /**
+   * POST /rooms/tiers/claim-promotion
+   * Called by Android when user taps "Claim Promotion" banner.
+   * Checks if user's next_tier_progress >= 100 and promotes them.
+   */
+  @Post('tiers/claim-promotion')
+  @HttpCode(HttpStatus.OK)
+  async claimPromotion(@Req() r: any) {
+    return this.tiersService.claimPromotion(r.user.id);
   }
 
   /**
