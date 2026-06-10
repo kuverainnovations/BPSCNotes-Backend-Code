@@ -1166,7 +1166,7 @@ export class AdminTierRoomsController {
 // MODULE
 // ============================================================
 @Module({
-  imports: [JwtModule, ScheduleModule.forRoot(), AuthModule],
+  imports: [JwtModule, AuthModule],
   controllers: [TierRoomsController, AdminTierRoomsController],
   providers: [
     TierRoomsService,
