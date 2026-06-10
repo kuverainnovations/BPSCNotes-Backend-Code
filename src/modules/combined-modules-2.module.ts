@@ -1366,12 +1366,16 @@ class FlashcardsService {
   }
 
   async create(data: any, adminId: string) {
+    console.log('Flashcard create payload:', JSON.stringify(data));
     const front = data.front || data.question;
-    const back  = data.back  || data.answer;
-    if (!front || !back) throw new BadRequestException('front (question) and back (answer) are required');
+    const back  = data.back  || data.answer || '';
+    const backImageUrl = data.backImageUrl || data.back_image_url || null;
+    // front (question) is always required
+    // back (answer) is required UNLESS a back image is provided
+    if (!front) throw new BadRequestException('front (question) is required');
+    if (!back && !backImageUrl) throw new BadRequestException('back (answer) or a back image is required');
     const cardType = data.cardType || data.card_type || 'text';
     const imageUrl = cardType === 'image' ? (data.imageUrl || data.image_url || null) : null;
-    const backImageUrl = data.backImageUrl || data.back_image_url || null;
     const result = await this.db.query(
       `INSERT INTO flashcards
          (front, back, subject, exam_tags, card_type, image_url, back_image_url, topic, hint, example, created_by)
