@@ -778,11 +778,11 @@ export class AuthService {
   // ════════════════════════════════════════════════════════
 
   private validateMpinStrength(mpin: string): void {
-    if (!/^\d{6}$/.test(mpin))
-      throw new BadRequestException('MPIN must be exactly 6 digits');
-    if (/^(\d)\1{5}$/.test(mpin))
-      throw new BadRequestException('MPIN cannot be all the same digit (e.g. 111111)');
-    if (['123456','234567','345678','456789','654321','543210','012345'].includes(mpin))
+    if (!/^\d{4}$/.test(mpin))
+      throw new BadRequestException('MPIN must be exactly 4 digits');
+    if (/^(\d)\1{3}$/.test(mpin))
+      throw new BadRequestException('MPIN cannot be all the same digit (e.g. 1111)');
+    if (['1234','2345','3456','4567','5678','6789','9876','8765','7654','6543','5432','4321'].includes(mpin))
       throw new BadRequestException('MPIN is too simple. Please choose a less predictable one');
   }
 
