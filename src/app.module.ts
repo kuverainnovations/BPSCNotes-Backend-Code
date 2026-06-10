@@ -3,7 +3,6 @@ import { ConfigModule, ConfigService } from '@nestjs/config';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { ThrottlerModule, ThrottlerGuard } from '@nestjs/throttler';
 import { CacheModule } from '@nestjs/cache-manager';
-import { ScheduleModule } from '@nestjs/schedule';
 import { APP_GUARD, APP_FILTER, APP_INTERCEPTOR } from '@nestjs/core';
 import { join } from 'path';
 import { redisStore } from 'cache-manager-ioredis-yet';
@@ -109,7 +108,6 @@ import { MarketplaceModule }   from './modules/marketplace.module';
     }),
 
     // ── Feature Modules ───────────────────────────────────────
-    ScheduleModule.forRoot(),
     AuthModule,
     AdminModule,
     CoursesModule,
