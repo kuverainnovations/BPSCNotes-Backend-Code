@@ -386,18 +386,13 @@ export class TierRoomsService {
   // Returns: { isAtRisk, progress, threshold, tierKey, graceUntil }
   // Called by Android on app resume to show the warning banner.
   async claimPromotion(userId: string) {
-    // Get user's current tier and next tier
     const [urt] = await this.db.query(`
       SELECT urt.current_tier_id, urt.next_tier_progress,
-             ct.tier_key AS current_key,
+             ct.tier_key AS current_key, ct.sort_order AS current_sort,
              nt.id AS next_tier_id, nt.tier_key AS next_key, nt.name AS next_name, nt.icon_emoji
       FROM user_room_tier urt
       JOIN room_tiers ct ON ct.id = urt.current_tier_id
-      LEFT JOIN room_tiers nt ON nt.id = (
-        SELECT id FROM room_tiers
-        WHERE min_score > ct.min_score AND is_active = TRUE
-        ORDER BY min_score ASC LIMIT 1
-      )
+      LEFT JOIN room_tiers nt ON nt.sort_order = ct.sort_order + 1 AND nt.is_active = TRUE
       WHERE urt.user_id = $1
     `, [userId]);
 
@@ -414,7 +409,7 @@ export class TierRoomsService {
       promotedTo: { key: urt.next_key, name: urt.next_name, emoji: urt.icon_emoji }
     }, `🎉 Promoted to ${urt.next_name}!`);
   }
-
+ 
   async getAtRiskStatus(userId: string) {
     const rows = await this.db.query(`
       SELECT
