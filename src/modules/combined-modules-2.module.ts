@@ -558,6 +558,21 @@ class DailyTargetsService {
       wasCompleted ? 'Target deleted — coins reversed' : 'Target deleted'
     );
   }
+
+  async updateTarget(targetId: string, userId: string, title: string, subject: string) {
+    const rows = await this.db.query(
+      `SELECT id FROM daily_targets WHERE id=$1 AND user_id=$2`,
+      [targetId, userId]
+    );
+    if (!rows.length) throw new NotFoundException('Target not found');
+
+    await this.db.query(
+      `UPDATE daily_targets SET title=$1, subject=$2, updated_at=NOW() WHERE id=$3 AND user_id=$4`,
+      [title.trim(), subject || 'General Studies', targetId, userId]
+    );
+
+    return this.getTargets(userId);
+  }
 }
 
 // ── Controller ─────────────────────────────────────────────
@@ -609,6 +624,20 @@ class DailyTargetsController {
     @Req() r: any,
   ) {
     return this.s.deleteTarget(id, r.user.id);
+  }
+
+  /**
+   * PATCH /api/v1/users/daily-targets/:id
+   * Update title and subject of a target
+   */
+  @Patch(':id')
+  @HttpCode(HttpStatus.OK)
+  updateTarget(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: any,
+    @Req() r: any,
+  ) {
+    return this.s.updateTarget(id, r.user.id, dto.title, dto.subject);
   }
 }
 
