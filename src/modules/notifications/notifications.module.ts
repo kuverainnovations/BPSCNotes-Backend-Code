@@ -1,4 +1,3 @@
-
 import {
   Module, Injectable, Controller,
   Get, Post, Param, Query, Req, Body,
@@ -98,6 +97,14 @@ export class NotificationsService {
     };
   }
 
+  async getUnreadCount(userId: string): Promise<number> {
+    const rows = await this.db.query(
+      `SELECT COUNT(*)::int AS count FROM user_notifications WHERE user_id=$1 AND is_read=FALSE`,
+      [userId]
+    );
+    return rows[0]?.count ?? 0;
+  }
+
   async markRead(notifId: string, userId: string) {
     // FIX: mark in user_notifications, not notifications
     const rows = await this.db.query(
@@ -134,6 +141,13 @@ export class NotificationsController {
     @Query('limit') limit = 30,
   ) {
     return this.svc.getForUser(r.user.id, +page, +limit);
+  }
+
+  /** GET /notifications/unread-count — fast single COUNT query, no list fetch */
+  @Get('unread-count')
+  async getUnreadCount(@Req() r: any) {
+    const rows = await this.svc.getUnreadCount(r.user.id);
+    return { success: true, data: { count: rows } };
   }
 
   @Post(':id/read')
