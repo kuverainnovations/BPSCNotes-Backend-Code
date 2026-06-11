@@ -18,6 +18,8 @@ import { diskStorage }            from 'multer';
 import { extname, join }          from 'path';
 import * as fs                    from 'fs';
 import * as crypto                from 'crypto';
+import * as admin                 from 'firebase-admin';
+import { ensureFirebaseAdmin }    from '../../common/firebase/firebase-admin';
 import { Response }               from 'express';
 import { JwtAuthGuard, AdminJwtGuard, PermissionGuard, RequirePermission, Public } from '../../common/guards';
 import { successResponse, paginationMeta } from '../../common/utils/response.util';
@@ -505,27 +507,31 @@ if (query.search)  { conditions.push(`sm.title ILIKE $${pi++}`); params.push(`%$
 
     // Push notification to the uploader (direct Firebase, no cross-module dependency)
     try {
-      const [mat] = await this.db.query(
-        `SELECT sm.uploader_id, sm.title, u.fcm_token, u.notification_enabled
+      const rows = await this.db.query(
+        `SELECT sm.title, u.fcm_token
          FROM study_materials sm
          JOIN users u ON u.id = sm.uploader_id
          WHERE sm.id=$1`, [id]
       );
-      if (mat?.fcm_token && mat?.notification_enabled) {
-        const adminSdk = await import('firebase-admin');
-        if (adminSdk.apps.length) {
-          await adminSdk.messaging().send({
-            token: mat.fcm_token,
-            notification: {
-              title: '✅ Study material approved!',
-              body:  `Your upload "${mat.title}" is now live for all students.`,
-            },
-            data: { type: 'material_approved', materialId: id, screen: 'study_materials' },
-            android: { priority: 'high' },
-          }).catch(() => {});
-        }
+      const mat = rows[0];
+      if (mat?.fcm_token) {
+        ensureFirebaseAdmin();
+        const result = await admin.messaging().send({
+          token: mat.fcm_token,
+          notification: {
+            title: '✅ Study material approved!',
+            body:  `Your upload "${mat.title}" is now live for all students.`,
+          },
+          data: { type: 'material_approved', materialId: id, screen: 'study_materials' },
+          android: { priority: 'high' },
+        });
+        this.logger.log(`Push sent for approval: ${result}`);
+      } else {
+        this.logger.warn(`adminApprove: no fcm_token for material ${id}`);
       }
-    } catch (_) { /* non-blocking */ }
+    } catch (err: any) {
+      this.logger.error(`adminApprove push failed: ${err.message}`);
+    }
 
     return successResponse(null, '✅ Approved — now visible to students');
   }
@@ -538,29 +544,33 @@ if (query.search)  { conditions.push(`sm.title ILIKE $${pi++}`); params.push(`%$
       [id, reason || null]
     );
 
-    // Notify uploader
+    // Send push notification to uploader
     try {
-      const [mat] = await this.db.query(
-        `SELECT sm.title, sm.uploader_id, u.fcm_token, u.notification_enabled
-         FROM study_materials sm JOIN users u ON u.id=sm.uploader_id WHERE sm.id=$1`, [id]
+      const rows = await this.db.query(
+        `SELECT sm.title, u.fcm_token
+         FROM study_materials sm
+         JOIN users u ON u.id = sm.uploader_id
+         WHERE sm.id = $1`, [id]
       );
-      if (mat?.fcm_token && mat?.notification_enabled) {
-        const adminSdk = await import('firebase-admin');
-        if (adminSdk.apps.length) {
-          await adminSdk.messaging().send({
-            token: mat.fcm_token,
-            notification: {
-              title: '❌ Upload Not Approved',
-              body: reason
-                ? `Your upload "${mat.title}" was rejected: ${reason}`
-                : `Your upload "${mat.title}" was not approved. Please check the guidelines.`,
-            },
-            data: { type: 'upload_rejected', materialId: id, screen: 'study_materials' },
-            android: { priority: 'high' },
-          }).catch(() => {});
-        }
+      const mat = rows[0];
+      if (mat?.fcm_token) {
+        ensureFirebaseAdmin();
+        const body = reason
+          ? `Your upload "${mat.title}" was rejected: ${reason}`
+          : `Your upload "${mat.title}" was not approved. Please check the guidelines.`;
+        const result = await admin.messaging().send({
+          token: mat.fcm_token,
+          notification: { title: '❌ Upload Not Approved', body },
+          data: { type: 'upload_rejected', materialId: id, screen: 'study_materials' },
+          android: { priority: 'high' },
+        });
+        this.logger.log(`Push sent for rejection: ${result}`);
+      } else {
+        this.logger.warn(`adminReject: no fcm_token for material ${id}`);
       }
-    } catch (_) { /* non-blocking */ }
+    } catch (err: any) {
+      this.logger.error(`adminReject push failed: ${err.message}`);
+    }
 
     return successResponse(null, `Rejected${reason ? ': ' + reason : ''}`);
   }
