@@ -142,10 +142,44 @@ class LibraryService {
     return successResponse(null, 'Resource updated — live in app ✅');
   }
 
-  async reviewUpload(noteId: string, action: string) {
+  async reviewUpload(noteId: string, action: string, reason?: string) {
     if (!['published','rejected'].includes(action)) throw new ForbiddenException('Invalid action');
-    await this.db.query(`UPDATE library_notes SET status=$1, updated_at=NOW() WHERE id=$2`, [action, noteId]);
-    return successResponse(null, `${action === 'published' ? 'Approved — now live in E-Library ✅' : 'Rejected'}`);
+
+    // Ensure rejection_reason column exists (migration-safe)
+    await this.db.query(`
+      ALTER TABLE library_notes ADD COLUMN IF NOT EXISTS rejection_reason TEXT
+    `).catch(() => {});
+
+    await this.db.query(
+      `UPDATE library_notes SET status=$1, rejection_reason=$2, updated_at=NOW() WHERE id=$3`,
+      [action, reason || null, noteId]
+    );
+
+    // Notify uploader via push notification
+    try {
+      const [note] = await this.db.query(
+        `SELECT n.title, n.uploaded_by_id, u.fcm_token, u.notification_enabled
+         FROM library_notes n
+         JOIN users u ON u.id = n.uploaded_by_id
+         WHERE n.id=$1`, [noteId]
+      );
+      if (note?.fcm_token && note?.notification_enabled) {
+        const adminSdk = await import('firebase-admin');
+        if (adminSdk.apps.length) {
+          const msg = action === 'published'
+            ? { title: '✅ Upload Approved!', body: `Your upload "${note.title}" is now live in the E-Library.` }
+            : { title: '❌ Upload Rejected', body: reason ? `"${note.title}" was rejected: ${reason}` : `Your upload "${note.title}" was not approved.` };
+          await adminSdk.messaging().send({
+            token: note.fcm_token,
+            notification: msg,
+            data: { type: action === 'published' ? 'upload_approved' : 'upload_rejected', noteId, screen: 'library' },
+            android: { priority: 'high' },
+          }).catch(() => {});
+        }
+      }
+    } catch (_) { /* non-blocking */ }
+
+    return successResponse(null, `${action === 'published' ? 'Approved — now live in E-Library ✅' : `Rejected${reason ? ': ' + reason : ''}`}`);
   }
 
   async getPendingReviews() {
@@ -175,7 +209,7 @@ class AdminLibraryController {
   @Get('pending-reviews') @RequirePermission('reviews') getPending() { return this.s.getPendingReviews(); }
   @Post() @RequirePermission('notes') @HttpCode(201) @UseInterceptors(FileInterceptor('file')) create(@Body() dto: any, @UploadedFile() file: any, @Req() r: any) { return this.s.adminCreate(dto, file, r.admin.id); }
   @Put(':id') @RequirePermission('notes') update(@Param('id', ParseUUIDPipe) id: string, @Body() dto: any) { return this.s.adminUpdate(id, dto); }
-  @Put(':id/review') @RequirePermission('reviews') review(@Param('id', ParseUUIDPipe) id: string, @Body() body: any) { return this.s.reviewUpload(id, body.action); }
+  @Put(':id/review') @RequirePermission('reviews') review(@Param('id', ParseUUIDPipe) id: string, @Body() body: any) { return this.s.reviewUpload(id, body.action, body.reason); }
 }
 
 @Module({ imports:[ConfigModule], controllers:[LibraryController, AdminLibraryController], providers:[LibraryService] })

@@ -531,7 +531,35 @@ if (query.search)  { conditions.push(`sm.title ILIKE $${pi++}`); params.push(`%$
   }
 
   async adminReject(id: string, reason?: string) {
-    await this.db.query(`UPDATE study_materials SET status='rejected', updated_at=NOW() WHERE id=$1`, [id]);
+    await this.db.query(
+      `UPDATE study_materials SET status='rejected', rejection_reason=$2, updated_at=NOW() WHERE id=$1`,
+      [id, reason || null]
+    );
+
+    // Notify uploader
+    try {
+      const [mat] = await this.db.query(
+        `SELECT sm.title, sm.uploader_id, u.fcm_token, u.notification_enabled
+         FROM study_materials sm JOIN users u ON u.id=sm.uploader_id WHERE sm.id=$1`, [id]
+      );
+      if (mat?.fcm_token && mat?.notification_enabled) {
+        const adminSdk = await import('firebase-admin');
+        if (adminSdk.apps.length) {
+          await adminSdk.messaging().send({
+            token: mat.fcm_token,
+            notification: {
+              title: '❌ Upload Not Approved',
+              body: reason
+                ? `Your upload "${mat.title}" was rejected: ${reason}`
+                : `Your upload "${mat.title}" was not approved. Please check the guidelines.`,
+            },
+            data: { type: 'upload_rejected', materialId: id, screen: 'study_materials' },
+            android: { priority: 'high' },
+          }).catch(() => {});
+        }
+      }
+    } catch (_) { /* non-blocking */ }
+
     return successResponse(null, `Rejected${reason ? ': ' + reason : ''}`);
   }
 
