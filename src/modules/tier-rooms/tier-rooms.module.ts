@@ -32,14 +32,56 @@ import { JwtModule } from '@nestjs/jwt';
 @Injectable()
 export class TierRoomsService {
   private readonly logger = new Logger(TierRoomsService.name);
-  promoteUser: any;
-  meetsCriteria: any;
-  computeProgress: any;
 
   constructor(
     @InjectDataSource() private readonly db: DataSource,
     @Inject(CACHE_MANAGER) private readonly cache: Cache,
+    private readonly authService: AuthService,
+    private readonly gateway: TierRoomsGateway,
+    private readonly notifService: TierNotificationsService,
   ) {}
+
+  private computeProgress(user: any, rule: any, totalHours: number): number {
+    const parts: number[] = [];
+    if (+rule.min_total_study_hours > 0) parts.push(Math.min(totalHours / +rule.min_total_study_hours, 1));
+    if (+rule.min_streak_days > 0) parts.push(Math.min((user.streak || 0) / +rule.min_streak_days, 1));
+    if (+rule.min_quizzes_completed > 0) parts.push(Math.min((user.quizzes_attempted || 0) / +rule.min_quizzes_completed, 1));
+    if (+rule.min_accuracy_pct > 0) parts.push(Math.min(+(user.accuracy || 0) / +rule.min_accuracy_pct, 1));
+    if (!parts.length) return 0;
+    return +Math.min(parts.reduce((a, b) => a + b, 0) / parts.length, 1).toFixed(4);
+  }
+
+  private meetsCriteria(user: any, rule: any, totalHours: number): boolean {
+    if (+rule.min_total_study_hours > 0 && totalHours < +rule.min_total_study_hours) return false;
+    if (+rule.min_streak_days > 0 && (user.streak || 0) < +rule.min_streak_days) return false;
+    if (+rule.min_quizzes_completed > 0 && (user.quizzes_attempted || 0) < +rule.min_quizzes_completed) return false;
+    if (+rule.min_accuracy_pct > 0 && +(user.accuracy || 0) < +rule.min_accuracy_pct) return false;
+    return true;
+  }
+
+  private async promoteUser(userId: string, toTierId: string, fromTierId: string) {
+    await this.db.query(`
+      UPDATE user_room_tier
+      SET current_tier_id=$1, previous_tier_id=$2, promoted_at=NOW(), tier_joined_at=NOW(),
+          next_tier_progress=0.0000, demotion_grace_until=NOW()+INTERVAL '3 days', updated_at=NOW()
+      WHERE user_id=$3
+    `, [toTierId, fromTierId, userId]);
+    await this.db.query(`UPDATE users SET room_tier_id=$1 WHERE id=$2`, [toTierId, userId]);
+    await this.authService.awardCoins(userId, 'tier_promotion', toTierId);
+    await this.cache.del(`user_tier:${userId}`);
+    await this.cache.del('tier_rooms:all');
+    const tierInfo = await this.db.query(
+      `SELECT tier_key, name, icon_emoji FROM room_tiers WHERE id=$1 LIMIT 1`, [toTierId]
+    );
+    if (tierInfo.length) {
+      const t = tierInfo[0];
+      const wsDelivered = this.gateway.emitPromotion(userId, t.tier_key, t.name, t.icon_emoji);
+      if (!wsDelivered) {
+        this.notifService.notifyPromotion(userId, t.tier_key, t.name, t.icon_emoji)
+          .catch((e: any) => this.logger.error(`Promotion push failed: ${e.message}`));
+      }
+    }
+  }
 
   async findAllTiers() {
     const cacheKey = 'tier_rooms:all';
@@ -388,7 +430,6 @@ export class TierRoomsService {
   // Returns: { isAtRisk, progress, threshold, tierKey, graceUntil }
   // Called by Android on app resume to show the warning banner.
   async claimPromotion(userId: string) {
-    // Get user's current tier, rule, and live stats
     const [urt] = await this.db.query(`
       SELECT
         urt.current_tier_id, urt.next_tier_progress, urt.tier_joined_at,
@@ -1140,11 +1181,6 @@ export class TierRoomsController {
     return this.tiersService.getAtRiskStatus(r.user.id);
   }
 
-  /**
-   * POST /rooms/tiers/claim-promotion
-   * Called by Android when user taps "Claim Promotion" banner.
-   * Checks if user's next_tier_progress >= 100 and promotes them.
-   */
   @Post('tiers/claim-promotion')
   @HttpCode(HttpStatus.OK)
   async claimPromotion(@Req() r: any) {
@@ -1216,7 +1252,7 @@ export class AdminTierRoomsController {
 // MODULE
 // ============================================================
 @Module({
-  imports: [JwtModule, AuthModule],
+  imports: [JwtModule, ScheduleModule.forRoot(), AuthModule],
   controllers: [TierRoomsController, AdminTierRoomsController],
   providers: [
     TierRoomsService,
