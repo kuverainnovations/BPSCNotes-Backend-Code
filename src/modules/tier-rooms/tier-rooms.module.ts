@@ -33,6 +33,8 @@ import { JwtModule } from '@nestjs/jwt';
 export class TierRoomsService {
   private readonly logger = new Logger(TierRoomsService.name);
   promoteUser: any;
+  meetsCriteria: any;
+  computeProgress: any;
 
   constructor(
     @InjectDataSource() private readonly db: DataSource,
@@ -386,21 +388,32 @@ export class TierRoomsService {
   // Returns: { isAtRisk, progress, threshold, tierKey, graceUntil }
   // Called by Android on app resume to show the warning banner.
   async claimPromotion(userId: string) {
+    // Get user's current tier, rule, and live stats
     const [urt] = await this.db.query(`
-      SELECT urt.current_tier_id, urt.next_tier_progress,
-             ct.tier_key AS current_key, ct.sort_order AS current_sort,
-             nt.id AS next_tier_id, nt.tier_key AS next_key, nt.name AS next_name, nt.icon_emoji
+      SELECT
+        urt.current_tier_id, urt.next_tier_progress, urt.tier_joined_at,
+        ct.tier_key AS current_key, ct.sort_order AS current_sort,
+        nt.id AS next_tier_id, nt.tier_key AS next_key, nt.name AS next_name, nt.icon_emoji,
+        u.total_study_minutes, u.streak, u.quizzes_attempted, u.accuracy,
+        tpr.min_total_study_hours, tpr.min_streak_days,
+        tpr.min_quizzes_completed, tpr.min_accuracy_pct,
+        tpr.evaluation_window_days
       FROM user_room_tier urt
       JOIN room_tiers ct ON ct.id = urt.current_tier_id
+      JOIN users u ON u.id = urt.user_id
       LEFT JOIN room_tiers nt ON nt.sort_order = ct.sort_order + 1 AND nt.is_active = TRUE
+      LEFT JOIN tier_progression_rules tpr ON tpr.from_tier_id = urt.current_tier_id AND tpr.is_active = TRUE
       WHERE urt.user_id = $1
     `, [userId]);
 
     if (!urt) throw new BadRequestException('Tier data not found');
     if (!urt.next_tier_id) throw new BadRequestException('Already at highest tier');
 
-    const progress = parseFloat(urt.next_tier_progress || '0');
-    if (progress < 1.0) {
+    const totalHours = (urt.total_study_minutes || 0) / 60;
+    const eligible = this.meetsCriteria(urt, urt, totalHours);
+
+    if (!eligible) {
+      const progress = this.computeProgress(urt, urt, totalHours);
       throw new BadRequestException(`Not yet eligible. Progress: ${(progress * 100).toFixed(1)}%`);
     }
 
