@@ -308,6 +308,7 @@ export class CoursesRepository {
       language: 'language', trialLessonTitle: 'trial_lesson_title',
       examTags: 'exam_tags', status: 'status',
       whatYouLearn: 'what_you_learn', hasCertificate: 'has_certificate',
+      rejection_reason: 'rejection_reason',
     };
 
     for (const [key, col] of Object.entries(map)) {

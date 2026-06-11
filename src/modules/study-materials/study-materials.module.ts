@@ -415,7 +415,7 @@ export class StudyMaterialsService {
   // ── GET: my uploads ───────────────────────────────────────
   async myUploads(userId: string) {
     const uploads = await this.db.query(
-      `SELECT id, title, subject, material_type, status, download_count, created_at, file_key
+      `SELECT id, title, subject, material_type, status, rejection_reason, download_count, created_at, file_key
        FROM study_materials WHERE uploader_id=$1 ORDER BY created_at DESC`,
       [userId]
     );
