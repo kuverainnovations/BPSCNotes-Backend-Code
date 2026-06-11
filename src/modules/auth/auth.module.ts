@@ -143,6 +143,9 @@ export class OtpService {
       return { success: true, otp };
     }
 
+    // TEMP: log OTP while DLT registration is pending — remove before launch
+    console.log(`📱 [TEMP] OTP for ${mobile}: ${otp}`);
+
     try {
       const msg91Response = await axios.default.post(
         'https://api.msg91.com/api/v5/otp',
