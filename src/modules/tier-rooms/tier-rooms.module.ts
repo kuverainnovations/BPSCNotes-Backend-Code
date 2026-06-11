@@ -400,8 +400,8 @@ export class TierRoomsService {
     if (!urt.next_tier_id) throw new BadRequestException('Already at highest tier');
 
     const progress = parseFloat(urt.next_tier_progress || '0');
-    if (progress < 100) {
-      throw new BadRequestException(`Not yet eligible. Progress: ${progress.toFixed(1)}%`);
+    if (progress < 1.0) {
+      throw new BadRequestException(`Not yet eligible. Progress: ${(progress * 100).toFixed(1)}%`);
     }
 
     await this.promoteUser(userId, urt.next_tier_id, urt.current_tier_id);
@@ -409,7 +409,7 @@ export class TierRoomsService {
       promotedTo: { key: urt.next_key, name: urt.next_name, emoji: urt.icon_emoji }
     }, `🎉 Promoted to ${urt.next_name}!`);
   }
- 
+
   async getAtRiskStatus(userId: string) {
     const rows = await this.db.query(`
       SELECT
