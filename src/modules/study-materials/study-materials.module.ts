@@ -22,6 +22,7 @@ import * as admin                 from 'firebase-admin';
 import { ensureFirebaseAdmin }    from '../../common/firebase/firebase-admin';
 import { Response }               from 'express';
 import { JwtAuthGuard, AdminJwtGuard, PermissionGuard, RequirePermission, Public } from '../../common/guards';
+import { ActivityLogService, ACTIONS } from '../../common/activity/activity-log.service';
 import { successResponse, paginationMeta } from '../../common/utils/response.util';
 import { AuthModule }             from '../auth/auth.module';
 import { CoinsModule, CoinsService } from '../coins/coins.module';

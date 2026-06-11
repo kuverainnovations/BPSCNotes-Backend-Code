@@ -32,6 +32,7 @@ import { Throttle } from '@nestjs/throttler';
 import { JwtAuthGuard, Public } from '../../common/guards';
 import { UseGuards, Request } from '@nestjs/common';
 import { successResponse } from '../../common/utils/response.util';
+import { ActivityLogService, ACTIONS } from '../../common/activity/activity-log.service';
 
 // ── DTOs ──────────────────────────────────────────────────────
 class SendOtpDto {
@@ -211,6 +212,7 @@ export class AuthService {
     private readonly config: ConfigService,
     private readonly otpService: OtpService,
     @Inject(CACHE_MANAGER) private readonly cache: Cache,
+    private readonly activityLog: ActivityLogService,
   ) {
   }
   private generateAdminToken(admin: any) {
@@ -261,6 +263,7 @@ export class AuthService {
       [tokens.refreshToken, user.id]
     );
     await this.awardCoins(user.id, 'daily_login');
+    await this.activityLog.log(user.id, ACTIONS.USER_LOGIN_OTP, 'Login via OTP', { mobile });
 
     return {
       isNewUser: false,
@@ -365,6 +368,8 @@ export class AuthService {
       );
     }
 
+    await this.activityLog.log(newUser.id, ACTIONS.USER_REGISTERED, `New user registered: ${dto.name}`, { mobile, referralCode: dto.referralCode || null });
+
     return {
       ...tokens,
       user: {
@@ -407,6 +412,7 @@ export class AuthService {
     // Invalidate user cache so next /auth/me returns updated data
     await this.cache.del(`user:${userId}`);
     await this.cache.del(`profile:${userId}`);
+    await this.activityLog.log(userId, ACTIONS.USER_PROFILE_UPDATED, 'Profile updated', dto);
 
     // Return fresh user data
     const user = await this.getMe(userId);
@@ -461,6 +467,7 @@ export class AuthService {
   async logout(userId: string) {
     await this.db.query(`UPDATE users SET refresh_token = NULL, fcm_token = NULL WHERE id = $1`, [userId]);
     await this.cache.del(`user:${userId}`);
+    await this.activityLog.log(userId, ACTIONS.USER_LOGOUT, 'User logged out');
   }
 
   async updateFcmToken(userId: string, fcmToken: string) {
@@ -864,6 +871,7 @@ export class AuthService {
       [tokens.refreshToken, user.id]
     );
     await this.awardCoins(user.id, 'daily_login');
+    await this.activityLog.log(user.id, ACTIONS.USER_LOGIN_MPIN, 'Login via MPIN', { mobile });
     await this.cache.del(`user:${user.id}`);
 
     return {
@@ -885,6 +893,7 @@ export class AuthService {
       [hash, userId]
     );
     await this.cache.del(`user:${userId}`);
+    await this.activityLog.log(userId, ACTIONS.USER_MPIN_CREATED, 'MPIN created');
     return { mpinCreated: true };
   }
 
@@ -1206,7 +1215,7 @@ export class AuthController {
     }),
   ],
   controllers: [AuthController],
-  providers:   [AuthService, OtpService, UserJwtStrategy, AdminJwtStrategy],
-  exports:     [AuthService, UserJwtStrategy, AdminJwtStrategy],
+  providers:   [AuthService, OtpService, UserJwtStrategy, AdminJwtStrategy, ActivityLogService],
+  exports:     [AuthService, UserJwtStrategy, AdminJwtStrategy, ActivityLogService],
 })
 export class AuthModule {}

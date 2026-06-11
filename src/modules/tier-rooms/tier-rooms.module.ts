@@ -20,6 +20,7 @@ import {
   JwtAuthGuard, AdminJwtGuard,
   PermissionGuard, RequirePermission, Public,
 } from '../../common/guards';
+import { ActivityLogService, ACTIONS } from '../../common/activity/activity-log.service';
 import { successResponse, paginationMeta } from '../../common/utils/response.util';
 import { TierNotificationsService } from './tier-notifications.service';
 import { TierRoomsGateway }       from './tier-rooms.gateway';
@@ -520,6 +521,7 @@ export class StudySessionsService {
   private readonly BASE_XP_PER_MINUTE  = 1;
   private readonly HEARTBEAT_INTERVAL_S = 300;
   private readonly AFK_THRESHOLD_S     = 420;
+  activityLog: any;
 
   constructor(
     @InjectDataSource() private readonly db: DataSource,
@@ -582,6 +584,7 @@ export class StudySessionsService {
       });
     }
 
+    await this.activityLog?.log(userId, ACTIONS.STUDY_SESSION_STARTED, 'Study session started', { sessionId: session[0].id, mode: sessionMode }).catch(()=>{});
     return successResponse({
       sessionId: session[0].id, startedAt: session[0].started_at,
       mode: session[0].mode, tierId: session[0].tier_id,
@@ -776,6 +779,7 @@ export class StudySessionsService {
       });
     }
 
+    await this.activityLog?.log(userId, ACTIONS.STUDY_SESSION_ENDED, `Study session ended - ${s.active_minutes} active mins`, { sessionId, activeMinutes: s.active_minutes, coins: s.coins_earned }).catch(()=>{});
     return successResponse({
       sessionId, durationMinutes: durationMins, activeMinutes: s.active_minutes,
       totalCoins: s.coins_earned + bonusCoins, totalXp: s.xp_earned, bonusCoins,

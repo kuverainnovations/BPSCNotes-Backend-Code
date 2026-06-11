@@ -17,6 +17,7 @@ import { ApiTags, ApiBearerAuth, ApiOperation } from '@nestjs/swagger';
 
 import { JwtAuthGuard, AdminJwtGuard, PermissionGuard, RequirePermission, Public } from '../../common/guards';
 import { PaginationDto } from '../../common/dtos/pagination.dto';
+import { ActivityLogService, ACTIONS } from '../../common/activity/activity-log.service';
 import { successResponse, paginationMeta } from '../../common/utils/response.util';
 import { AuthService } from '../auth/auth.module';
 

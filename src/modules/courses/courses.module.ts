@@ -24,6 +24,7 @@ import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 
 import { JwtAuthGuard, AdminJwtGuard, PermissionGuard, RequirePermission, Public } from '../../common/guards';
 import { PaginationDto } from '../../common/dtos/pagination.dto';
+import { ActivityLogService, ACTIONS } from '../../common/activity/activity-log.service';
 import { successResponse, paginationMeta } from '../../common/utils/response.util';
 import { AuthService } from '../auth/auth.module';
 import { AuthModule } from '../auth/auth.module';
@@ -347,6 +348,7 @@ export class CoursesService {
     @Inject(CACHE_MANAGER) private readonly cache: Cache,
     @InjectDataSource() private readonly db: DataSource,
     private readonly notifService: NotificationService,
+    private readonly activityLog?: ActivityLogService,
   ) {}
 
   async findAll(query: CourseQueryDto, userId?: string) {
