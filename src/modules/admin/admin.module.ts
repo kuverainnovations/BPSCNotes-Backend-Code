@@ -484,7 +484,10 @@ export class AdminAuthController {
 @UseGuards(AdminJwtGuard, PermissionGuard)
 @Controller('admin')
 export class AdminDashboardController {
-  constructor(private readonly service: AdminDashboardService) {}
+  constructor(
+    private readonly service: AdminDashboardService,
+    @InjectDataSource() private readonly db: DataSource,
+  ) {}
 
   @Get('stats')
   @RequirePermission('dashboard')
@@ -512,6 +515,62 @@ export class AdminDashboardController {
   async getExamDistribution() {
     const data = await this.service.getExamDistribution();
     return successResponse({ data });
+  }
+
+  /** GET /admin/activity?page=1&limit=50&action=quiz_started&search=name */
+  @Get('activity')
+  async getActivityLog(@Query() q: any) {
+    // Ensure table exists before querying
+    await this.db.query(`
+      CREATE TABLE IF NOT EXISTS user_activity_log (
+        id         UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id    UUID        REFERENCES users(id) ON DELETE SET NULL,
+        action     VARCHAR(60) NOT NULL,
+        description TEXT,
+        metadata   JSONB       DEFAULT '{}',
+        ip_address VARCHAR(45),
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `).catch(() => {});
+
+    const page   = Math.max(1, +(q.page  || 1));
+    const limit  = Math.min(100, +(q.limit || 50));
+    const offset = (page - 1) * limit;
+
+    const conditions: string[] = ['1=1'];
+    const params: any[] = [];
+    let pi = 1;
+
+    if (q.action) {
+      conditions.push(`l.action ILIKE $${pi++}`);
+      params.push(`%${q.action}%`);
+    }
+    if (q.search) {
+      conditions.push(`(u.name ILIKE $${pi} OR u.mobile ILIKE $${pi} OR l.description ILIKE $${pi})`);
+      params.push(`%${q.search}%`);
+      pi++;
+    }
+
+    const where = conditions.join(' AND ');
+
+    const [logs, cnt] = await Promise.all([
+      this.db.query(
+        `SELECT l.id, l.action, l.description, l.metadata, l.ip_address, l.created_at,
+                u.name AS user_name, u.mobile AS user_mobile
+         FROM user_activity_log l
+         LEFT JOIN users u ON u.id = l.user_id
+         WHERE ${where}
+         ORDER BY l.created_at DESC
+         LIMIT $${pi++} OFFSET $${pi++}`,
+        [...params, limit, offset]
+      ),
+      this.db.query(
+        `SELECT COUNT(*) FROM user_activity_log l LEFT JOIN users u ON u.id=l.user_id WHERE ${where}`,
+        params
+      ),
+    ]);
+
+    return successResponse({ logs, total: parseInt(cnt[0].count, 10) });
   }
 }
 
