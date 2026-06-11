@@ -531,6 +531,8 @@ if (query.search)  { conditions.push(`sm.title ILIKE $${pi++}`); params.push(`%$
   }
 
   async adminReject(id: string, reason?: string) {
+    // Ensure column exists (migration-safe)
+    await this.db.query(`ALTER TABLE study_materials ADD COLUMN IF NOT EXISTS rejection_reason TEXT`).catch(() => {});
     await this.db.query(
       `UPDATE study_materials SET status='rejected', rejection_reason=$2, updated_at=NOW() WHERE id=$1`,
       [id, reason || null]
