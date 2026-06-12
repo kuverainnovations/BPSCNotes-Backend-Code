@@ -37,6 +37,7 @@ import {
 import { TierRoomsModule }    from './modules/tier-rooms/tier-rooms.module';
 import { AchievementsModule } from './modules/achievements/achievements.module';
 import { StudyMaterialsModule } from '@modules/study-materials/study-materials.module';
+import { MaterialChatModule } from '@modules/study-materials/material-chat.module';
 import { MarketplaceModule }   from './modules/marketplace.module';
 
 @Module({
@@ -132,6 +133,7 @@ import { MarketplaceModule }   from './modules/marketplace.module';
     TierRoomsModule,
     AchievementsModule,
     StudyMaterialsModule,
+    MaterialChatModule,
     MarketplaceModule,
     CoinsModule
   ],
