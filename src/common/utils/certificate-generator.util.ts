@@ -8,7 +8,11 @@
 // ════════════════════════════════════════════════════════════
 import * as fs from 'fs';
 import { join } from 'path';
-import * as PDFDocument from 'pdfkit';
+// require() avoids a hard dependency on @types/pdfkit being installed —
+// pdfkit itself ships no types, so `import * as` fails type-checking
+// unless @types/pdfkit is present. require() + `as any` sidesteps this.
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const PDFDocument = require('pdfkit');
 
 export interface CertificateData {
   userName: string;
@@ -37,7 +41,7 @@ export async function generateCertificatePdf(
   const relativePath = `certificates/${fileName}`;
 
   // Landscape A4: 841.89 x 595.28 pt
-  const doc = new (PDFDocument as any)({
+  const doc = new PDFDocument({
     layout: 'landscape',
     size: 'A4',
     margins: { top: 0, bottom: 0, left: 0, right: 0 },

@@ -34,7 +34,7 @@ import { diskStorage } from 'multer';
 import { extname, join } from 'path';
 import * as fs from 'fs';
 import * as crypto from 'crypto';
-import { generateCertificatePdf } from '../../common/certificates/certificate-generator.util';
+import { generateCertificatePdf } from '../../common/utils/certificate-generator.util';
 
 // ── DTOs ──────────────────────────────────────────────────────
 class CourseQueryDto extends PaginationDto {
