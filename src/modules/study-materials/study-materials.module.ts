@@ -1428,6 +1428,78 @@ if (query.search)  { conditions.push(`sm.title ILIKE $${pi++}`); params.push(`%$
       meta: paginationMeta(parseInt(countRow.count, 10), page, limit),
     });
   }
+
+  // ── ADMIN: per-material revenue breakdown ─────────────────────
+  // For each material with at least one paid purchase, shows total
+  // collected, what the seller was paid, and the platform's net fee
+  // — i.e. "how much did the platform make from THIS material".
+  async adminListMaterialRevenue(query: any) {
+    const page   = Math.max(1, +(query.page  ?? 1));
+    const limit  = Math.min(100, +(query.limit ?? 20));
+    const offset = (page - 1) * limit;
+
+    const conditions: string[] = [`mp.price_paid > 0`];
+    const params: any[] = [];
+    let pi = 1;
+    if (query.search?.trim()) {
+      conditions.push(`(sm.title ILIKE $${pi} OR u.name ILIKE $${pi})`);
+      params.push(`%${query.search.trim()}%`); pi++;
+    }
+    const where = conditions.join(' AND ');
+
+    const sortMap: Record<string, string> = {
+      revenue:  'platform_revenue DESC',
+      sales:    'sale_count DESC',
+      newest:   'last_sale_at DESC',
+    };
+    const orderBy = sortMap[query.sort ?? 'revenue'] ?? sortMap.revenue;
+
+    const [rows, [cnt]] = await Promise.all([
+      this.db.query(
+        `SELECT sm.id AS material_id, sm.title, sm.price,
+                u.name AS uploader_name, u.mobile AS uploader_mobile,
+                COUNT(mp.id)::int                          AS sale_count,
+                COALESCE(SUM(mp.price_paid),0)::int        AS total_collected,
+                COALESCE(SUM(mp.price_paid - mp.platform_fee),0)::int AS seller_payout,
+                COALESCE(SUM(mp.platform_fee),0)::int      AS platform_revenue,
+                MAX(mp.created_at)                         AS last_sale_at
+         FROM material_purchases mp
+         JOIN study_materials sm ON sm.id = mp.material_id
+         LEFT JOIN users u ON u.id = sm.uploader_id
+         WHERE ${where}
+         GROUP BY sm.id, sm.title, sm.price, u.name, u.mobile
+         ORDER BY ${orderBy}
+         LIMIT $${pi++} OFFSET $${pi++}`,
+        [...params, limit, offset]
+      ),
+      this.db.query(
+        `SELECT COUNT(*) FROM (
+           SELECT sm.id FROM material_purchases mp
+           JOIN study_materials sm ON sm.id = mp.material_id
+           LEFT JOIN users u ON u.id = sm.uploader_id
+           WHERE ${where}
+           GROUP BY sm.id
+         ) sub`,
+        params
+      ),
+    ]);
+
+    // Grand totals across ALL materials (not just this page) for a summary header
+    const [grand] = await this.db.query(`
+      SELECT
+        COALESCE(SUM(price_paid),0)::int               AS total_collected,
+        COALESCE(SUM(price_paid - platform_fee),0)::int AS total_seller_payout,
+        COALESCE(SUM(platform_fee),0)::int             AS total_platform_revenue,
+        COUNT(*)::int                                  AS total_sales
+      FROM material_purchases WHERE price_paid > 0
+    `);
+
+    return successResponse({
+      materials: rows,
+      totals: grand,
+      meta: paginationMeta(parseInt(cnt.count, 10), page, limit),
+    });
+  }
 }
 
 // ════════════════════════════════════════════════════════════
@@ -1649,6 +1721,11 @@ export class AdminStudyMaterialsController {
   ) {
     return this.svc.adminGetWalletTransactions(userId, +page, +limit);
   }
+
+  // ── Per-material platform revenue breakdown ─────────────────
+  @Get('revenue')
+  @RequirePermission('study-materials')
+  adminListMaterialRevenue(@Query() q: any) { return this.svc.adminListMaterialRevenue(q); }
 
   @Get()
   @RequirePermission('study-materials')
