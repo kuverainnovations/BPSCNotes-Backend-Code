@@ -415,12 +415,47 @@ export class StudyMaterialsService {
   // ── GET: my uploads ───────────────────────────────────────
   async myUploads(userId: string) {
     const uploads = await this.db.query(
-      `SELECT id, title, subject, material_type, status, rejection_reason, download_count, created_at, file_key
+      `SELECT id, title, subject, material_type, status, rejection_reason, download_count, created_at, file_key,
+              price, negotiation_round, current_offer_price, proposed_by, negotiation_status
        FROM study_materials WHERE uploader_id=$1 ORDER BY created_at DESC`,
       [userId]
     );
     return successResponse({
       uploads: uploads.map((u: any) => ({ ...u, fileUrl: u.file_key ? this.fileUrl(u.file_key) : null }))
+    });
+  }
+
+  // ── GET: negotiation history for one material ─────────────
+  // Used by uploader to see the full back-and-forth before
+  // deciding to accept or counter.
+  async getNegotiationHistory(materialId: string, userId: string) {
+    const [mat] = await this.db.query(
+      `SELECT id, uploader_id, status, price, negotiation_round, current_offer_price,
+              proposed_by, negotiation_status, title
+       FROM study_materials WHERE id=$1`,
+      [materialId]
+    );
+    if (!mat) throw new NotFoundException('Material not found');
+    if (mat.uploader_id !== userId) throw new BadRequestException('Not your material');
+
+    const history = await this.db.query(
+      `SELECT round, offered_by, offer_price, message, action, created_at
+       FROM material_negotiations WHERE material_id=$1 ORDER BY round ASC, created_at ASC`,
+      [materialId]
+    );
+
+    return successResponse({
+      materialId:        mat.id,
+      title:             mat.title,
+      status:            mat.status,
+      originalPrice:     mat.price,
+      negotiationRound:  mat.negotiation_round,
+      currentOfferPrice: mat.current_offer_price,
+      proposedBy:        mat.proposed_by,
+      negotiationStatus: mat.negotiation_status,
+      canRespond:        mat.negotiation_status === 'awaiting_user',
+      isFinalRound:      mat.negotiation_round >= 3,
+      history,
     });
   }
 
@@ -571,6 +606,232 @@ if (query.search)  { conditions.push(`sm.title ILIKE $${pi++}`); params.push(`%$
     }
 
     return successResponse(null, `Rejected${reason ? ': ' + reason : ''}`);
+  }
+
+  // ── Shared: push notification to a material's uploader ─────
+  private async pushToUploader(materialId: string, title: string, body: string, data: Record<string, string>) {
+    try {
+      const rows = await this.db.query(
+        `SELECT sm.title AS material_title, u.fcm_token
+         FROM study_materials sm JOIN users u ON u.id = sm.uploader_id
+         WHERE sm.id = $1`, [materialId]
+      );
+      const mat = rows[0];
+      if (mat?.fcm_token) {
+        ensureFirebaseAdmin();
+        await admin.messaging().send({
+          token: mat.fcm_token,
+          notification: { title, body },
+          data: { materialId, screen: 'study_materials', ...data },
+          android: { priority: 'high' },
+        });
+      } else {
+        this.logger.warn(`pushToUploader: no fcm_token for material ${materialId}`);
+      }
+    } catch (err: any) {
+      this.logger.error(`pushToUploader failed: ${err.message}`);
+    }
+  }
+
+  // ── Shared: load negotiation-relevant row, with guards ──────
+  private async loadMaterialForNegotiation(id: string) {
+    const [mat] = await this.db.query(
+      `SELECT id, title, status, price, uploader_id, negotiation_round,
+              current_offer_price, proposed_by, negotiation_status
+       FROM study_materials WHERE id=$1`,
+      [id]
+    );
+    if (!mat) throw new NotFoundException('Material not found');
+    return mat;
+  }
+
+  // ── ADMIN: counter-offer instead of outright reject ─────────
+  // Moves status -> 'negotiating', records round 1 (or increments
+  // an existing round), and notifies the uploader.
+  // Blocked once 3 rounds are already complete — admin must use
+  // adminFinalDecision() instead.
+  async adminCounterOffer(id: string, counterPrice: number, message?: string) {
+    const mat = await this.loadMaterialForNegotiation(id);
+
+    if (mat.status === 'approved') {
+      throw new BadRequestException('Material is already approved');
+    }
+    if (mat.negotiation_round >= 3) {
+      throw new BadRequestException(
+        'Maximum negotiation rounds (3) reached — use the final decision (approve/reject) instead'
+      );
+    }
+    if (counterPrice < 0) throw new BadRequestException('Price cannot be negative');
+
+    const newRound = mat.negotiation_round + 1;
+
+    await this.db.query(
+      `UPDATE study_materials
+       SET status='negotiating', negotiation_round=$2, current_offer_price=$3,
+           proposed_by='admin', negotiation_status='awaiting_user', updated_at=NOW()
+       WHERE id=$1`,
+      [id, newRound, counterPrice]
+    );
+    await this.db.query(
+      `INSERT INTO material_negotiations (material_id, round, offered_by, offer_price, message, action)
+       VALUES ($1,$2,'admin',$3,$4,'counter')`,
+      [id, newRound, counterPrice, message || null]
+    );
+
+    await this.pushToUploader(
+      id,
+      '💬 Price negotiation on your upload',
+      message
+        ? `For "${mat.title}", we suggest ₹${counterPrice}: ${message}`
+        : `For "${mat.title}", we suggest a price of ₹${counterPrice}. Tap to respond.`,
+      { type: 'price_negotiation', round: String(newRound) }
+    );
+
+    return successResponse(
+      { negotiationRound: newRound, currentOfferPrice: counterPrice },
+      `Counter-offer of ₹${counterPrice} sent (round ${newRound}/3)`
+    );
+  }
+
+  // ── USER: respond to admin's counter-offer ──────────────────
+  // action='accept'  -> material is approved at current_offer_price
+  // action='counter' -> user proposes their own price (increments round)
+  async respondToNegotiation(
+    materialId: string,
+    userId: string,
+    action: 'accept' | 'counter',
+    counterPrice?: number,
+    message?: string,
+  ) {
+    const mat = await this.loadMaterialForNegotiation(materialId);
+    if (mat.uploader_id !== userId) throw new BadRequestException('Not your material');
+    if (mat.negotiation_status !== 'awaiting_user') {
+      throw new BadRequestException('No pending offer to respond to');
+    }
+
+    if (action === 'accept') {
+      const finalPrice = mat.current_offer_price ?? mat.price;
+      await this.db.query(
+        `UPDATE study_materials
+         SET status='approved', price=$2, negotiation_status='resolved',
+             approved_at=NOW(), updated_at=NOW()
+         WHERE id=$1`,
+        [materialId, finalPrice]
+      );
+      await this.db.query(
+        `INSERT INTO material_negotiations (material_id, round, offered_by, offer_price, message, action)
+         VALUES ($1,$2,'user',$3,$4,'accept')`,
+        [materialId, mat.negotiation_round, finalPrice, message || null]
+      );
+
+      // Coin reward + referral milestone, same as a normal approval
+      try {
+        await this.coinsService.claimTask('upload_note', userId);
+        this.awardReferralMilestoneInline(userId, 'engagement').catch(() => {});
+      } catch (_) { /* non-blocking */ }
+
+      return successResponse(
+        { status: 'approved', finalPrice },
+        `✅ Accepted ₹${finalPrice} — your material is now live!`
+      );
+    }
+
+    // action === 'counter'
+    if (counterPrice == null || counterPrice < 0) {
+      throw new BadRequestException('A valid counter price is required');
+    }
+    if (mat.negotiation_round >= 3) {
+      // Round 3 was the admin's offer; user cannot start a 4th round —
+      // admin must make the final call.
+      throw new BadRequestException(
+        'Maximum negotiation rounds reached — please wait for the final decision from our team'
+      );
+    }
+
+    const newRound = mat.negotiation_round + 1;
+    const isFinalRound = newRound >= 3;
+
+    await this.db.query(
+      `UPDATE study_materials
+       SET negotiation_round=$2, current_offer_price=$3,
+           proposed_by='user', negotiation_status='awaiting_admin', updated_at=NOW()
+       WHERE id=$1`,
+      [materialId, newRound, counterPrice]
+    );
+    await this.db.query(
+      `INSERT INTO material_negotiations (material_id, round, offered_by, offer_price, message, action)
+       VALUES ($1,$2,'user',$3,$4,'counter')`,
+      [materialId, newRound, counterPrice, message || null]
+    );
+
+    return successResponse(
+      { negotiationRound: newRound, currentOfferPrice: counterPrice, isFinalRound },
+      isFinalRound
+        ? `Counter sent (round ${newRound}/3 — final round). Our team will make a final decision.`
+        : `Counter-offer of ₹${counterPrice} sent (round ${newRound}/3)`
+    );
+  }
+
+  // ── ADMIN: final decision after round 3 is exhausted ────────
+  // action='approve' -> publish at the given price (defaults to the
+  //                      most recent offer on the table)
+  // action='reject'  -> permanent rejection with reason
+  async adminFinalDecision(id: string, action: 'approve' | 'reject', price?: number, reason?: string) {
+    const mat = await this.loadMaterialForNegotiation(id);
+
+    if (action === 'approve') {
+      const finalPrice = price ?? mat.current_offer_price ?? mat.price;
+      await this.db.query(
+        `UPDATE study_materials
+         SET status='approved', price=$2, negotiation_status='resolved',
+             approved_at=NOW(), updated_at=NOW()
+         WHERE id=$1`,
+        [id, finalPrice]
+      );
+      await this.db.query(
+        `INSERT INTO material_negotiations (material_id, round, offered_by, offer_price, message, action)
+         VALUES ($1,$2,'admin',$3,$4,'final_approve')`,
+        [id, mat.negotiation_round, finalPrice, reason || null]
+      );
+
+      try {
+        await this.coinsService.claimTask('upload_note', mat.uploader_id);
+        this.awardReferralMilestoneInline(mat.uploader_id, 'engagement').catch(() => {});
+      } catch (_) { /* non-blocking */ }
+
+      await this.pushToUploader(
+        id,
+        '✅ Study material approved!',
+        `Your upload "${mat.title}" is now live at ₹${finalPrice}.`,
+        { type: 'material_approved' }
+      );
+
+      return successResponse({ status: 'approved', finalPrice }, `Approved at ₹${finalPrice}`);
+    }
+
+    // action === 'reject'
+    await this.db.query(
+      `UPDATE study_materials
+       SET status='rejected', rejection_reason=$2, negotiation_status='resolved', updated_at=NOW()
+       WHERE id=$1`,
+      [id, reason || 'Not approved after negotiation']
+    );
+    await this.db.query(
+      `INSERT INTO material_negotiations (material_id, round, offered_by, offer_price, message, action)
+       VALUES ($1,$2,'admin',$3,$4,'final_reject')`,
+      [id, mat.negotiation_round, mat.current_offer_price ?? mat.price, reason || null]
+    );
+
+    await this.pushToUploader(
+      id,
+      '❌ Upload Not Approved',
+      reason
+        ? `Your upload "${mat.title}" was not approved: ${reason}`
+        : `Your upload "${mat.title}" was not approved after negotiation.`,
+      { type: 'upload_rejected' }
+    );
+
+    return successResponse({ status: 'rejected' }, `Rejected${reason ? ': ' + reason : ''}`);
   }
 
   async adminToggleFeature(id: string) {
@@ -827,6 +1088,26 @@ export class StudyMaterialsController {
   @Get('my-uploads')
   myUploads(@Req() r: any) { return this.svc.myUploads(r.user.id); }
 
+  // ── NEGOTIATION: get full offer history for a material ─────
+  @Get('my-uploads/:id/negotiation')
+  getNegotiationHistory(@Param('id', ParseUUIDPipe) id: string, @Req() r: any) {
+    return this.svc.getNegotiationHistory(id, r.user.id);
+  }
+
+  // ── NEGOTIATION: accept the admin's counter-offer ───────────
+  @Post('my-uploads/:id/negotiation/accept')
+  @HttpCode(HttpStatus.OK)
+  acceptNegotiation(@Param('id', ParseUUIDPipe) id: string, @Req() r: any) {
+    return this.svc.respondToNegotiation(id, r.user.id, 'accept');
+  }
+
+  // ── NEGOTIATION: send a counter-offer back to admin ─────────
+  @Post('my-uploads/:id/negotiation/counter')
+  @HttpCode(HttpStatus.OK)
+  counterNegotiation(@Param('id', ParseUUIDPipe) id: string, @Body() b: any, @Req() r: any) {
+    return this.svc.respondToNegotiation(id, r.user.id, 'counter', +b.price, b.message);
+  }
+
   // ── LEGACY: get pre-signed-style upload URL (token-based) ──
   @Get('upload-url')
   getUploadUrl(
@@ -976,6 +1257,24 @@ export class AdminStudyMaterialsController {
   @HttpCode(HttpStatus.OK)
   reject(@Param('id', ParseUUIDPipe) id: string, @Body() b: any) { return this.svc.adminReject(id, b.reason); }
 
+  // ── NEGOTIATION: counter-offer instead of outright reject ───
+  // Body: { price: number, message?: string }
+  @Patch(':id/counter-offer')
+  @RequirePermission('study-materials')
+  @HttpCode(HttpStatus.OK)
+  counterOffer(@Param('id', ParseUUIDPipe) id: string, @Body() b: any) {
+    return this.svc.adminCounterOffer(id, +b.price, b.message);
+  }
+
+  // ── NEGOTIATION: final call after round 3 ───────────────────
+  // Body: { action: 'approve'|'reject', price?: number, reason?: string }
+  @Patch(':id/final-decision')
+  @RequirePermission('study-materials')
+  @HttpCode(HttpStatus.OK)
+  finalDecision(@Param('id', ParseUUIDPipe) id: string, @Body() b: any) {
+    return this.svc.adminFinalDecision(id, b.action, b.price != null ? +b.price : undefined, b.reason);
+  }
+
   @Patch(':id/feature')
   @RequirePermission('study-materials')
   @HttpCode(HttpStatus.OK)
@@ -1000,4 +1299,4 @@ export class AdminStudyMaterialsController {
   providers:   [StudyMaterialsService],
   exports:     [StudyMaterialsService],
 })
-export class StudyMaterialsModule {}
+export class StudyMaterialsModule {}/Users/apple/Downloads/1780200000000-MarketplaceNegotiation.ts
