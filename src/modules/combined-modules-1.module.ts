@@ -853,10 +853,12 @@ export class NotificationService {
 
     let userQuery = `SELECT id, fcm_token FROM users WHERE status='active' AND notification_enabled=TRUE AND deleted_at IS NULL`;
     const params: any[] = [];
-    if (data.target === 'pro') {
+    if (data.target === 'pro' || data.target === 'premium') {
       userQuery += ` AND id IN (SELECT user_id FROM subscriptions WHERE status='active' AND ends_at>NOW())`;
     } else if (data.target === 'free') {
       userQuery += ` AND id NOT IN (SELECT user_id FROM subscriptions WHERE status='active' AND ends_at>NOW())`;
+    } else if (data.target === 'inactive') {
+      userQuery += ` AND (last_active_at IS NULL OR last_active_at < NOW() - INTERVAL '7 days')`;
     } else if (data.target === 'exam' && data.targetExam) {
       userQuery += ` AND primary_exam=$1`;
       params.push(data.targetExam);
@@ -955,6 +957,14 @@ console.log('sample token:', tokens[0]);
       paginationMeta(0, page, limit));
   }
 
+  async getUnreadCount(userId: string) {
+    const rows = await this.db.query(
+      `SELECT COUNT(*) FROM user_notifications WHERE user_id=$1 AND is_read=FALSE`,
+      [userId]
+    );
+    return successResponse({ count: parseInt(rows[0].count) });
+  }
+
   // ── Direct push helpers (called by other modules) ──────────
   async pushToUser(userId: string, title: string, body: string, data: Record<string, string> = {}) {
     const rows = await this.db.query(
@@ -1049,6 +1059,8 @@ console.log('sample token:', tokens[0]);
 class NotificationsController {
   constructor(private s: NotificationService) {}
   @Get() getUserNotifs(@Query() q: any, @Req() r: any) { return this.s.getUserNotifications(r.user.id, q); }
+  /** GET /notifications/unread-count — fast single COUNT query, no list fetch */
+  @Get('unread-count') getUnreadCount(@Req() r: any) { return this.s.getUnreadCount(r.user.id); }
   @Post('mark-read') @HttpCode(200) markRead(@Req() r: any, @Body() body: any) { return this.s.markRead(r.user.id, body.ids); }
 }
 
