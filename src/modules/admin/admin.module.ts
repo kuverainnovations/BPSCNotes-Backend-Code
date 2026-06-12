@@ -519,6 +519,7 @@ export class AdminDashboardController {
 
   /** GET /admin/activity?page=1&limit=50&action=quiz_started&search=name */
   @Get('activity')
+  @RequirePermission('dashboard')
   async getActivityLog(@Query() q: any) {
     // Ensure table exists before querying
     await this.db.query(`
@@ -875,6 +876,77 @@ class AdminPaymentSettingsController {
   refund(@Param('id', ParseUUIDPipe) id: string) { return this.s.refundSubscription(id); }
 }
 
+// ── Exam & Job Categories Controller ────────────────────────
+@UseGuards(AdminJwtGuard)
+@Controller('admin')
+class CategoriesController {
+  constructor(@InjectDataSource() private readonly db: DataSource) {}
+
+  private async ensureTable(table: string) {
+    await this.db.query(`CREATE TABLE IF NOT EXISTS ${table} (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      name VARCHAR(100) NOT NULL UNIQUE,
+      created_at TIMESTAMPTZ DEFAULT NOW()
+    )`).catch(() => {});
+  }
+
+  @Get('exam-categories')
+  @RequirePermission('settings')
+  async getExamCategories() {
+    await this.ensureTable('exam_categories');
+    const rows = await this.db.query(`SELECT * FROM exam_categories ORDER BY name ASC`);
+    return successResponse({ categories: rows });
+  }
+
+  @Post('exam-categories')
+  @HttpCode(HttpStatus.CREATED)
+  @RequirePermission('settings')
+  async createExamCategory(@Body() dto: any) {
+    await this.ensureTable('exam_categories');
+    const [row] = await this.db.query(
+      `INSERT INTO exam_categories (name) VALUES ($1) ON CONFLICT (name) DO UPDATE SET name=$1 RETURNING *`,
+      [dto.name]
+    );
+    return successResponse(row, 'Category added');
+  }
+
+  @Delete('exam-categories/:id')
+  @HttpCode(HttpStatus.OK)
+  @RequirePermission('settings')
+  async deleteExamCategory(@Param('id') id: string) {
+    await this.db.query(`DELETE FROM exam_categories WHERE id=$1`, [id]);
+    return successResponse(null, 'Deleted');
+  }
+
+  @Get('job-categories')
+  @RequirePermission('settings')
+  async getJobCategories() {
+    await this.ensureTable('job_categories');
+    const rows = await this.db.query(`SELECT * FROM job_categories ORDER BY name ASC`);
+    return successResponse({ categories: rows });
+  }
+
+  @Post('job-categories')
+  @HttpCode(HttpStatus.CREATED)
+  @RequirePermission('settings')
+  async createJobCategory(@Body() dto: any) {
+    await this.ensureTable('job_categories');
+    const [row] = await this.db.query(
+      `INSERT INTO job_categories (name) VALUES ($1) ON CONFLICT (name) DO UPDATE SET name=$1 RETURNING *`,
+      [dto.name]
+    );
+    return successResponse(row, 'Category added');
+  }
+
+  @Delete('job-categories/:id')
+  @HttpCode(HttpStatus.OK)
+  @RequirePermission('settings')
+  async deleteJobCategory(@Param('id') id: string) {
+    await this.db.query(`DELETE FROM job_categories WHERE id=$1`, [id]);
+    return successResponse(null, 'Deleted');
+  }
+}
+
 @Module({
   imports: [
     ConfigModule,
@@ -893,6 +965,7 @@ class AdminPaymentSettingsController {
     AdminSettingsController,
     AdminUsersController,
     AppConfigController,
+    CategoriesController,
   ],
   providers: [
     AdminAuthService,
