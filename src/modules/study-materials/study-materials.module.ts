@@ -1271,6 +1271,102 @@ if (query.search)  { conditions.push(`sm.title ILIKE $${pi++}`); params.push(`%$
     `);
     return successResponse(stats);
   }
+
+  // ── ADMIN: list all seller wallets (balances + totals) ───────
+  // Supports search by name/mobile and sorting by balance/earned.
+  async adminListWallets(query: any) {
+    const page   = Math.max(1, +(query.page  ?? 1));
+    const limit  = Math.min(100, +(query.limit ?? 20));
+    const offset = (page - 1) * limit;
+
+    const conditions: string[] = ['1=1'];
+    const params: any[] = [];
+    let pi = 1;
+    if (query.search?.trim()) {
+      conditions.push(`(u.name ILIKE $${pi} OR u.mobile ILIKE $${pi})`);
+      params.push(`%${query.search.trim()}%`); pi++;
+    }
+    const where = conditions.join(' AND ');
+
+    const sortMap: Record<string, string> = {
+      balance:     'sw.balance DESC',
+      total_earned: 'sw.total_earned DESC',
+      name:        'u.name ASC',
+    };
+    const orderBy = sortMap[query.sort ?? 'balance'] ?? sortMap.balance;
+
+    const [rows, [cnt]] = await Promise.all([
+      this.db.query(
+        `SELECT sw.user_id, u.name AS uploader_name, u.mobile, u.email,
+                sw.balance, sw.total_earned, sw.updated_at,
+                (SELECT COUNT(*) FROM wallet_transactions wt WHERE wt.user_id = sw.user_id) AS transaction_count,
+                (SELECT COUNT(*) FROM wallet_transactions wt WHERE wt.user_id = sw.user_id AND wt.status='pending') AS pending_count
+         FROM seller_wallets sw
+         JOIN users u ON u.id = sw.user_id
+         WHERE ${where}
+         ORDER BY ${orderBy}
+         LIMIT $${pi++} OFFSET $${pi++}`,
+        [...params, limit, offset]
+      ),
+      this.db.query(
+        `SELECT COUNT(*) FROM seller_wallets sw JOIN users u ON u.id = sw.user_id WHERE ${where}`,
+        params
+      ),
+    ]);
+
+    // Platform-wide totals — useful for an admin dashboard summary
+    const [totals] = await this.db.query(`
+      SELECT
+        COALESCE(SUM(balance),0)::int      AS total_balance,
+        COALESCE(SUM(total_earned),0)::int AS total_disbursed,
+        COUNT(*)::int                      AS seller_count
+      FROM seller_wallets
+    `);
+
+    return successResponse({
+      wallets: rows.map((r: any) => ({
+        ...r,
+        transaction_count: parseInt(r.transaction_count, 10),
+        pending_count: parseInt(r.pending_count, 10),
+      })),
+      totals,
+      meta: paginationMeta(parseInt(cnt.count, 10), page, limit),
+    });
+  }
+
+  // ── ADMIN: full transaction history for one seller ───────────
+  async adminGetWalletTransactions(userId: string, page = 1, limit = 30) {
+    const offset = (page - 1) * limit;
+
+    const [wallet] = await this.db.query(
+      `SELECT sw.balance, sw.total_earned, u.name AS uploader_name, u.mobile
+       FROM seller_wallets sw JOIN users u ON u.id = sw.user_id
+       WHERE sw.user_id=$1`,
+      [userId]
+    );
+    if (!wallet) throw new NotFoundException('Seller has no wallet yet');
+
+    const [transactions, [countRow]] = await Promise.all([
+      this.db.query(
+        `SELECT wt.id, wt.type, wt.amount, wt.status, wt.description, wt.balance_after,
+                wt.created_at, wt.disbursed_at, sm.title AS material_title, sm.id AS material_id
+         FROM wallet_transactions wt
+         LEFT JOIN study_materials sm ON sm.id = wt.material_id
+         WHERE wt.user_id=$1 ORDER BY wt.created_at DESC LIMIT $2 OFFSET $3`,
+        [userId, limit, offset]
+      ),
+      this.db.query(`SELECT COUNT(*) FROM wallet_transactions WHERE user_id=$1`, [userId]),
+    ]);
+
+    return successResponse({
+      uploaderName: wallet.uploader_name,
+      mobile: wallet.mobile,
+      balance: wallet.balance,
+      totalEarned: wallet.total_earned,
+      transactions,
+      meta: paginationMeta(parseInt(countRow.count, 10), page, limit),
+    });
+  }
 }
 
 // ════════════════════════════════════════════════════════════
@@ -1469,6 +1565,23 @@ export class AdminStudyMaterialsController {
   @Get('stats')
   @RequirePermission('study-materials')
   adminStats() { return this.svc.adminStats(); }
+
+  // ── Seller wallets (Phase 3) ────────────────────────────────
+  // Must be declared before any :id routes to avoid 'wallets'
+  // being swallowed by a ':id' parameter match.
+  @Get('wallets')
+  @RequirePermission('study-materials')
+  adminListWallets(@Query() q: any) { return this.svc.adminListWallets(q); }
+
+  @Get('wallets/:userId/transactions')
+  @RequirePermission('study-materials')
+  adminGetWalletTransactions(
+    @Param('userId', ParseUUIDPipe) userId: string,
+    @Query('page') page = 1,
+    @Query('limit') limit = 30,
+  ) {
+    return this.svc.adminGetWalletTransactions(userId, +page, +limit);
+  }
 
   @Get()
   @RequirePermission('study-materials')
