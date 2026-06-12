@@ -566,6 +566,40 @@ export class CoinsController {
 export class AdminCoinsService {
   constructor(@InjectDataSource() private readonly db: DataSource) {}
 
+  /** GET /admin/coins/ad-config — read admin-configured ad reward settings */
+  async getAdConfig() {
+    const rows = await this.db.query(`
+      SELECT key, value FROM app_settings
+      WHERE key IN ('ad_reward_coins', 'ad_min_per_session')
+    `).catch(() => []);
+    const map: Record<string, string> = {};
+    for (const r of rows) map[r.key] = r.value;
+    return successResponse({
+      coinsPerAd:       parseInt(map['ad_reward_coins']    || '10', 10),
+      minAdsPerSession: parseInt(map['ad_min_per_session'] || '2',  10),
+    });
+  }
+
+  /** PUT /admin/coins/ad-config — update ad reward settings */
+  async updateAdConfig(dto: { coinsPerAd?: number; minAdsPerSession?: number }) {
+    await this.db.query(`
+      CREATE TABLE IF NOT EXISTS app_settings (
+        key VARCHAR(100) PRIMARY KEY,
+        value TEXT,
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `).catch(() => {});
+    const upsert = async (key: string, value: string) => {
+      await this.db.query(`
+        INSERT INTO app_settings (key, value, updated_at) VALUES ($1, $2, NOW())
+        ON CONFLICT (key) DO UPDATE SET value=$2, updated_at=NOW()
+      `, [key, value]);
+    };
+    if (dto.coinsPerAd !== undefined)       await upsert('ad_reward_coins', String(dto.coinsPerAd));
+    if (dto.minAdsPerSession !== undefined) await upsert('ad_min_per_session', String(dto.minAdsPerSession));
+    return this.getAdConfig();
+  }
+
   async getStats() {
     const [row] = await this.db.query(`
       SELECT
@@ -667,6 +701,12 @@ export class AdminCoinsController {
 
   @Get('rules')
   getRules() { return this.svc.getRules(); }
+
+  @Get('ad-config')
+  getAdConfig() { return this.svc.getAdConfig(); }
+
+  @Put('ad-config')
+  updateAdConfig(@Body() dto: any) { return this.svc.updateAdConfig(dto); }
 
   @Post('rules')
   @HttpCode(HttpStatus.CREATED)
