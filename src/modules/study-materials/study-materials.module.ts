@@ -162,6 +162,9 @@ export class StudyMaterialsService {
       ? `EXISTS (SELECT 1 FROM material_purchases mp WHERE mp.material_id=sm.id AND mp.user_id='${query.userId}') AS is_purchased,`
       : `FALSE AS is_purchased,`;
 
+    // Buyer count — social proof badge ("12 students bought this")
+    const buyerCountSubq = `(SELECT COUNT(*) FROM material_purchases mp WHERE mp.material_id=sm.id AND mp.price_paid > 0) AS buyer_count,`;
+
     const where   = conditions.join(' AND ');
     const [rows, [countRow]] = await Promise.all([
       this.db.query(
@@ -175,6 +178,7 @@ export class StudyMaterialsService {
                 COALESCE(sm.is_premium, false) AS is_premium,
                 ${bookmarkSubq}
                 ${purchaseSubq}
+                ${buyerCountSubq}
                 sm.status
          FROM study_materials sm WHERE ${where}
          ORDER BY ${orderBy} LIMIT $${pi++} OFFSET $${pi++}`,
@@ -193,6 +197,7 @@ export class StudyMaterialsService {
       price:      parseInt(m.price ?? '0', 10),
       free_pages: parseInt(m.free_pages ?? '3', 10),   // snake_case — matches Android @SerializedName("free_pages")
       is_premium: m.is_premium ?? false,               // snake_case — matches Android @SerializedName("is_premium")
+      buyer_count: parseInt(m.buyer_count ?? '0', 10),
     }));
 
     const total = parseInt(countRow.count ?? '0', 10);
@@ -236,7 +241,8 @@ export class StudyMaterialsService {
     const [row] = await this.db.query(`
       SELECT sm.*,
              u.name AS uploader_name,
-             (SELECT TRUE FROM material_bookmarks mb WHERE mb.material_id=sm.id AND mb.user_id=$2) AS is_bookmarked
+             (SELECT TRUE FROM material_bookmarks mb WHERE mb.material_id=sm.id AND mb.user_id=$2) AS is_bookmarked,
+             (SELECT COUNT(*) FROM material_purchases mp WHERE mp.material_id=sm.id AND mp.price_paid > 0) AS buyer_count
       FROM study_materials sm
       LEFT JOIN users u ON u.id = sm.uploader_id
       WHERE sm.id = $1 AND sm.status = 'approved'
@@ -246,6 +252,40 @@ export class StudyMaterialsService {
       ...row,
       fileUrl:      row.file_key      ? this.fileUrl(row.file_key)      : null,
       thumbnailUrl: row.thumbnail_key ? this.fileUrl(row.thumbnail_key) : null,
+      buyer_count:  parseInt(row.buyer_count ?? '0', 10),
+    });
+  }
+
+  // ── GET: anonymized buyer list for social proof ────────────
+  // Returns up to `limit` buyer display names (first name + last
+  // initial, e.g. "Rahul K.") plus the total buyer count, so the
+  // detail screen can show "Rahul K. and 11 others bought this".
+  async getBuyers(materialId: string, limit = 5) {
+    const rows = await this.db.query(
+      `SELECT u.name
+       FROM material_purchases mp
+       JOIN users u ON u.id = mp.user_id
+       WHERE mp.material_id=$1 AND mp.price_paid > 0
+       ORDER BY mp.created_at DESC
+       LIMIT $2`,
+      [materialId, limit]
+    );
+    const [countRow] = await this.db.query(
+      `SELECT COUNT(*) FROM material_purchases WHERE material_id=$1 AND price_paid > 0`,
+      [materialId]
+    );
+
+    // Anonymize: "Rahul Kumar" -> "Rahul K." ; single-word names kept as-is
+    const anonymize = (fullName: string): string => {
+      const parts = (fullName || '').trim().split(/\s+/).filter(Boolean);
+      if (parts.length === 0) return 'A student';
+      if (parts.length === 1) return parts[0];
+      return `${parts[0]} ${parts[1][0].toUpperCase()}.`;
+    };
+
+    return successResponse({
+      buyers: rows.map((r: any) => anonymize(r.name)),
+      totalBuyers: parseInt(countRow.count ?? '0', 10),
     });
   }
 
@@ -1530,6 +1570,12 @@ export class StudyMaterialsController {
   @Get(':id/preview')
   getPreview(@Param('id', ParseUUIDPipe) id: string, @Req() r: any) {
     return this.svc.getPreview(id, r.user.id);
+  }
+
+  // ── Social proof: anonymized buyer list for "Rahul K. and 11 others" ──
+  @Get(':id/buyers')
+  getBuyers(@Param('id', ParseUUIDPipe) id: string, @Query('limit') limit = 5) {
+    return this.svc.getBuyers(id, +limit);
   }
 
   @Get(':id')
