@@ -34,6 +34,7 @@ import { diskStorage } from 'multer';
 import { extname, join } from 'path';
 import * as fs from 'fs';
 import * as crypto from 'crypto';
+import { generateCertificatePdf } from '../../common/certificates/certificate-generator.util';
 
 // ── DTOs ──────────────────────────────────────────────────────
 class CourseQueryDto extends PaginationDto {
@@ -604,11 +605,43 @@ export class CoursesService {
       [completedLessons, lessonId, totalLessons, userId, courseId]
     );
 
-    if (isCompleted) {
-      await this.db.query(
-        `INSERT INTO certificates (user_id, course_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`,
+    if (isCompleted && totalLessons > 0) {
+      const [certRow] = await this.db.query(
+        `INSERT INTO certificates (user_id, course_id) VALUES ($1,$2)
+         ON CONFLICT (user_id, course_id) DO UPDATE SET user_id=EXCLUDED.user_id
+         RETURNING id, certificate_url`,
         [userId, courseId]
       );
+
+      // Generate the PDF only if it doesn't exist yet (idempotent —
+      // re-completing/re-syncing won't regenerate it every time)
+      if (certRow && !certRow.certificate_url) {
+        try {
+          const [userRow] = await this.db.query(`SELECT name FROM users WHERE id=$1`, [userId]);
+          const [courseRow] = await this.db.query(`SELECT title, instructor FROM courses WHERE id=$1`, [courseId]);
+
+          const uploadDir = process.env.UPLOAD_DIR ?? join(process.cwd(), 'uploads');
+          const relativePath = await generateCertificatePdf(uploadDir, {
+            userName: userRow?.name || 'Student',
+            courseTitle: courseRow?.title || 'BPSCNotes Course',
+            instructor: courseRow?.instructor,
+            completedAt: new Date(),
+            certificateId: certRow.id,
+          });
+
+          const baseUrl = this.config.get<string>('BASE_URL') ?? 'https://api.bpscnotes.in';
+          const certificateUrl = `${baseUrl}/uploads/${relativePath}`;
+
+          await this.db.query(
+            `UPDATE certificates SET certificate_url=$1 WHERE id=$2`,
+            [certificateUrl, certRow.id]
+          );
+        } catch (err) {
+          // Don't fail lesson completion if certificate generation fails —
+          // log and let the lazy-generation fallback in getCertificates() retry later
+          console.error('Certificate generation failed:', err);
+        }
+      }
     }
 
     return successResponse({ completedLessons, totalLessons, isCompleted });

@@ -25,6 +25,8 @@ import { FileInterceptor } from '@nestjs/platform-express';
 import { diskStorage }     from 'multer';
 import { extname, join }   from 'path';
 import * as fs             from 'fs';
+import { join }            from 'path';
+import { generateCertificatePdf } from '../common/certificates/certificate-generator.util';
 import * as crypto         from 'crypto';
 import { PaginationDto } from '../common/dtos/pagination.dto';
 import { successResponse, paginationMeta } from '../common/utils/response.util';
@@ -663,6 +665,7 @@ class UsersService {
   constructor(
     @InjectDataSource() private readonly db: DataSource,
     @Inject(CACHE_MANAGER) private readonly cache: Cache,
+    private readonly config: ConfigService,
   ) {}
 
   async getProfile(userId: string) {
@@ -921,11 +924,42 @@ class UsersService {
 
   async getCertificates(userId: string) {
     const rows = await this.db.query(
-      `SELECT c.*, co.title AS course_title, co.subject
-       FROM certificates c JOIN courses co ON c.course_id=co.id
+      `SELECT c.*, co.title AS course_title, co.subject, co.instructor, u.name AS user_name
+       FROM certificates c
+       JOIN courses co ON c.course_id=co.id
+       JOIN users u    ON c.user_id=u.id
        WHERE c.user_id=$1 ORDER BY c.issued_at DESC`,
       [userId]
     );
+
+    // Lazy-generation backfill: any certificate row created before PDF
+    // generation existed will have certificate_url = NULL. Generate it
+    // on first fetch so older completions still get a real download.
+    const uploadDir = process.env.UPLOAD_DIR ?? join(process.cwd(), 'uploads');
+    const baseUrl = this.config.get<string>('BASE_URL') ?? 'https://api.bpscnotes.in';
+
+    for (const cert of rows) {
+      if (!cert.certificate_url) {
+        try {
+          const relativePath = await generateCertificatePdf(uploadDir, {
+            userName: cert.user_name || 'Student',
+            courseTitle: cert.course_title || 'BPSCNotes Course',
+            instructor: cert.instructor,
+            completedAt: cert.issued_at,
+            certificateId: cert.id,
+          });
+          cert.certificate_url = `${baseUrl}/uploads/${relativePath}`;
+          await this.db.query(
+            `UPDATE certificates SET certificate_url=$1 WHERE id=$2`,
+            [cert.certificate_url, cert.id]
+          );
+        } catch (err) {
+          console.error('Lazy certificate generation failed:', err);
+          // leave certificate_url as null — app will show "not yet available"
+        }
+      }
+    }
+
     return successResponse({ certificates: rows });
   }
 
@@ -1093,7 +1127,7 @@ class LeaderboardCronService implements OnModuleInit {
   }
 }
 
-@Module({ imports:[], controllers:[UsersController, AdminUsersExtraController], providers:[UsersService, LeaderboardCronService], exports:[UsersService] })
+@Module({ imports:[ConfigModule], controllers:[UsersController, AdminUsersExtraController], providers:[UsersService, LeaderboardCronService], exports:[UsersService] })
 export class UsersModule {}
 
 // ════════════════════════════════════════════════════════════
