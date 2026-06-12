@@ -107,7 +107,7 @@ export class AdminDashboardService {
     const cached = await this.cache.get(cacheKey);
     if (cached) return cached;
   
-    const [users, revenue, subs, content, coins, quizStats, rooms] = await Promise.all([
+    const [users, revenue, subs, marketplaceRevenue, content, coins, quizStats, rooms] = await Promise.all([
       this.db.query(`
         SELECT
           COUNT(*) AS total,
@@ -126,6 +126,17 @@ export class AdminDashboardService {
         FROM subscriptions WHERE payment_status = 'success'
       `),
       this.db.query(`SELECT COUNT(*) AS active FROM subscriptions WHERE status='active' AND ends_at > NOW()`),
+      // Marketplace platform revenue — the platform's net cut (platform_fee)
+      // from study material sales. This is "BPSCNotes' money" the same way
+      // subscriptions are, vs. the seller's 60% which just passes through.
+      this.db.query(`
+        SELECT
+          COALESCE(SUM(platform_fee), 0) AS total,
+          COALESCE(SUM(CASE WHEN created_at >= date_trunc('month', NOW()) THEN platform_fee END), 0) AS this_month,
+          COALESCE(SUM(CASE WHEN created_at >= date_trunc('month', NOW()) - INTERVAL '1 month'
+                             AND created_at < date_trunc('month', NOW()) THEN platform_fee END), 0) AS last_month
+        FROM material_purchases WHERE price_paid > 0
+      `),
       this.db.query(`
         SELECT
           (SELECT COUNT(*) FROM courses WHERE status='published') AS courses,
@@ -162,15 +173,19 @@ export class AdminDashboardService {
       newThisWeek:         Number(users?.[0]?.new_this_week || 0),
       newThisMonth:        Number(users?.[0]?.new_this_month || 0),
   
-      totalRevenue:        Number(revenue?.[0]?.total || 0),
-      revenueThisMonth:    Number(revenue?.[0]?.this_month || 0),
-      revenueLastMonth:    Number(revenue?.[0]?.last_month || 0),
+      // Revenue = subscriptions (100% BPSCNotes) + marketplace platform_fee
+      // (the platform's net cut from study material sales; the seller's
+      // 60% share is excluded since it's a pass-through, not BPSCNotes revenue).
+      totalRevenue:        Number(revenue?.[0]?.total || 0) + Number(marketplaceRevenue?.[0]?.total || 0),
+      revenueThisMonth:    Number(revenue?.[0]?.this_month || 0) + Number(marketplaceRevenue?.[0]?.this_month || 0),
+      revenueLastMonth:    Number(revenue?.[0]?.last_month || 0) + Number(marketplaceRevenue?.[0]?.last_month || 0),
   
       revenueGrowthPct:
-        Number(revenue?.[0]?.last_month) > 0
+        (Number(revenue?.[0]?.last_month || 0) + Number(marketplaceRevenue?.[0]?.last_month || 0)) > 0
           ? Math.round(
-              (Number(revenue?.[0]?.this_month) - Number(revenue?.[0]?.last_month)) /
-              Number(revenue?.[0]?.last_month) * 100
+              ((Number(revenue?.[0]?.this_month || 0) + Number(marketplaceRevenue?.[0]?.this_month || 0)) -
+               (Number(revenue?.[0]?.last_month || 0) + Number(marketplaceRevenue?.[0]?.last_month || 0))) /
+              (Number(revenue?.[0]?.last_month || 0) + Number(marketplaceRevenue?.[0]?.last_month || 0)) * 100
             )
           : 0,
   
@@ -217,10 +232,15 @@ export class AdminDashboardService {
     } else if (type === 'revenue') {
       query = `
         SELECT TO_CHAR(DATE_TRUNC('month', gs), 'Mon') AS date,
-               COALESCE(SUM(s.final_amount), 0) AS value
+               COALESCE(SUM(s.final_amount), 0) + COALESCE(MAX(mp.platform_fee_sum), 0) AS value
         FROM generate_series(NOW() - INTERVAL '${months - 1} months', NOW(), '1 month') gs
         LEFT JOIN subscriptions s ON DATE_TRUNC('month', s.created_at) = DATE_TRUNC('month', gs)
           AND s.payment_status = 'success'
+        LEFT JOIN (
+          SELECT DATE_TRUNC('month', created_at) AS month, SUM(platform_fee) AS platform_fee_sum
+          FROM material_purchases WHERE price_paid > 0
+          GROUP BY DATE_TRUNC('month', created_at)
+        ) mp ON mp.month = DATE_TRUNC('month', gs)
         GROUP BY gs ORDER BY gs
       `;
     } else {
@@ -243,7 +263,18 @@ export class AdminDashboardService {
              COALESCE(SUM(final_amount), 0) AS amount
       FROM subscriptions
       WHERE payment_status = 'success'
-      GROUP BY plan ORDER BY amount DESC
+      GROUP BY plan
+
+      UNION ALL
+
+      SELECT 'study_materials' AS plan,
+             COUNT(*) AS count,
+             COALESCE(SUM(platform_fee), 0) AS amount
+      FROM material_purchases
+      WHERE price_paid > 0
+      HAVING COUNT(*) > 0
+
+      ORDER BY amount DESC
     `);
     return result;
   }
