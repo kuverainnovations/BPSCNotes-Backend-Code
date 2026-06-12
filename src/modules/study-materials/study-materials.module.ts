@@ -1159,23 +1159,35 @@ if (query.search)  { conditions.push(`sm.title ILIKE $${pi++}`); params.push(`%$
       );
     }
 
+    // ── 60/40 split: compute seller's share and the platform's net fee ──
+    // Seller share is 60% of the FULL listed price (coin discounts don't
+    // reduce the seller's payout — the platform absorbs that cost).
+    // Platform's net fee = amount actually collected (fullPrice - coinDiscountInr)
+    // minus what was paid out to the seller. This can be less than the
+    // "headline" 40% when a coin discount was applied.
+    let sellerShare = 0;
+    let platformFee = 0;
+    if (material.uploader_id && material.uploader_id !== userId && fullPrice > 0) {
+      const sellerPct = await this.getSettingNumber('seller_commission_pct', 60);
+      sellerShare = Math.floor(fullPrice * sellerPct / 100);
+      platformFee = Math.max(0, (fullPrice - coinDiscountInr) - sellerShare);
+    }
+
     // Record the purchase (legacy table — kept for "isPurchased" checks elsewhere)
     await this.db.query(
       `INSERT INTO material_purchases (material_id, user_id, price_paid, coins_paid, platform_fee)
        VALUES ($1,$2,$3,$4,$5)
        ON CONFLICT (material_id, user_id) DO NOTHING`,
-      [material.id, userId, fullPrice, coinsApplied, 0]
+      [material.id, userId, fullPrice, coinsApplied, platformFee]
     );
 
-    // ── 60/40 split: credit seller's ₹ wallet ──
-    if (material.uploader_id && material.uploader_id !== userId && fullPrice > 0) {
-      const sellerPct   = await this.getSettingNumber('seller_commission_pct', 60);
-      const sellerShare = Math.floor(fullPrice * sellerPct / 100);
+    if (sellerShare > 0) {
       await this.creditSellerWallet(
-        material.uploader_id, sellerShare, material.id, purchaseOrderId,
-        `Sale: "${material.title}" (₹${fullPrice} @ ${sellerPct}%)`
+        material.uploader_id!, sellerShare, material.id, purchaseOrderId,
+        `Sale: "${material.title}" (₹${fullPrice} @ ${Math.round(sellerShare / fullPrice * 100)}%)`
       );
     }
+
 
     const fileUrl = await this.fileUrlForMaterial(material.id);
 
@@ -1362,6 +1374,15 @@ if (query.search)  { conditions.push(`sm.title ILIKE $${pi++}`); params.push(`%$
         COUNT(*)::int                      AS seller_count
       FROM seller_wallets
     `);
+
+    // Platform revenue — sum of platform_fee from all completed marketplace
+    // purchases (the platform's net cut after seller payouts and any
+    // coin-discount cost absorbed by the platform).
+    const [platformRow] = await this.db.query(`
+      SELECT COALESCE(SUM(platform_fee),0)::int AS platform_revenue
+      FROM material_purchases
+    `);
+    totals.platform_revenue = parseInt(platformRow?.platform_revenue ?? '0', 10);
 
     return successResponse({
       wallets: rows.map((r: any) => ({
