@@ -4,7 +4,7 @@ import {
   Body, Param, Query, Req, Res, UploadedFile,
   UseGuards, UseInterceptors, HttpCode, HttpStatus,
   ParseUUIDPipe, BadRequestException, Logger,
-  NotFoundException, StreamableFile,
+  NotFoundException, StreamableFile, HttpException,
 } from '@nestjs/common';
 import { FileInterceptor }        from '@nestjs/platform-express';
 import { InjectDataSource }       from '@nestjs/typeorm';
@@ -900,10 +900,50 @@ if (query.search)  { conditions.push(`sm.title ILIKE $${pi++}`); params.push(`%$
     return successResponse({ downloads });
   }
 
-  // ── POST: purchase a paid material with coins ─────────────
-  // Commission: BPSCNotes takes 30%, creator gets 70%
-  async purchaseMaterial(materialId: string, userId: string) {
-    // Check if already purchased
+  // ── Shared: read a numeric app_settings value with fallback ─
+  private async getSettingNumber(key: string, fallback: number): Promise<number> {
+    const [row] = await this.db.query(
+      `SELECT value FROM app_settings WHERE key=$1 LIMIT 1`, [key]
+    ).catch(() => []);
+    const n = parseFloat(row?.value);
+    return isNaN(n) ? fallback : n;
+  }
+
+  // ── Shared: credit a seller's ₹ wallet and log the transaction ──
+  // Auto-disburses immediately but logs status='disbursed' for a
+  // full audit trail (per design: instant credit, full ledger).
+  private async creditSellerWallet(
+    sellerId: string, amountInr: number, materialId: string,
+    purchaseOrderId: string, description: string,
+  ) {
+    if (amountInr <= 0) return;
+    await this.db.query(`
+      INSERT INTO seller_wallets (user_id, balance, total_earned)
+      VALUES ($1,$2,$2)
+      ON CONFLICT (user_id) DO UPDATE
+        SET balance = seller_wallets.balance + $2,
+            total_earned = seller_wallets.total_earned + $2,
+            updated_at = NOW()
+    `, [sellerId, amountInr]);
+
+    const [wallet] = await this.db.query(
+      `SELECT balance FROM seller_wallets WHERE user_id=$1`, [sellerId]
+    );
+
+    await this.db.query(`
+      INSERT INTO wallet_transactions
+        (user_id, type, amount, status, material_id, purchase_id, description, balance_after, disbursed_at)
+      VALUES ($1,'sale_credit',$2,'disbursed',$3,$4,$5,$6,NOW())
+    `, [sellerId, amountInr, materialId, purchaseOrderId, description, wallet.balance]);
+  }
+
+  // ── POST: initiate a marketplace purchase ───────────────────
+  // Hybrid checkout: buyer may apply up to `max_coins_per_purchase`
+  // coins as a discount (1 coin = coin_to_inr_rate ₹). Remaining ₹
+  // balance is paid via Razorpay. If coins fully cover the price,
+  // the purchase completes immediately with no payment step.
+  async initPurchase(materialId: string, userId: string, coinsToApply: number) {
+    // Already purchased?
     const [existing] = await this.db.query(
       `SELECT id FROM material_purchases WHERE material_id=$1 AND user_id=$2`,
       [materialId, userId]
@@ -914,67 +954,236 @@ if (query.search)  { conditions.push(`sm.title ILIKE $${pi++}`); params.push(`%$
       `SELECT id, title, price, uploader_id FROM study_materials WHERE id=$1 AND status='approved'`,
       [materialId]
     );
-    if (!material) throw new Error('Material not found');
+    if (!material) throw new NotFoundException('Material not found');
 
     const price = material.price ?? 0;
+
+    // Free material — no payment needed at all
     if (price === 0) {
-      // Free — just record purchase
       await this.db.query(
         `INSERT INTO material_purchases (material_id, user_id, price_paid, coins_paid) VALUES ($1,$2,0,0)`,
         [materialId, userId]
       );
-      return successResponse({ purchased: true, alreadyPurchased: false, coinsSpent: 0 });
+      const fileUrl = await this.fileUrlForMaterial(materialId);
+      return successResponse({ purchased: true, alreadyPurchased: false, coinsSpent: 0, amountDueInr: 0, fileUrl },
+        '🎉 Added to your library!');
     }
 
-    // Check user has enough coins
-    const [userRow] = await this.db.query(`SELECT coins FROM users WHERE id=$1`, [userId]);
-    if (!userRow || userRow.coins < price) {
-      throw new Error(`\`Insufficient coins. Need \${price}, have \${userRow?.coins ?? 0}.'\'`);
+    // ── Validate coin discount ──
+    const maxCoins      = await this.getSettingNumber('max_coins_per_purchase', 50);
+    const coinToInrRate = await this.getSettingNumber('coin_to_inr_rate', 1);
+
+    const coinsApplied = Math.max(0, Math.min(Math.floor(coinsToApply || 0), maxCoins));
+    if (coinsApplied > 0) {
+      const [userRow] = await this.db.query(`SELECT coins FROM users WHERE id=$1`, [userId]);
+      if (!userRow || userRow.coins < coinsApplied) {
+        throw new BadRequestException(`You only have ${userRow?.coins ?? 0} coins.`);
+      }
     }
 
-    // Deduct coins from buyer
-    await this.db.query(`UPDATE users SET coins=coins-$1 WHERE id=$2`, [price, userId]);
-    const [updatedUser] = await this.db.query(`SELECT coins FROM users WHERE id=$1`, [userId]);
+    const coinDiscountInr = Math.min(price, Math.floor(coinsApplied * coinToInrRate));
+    const amountDueInr    = price - coinDiscountInr;
 
-    // Commission rate — read from app_settings (admin-configurable, default 70% to creator)
-    const [setting] = await this.db.query(
-      `SELECT value FROM app_settings WHERE key='creator_commission_pct' LIMIT 1`
-    ).catch(() => []);
-    const creatorPct   = parseFloat(setting?.value ?? '70') / 100;
-    const creatorShare = Math.floor(price * creatorPct);
-    const platformFee  = price - creatorShare; // remainder to platform
-    if (material.uploader_id && material.uploader_id !== userId) {
-      await this.db.query(`UPDATE users SET coins=coins+$1 WHERE id=$2`, [creatorShare, material.uploader_id]);
+    // ── Fully covered by coins — complete immediately, no Razorpay ──
+    if (amountDueInr <= 0) {
+      const [order] = await this.db.query(`
+        INSERT INTO material_purchase_orders
+          (material_id, user_id, material_price, coins_applied, coin_discount_inr, amount_due_inr, status)
+        VALUES ($1,$2,$3,$4,$5,0,'completed')
+        RETURNING id
+      `, [materialId, userId, price, coinsApplied, coinDiscountInr]);
+
+      return await this.finalizeMaterialPurchase(material, userId, order.id, coinsApplied, coinDiscountInr, price);
+    }
+
+    // ── Remaining balance needs Razorpay ──
+    let razorpayOrderId: string | null = null;
+    try {
+      const rpKey    = process.env.RAZORPAY_KEY_ID;
+      const rpSecret = process.env.RAZORPAY_KEY_SECRET;
+      const rpRes = await fetch('https://api.razorpay.com/v1/orders', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': 'Basic ' + Buffer.from(`${rpKey}:${rpSecret}`).toString('base64'),
+        },
+        body: JSON.stringify({
+          amount:   amountDueInr * 100, // paise
+          currency: 'INR',
+          receipt:  `material_${materialId.substring(0,8)}_${userId.substring(0,8)}_${Date.now()}`,
+          notes:    { materialId, userId, type: 'material_purchase' },
+        }),
+      });
+      const rpData = await rpRes.json();
+      razorpayOrderId = rpData.id || null;
+    } catch (err: any) {
+      this.logger.error(`Material order creation failed: ${err.message}`);
+    }
+
+    if (!razorpayOrderId) {
+      throw new HttpException('Payment gateway unavailable. Please try again.', HttpStatus.SERVICE_UNAVAILABLE);
+    }
+
+    const [order] = await this.db.query(`
+      INSERT INTO material_purchase_orders
+        (material_id, user_id, material_price, coins_applied, coin_discount_inr, amount_due_inr, razorpay_order_id, status)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,'pending')
+      RETURNING id
+    `, [materialId, userId, price, coinsApplied, coinDiscountInr, amountDueInr, razorpayOrderId]);
+
+    return successResponse({
+      purchased: false,
+      requiresPayment: true,
+      purchaseOrderId: order.id,
+      materialPrice:   price,
+      coinsApplied,
+      coinDiscountInr,
+      amountDueInr,
+      razorpayOrderId,
+      razorpayKeyId:   process.env.RAZORPAY_KEY_ID,
+      materialTitle:   material.title,
+    }, `₹${amountDueInr} due — complete payment to unlock`);
+  }
+
+  // ── POST: confirm a marketplace purchase after Razorpay payment ──
+  async confirmPurchase(
+    materialId: string, userId: string,
+    dto: { purchaseOrderId: string; razorpayPaymentId: string; razorpaySignature: string; paymentMethod?: string },
+  ) {
+    // Idempotency
+    const [already] = await this.db.query(
+      `SELECT id FROM material_purchases WHERE material_id=$1 AND user_id=$2`,
+      [materialId, userId]
+    );
+    if (already) {
+      const fileUrl = await this.fileUrlForMaterial(materialId);
+      return successResponse({ purchased: true, alreadyPurchased: true, fileUrl }, 'Already purchased');
+    }
+
+    const [order] = await this.db.query(
+      `SELECT * FROM material_purchase_orders WHERE id=$1 AND material_id=$2 AND user_id=$3 AND status='pending'`,
+      [dto.purchaseOrderId, materialId, userId]
+    );
+    if (!order) throw new NotFoundException('No pending purchase order found. Please try again.');
+
+    // Verify Razorpay HMAC signature — no bypass
+    const rpSecret = process.env.RAZORPAY_KEY_SECRET;
+    if (!rpSecret) throw new BadRequestException('Payment gateway not configured. Contact support.');
+    const crypto = require('crypto');
+    const expected = crypto
+      .createHmac('sha256', rpSecret)
+      .update(`${order.razorpay_order_id}|${dto.razorpayPaymentId}`)
+      .digest('hex');
+    if (expected !== dto.razorpaySignature) {
+      this.logger.error(
+        `MATERIAL PAYMENT TAMPER DETECTED: user=${userId} material=${materialId} ` +
+        `order=${order.razorpay_order_id} payment=${dto.razorpayPaymentId}`
+      );
+      throw new BadRequestException('Payment verification failed. Contact support.');
+    }
+
+    await this.db.query(
+      `UPDATE material_purchase_orders
+       SET status='completed', razorpay_payment_id=$1, payment_method=$2, updated_at=NOW()
+       WHERE id=$3`,
+      [dto.razorpayPaymentId, dto.paymentMethod || 'upi', order.id]
+    );
+
+    const [material] = await this.db.query(
+      `SELECT id, title, price, uploader_id FROM study_materials WHERE id=$1`, [materialId]
+    );
+
+    return await this.finalizeMaterialPurchase(
+      material, userId, order.id, order.coins_applied, order.coin_discount_inr, order.material_price
+    );
+  }
+
+  // ── Shared: finalize a purchase — deduct coins, record purchase, ──
+  // credit seller wallet with the seller_commission_pct share, return file URL.
+  // Called for both coin-only (fully covered) and Razorpay-completed purchases.
+  private async finalizeMaterialPurchase(
+    material: { id: string; title: string; price: number; uploader_id: string | null },
+    userId: string, purchaseOrderId: string,
+    coinsApplied: number, coinDiscountInr: number, fullPrice: number,
+  ) {
+    // Deduct applied coins from buyer
+    let updatedCoins: number | null = null;
+    if (coinsApplied > 0) {
+      await this.db.query(`UPDATE users SET coins=coins-$1 WHERE id=$2`, [coinsApplied, userId]);
+      const [u] = await this.db.query(`SELECT coins FROM users WHERE id=$1`, [userId]);
+      updatedCoins = u.coins;
       await this.db.query(
         `INSERT INTO coin_transactions (user_id,type,amount,description,action,balance)
-         VALUES ($1,'earned',$2,'Sale: '||$3,'material_sale',(SELECT coins FROM users WHERE id=$1))`,
-        [material.uploader_id, creatorShare, material.title]
+         VALUES ($1,'spent',$2,'Marketplace discount: '||$3,'material_purchase_discount',$4)`,
+        [userId, coinsApplied, material.title, updatedCoins]
       );
     }
 
-    // Record purchase
+    // Record the purchase (legacy table — kept for "isPurchased" checks elsewhere)
     await this.db.query(
       `INSERT INTO material_purchases (material_id, user_id, price_paid, coins_paid, platform_fee)
-       VALUES ($1,$2,$3,$3,$4)`,
-      [materialId, userId, price, platformFee]
+       VALUES ($1,$2,$3,$4,$5)
+       ON CONFLICT (material_id, user_id) DO NOTHING`,
+      [material.id, userId, fullPrice, coinsApplied, 0]
     );
 
-    // Coin transaction for buyer
-    await this.db.query(
-      `INSERT INTO coin_transactions (user_id,type,amount,description,action,balance)
-       VALUES ($1,'spent',$2,'Purchased: '||$3,'material_purchase',$4)`,
-      [userId, price, material.title, updatedUser.coins]
-    );
+    // ── 60/40 split: credit seller's ₹ wallet ──
+    if (material.uploader_id && material.uploader_id !== userId && fullPrice > 0) {
+      const sellerPct   = await this.getSettingNumber('seller_commission_pct', 60);
+      const sellerShare = Math.floor(fullPrice * sellerPct / 100);
+      await this.creditSellerWallet(
+        material.uploader_id, sellerShare, material.id, purchaseOrderId,
+        `Sale: "${material.title}" (₹${fullPrice} @ ${sellerPct}%)`
+      );
+    }
 
-    // Get file URL for immediate access
-    const [mat] = await this.db.query(`SELECT file_key FROM study_materials WHERE id=$1`, [materialId]);
-    const fileUrl = mat?.file_key ? this.fileUrl(mat.file_key) : null;
+    const fileUrl = await this.fileUrlForMaterial(material.id);
 
     return successResponse({
       purchased: true, alreadyPurchased: false,
-      coinsSpent: price, coinsBalance: updatedUser.coins,
-      fileUrl
+      coinsSpent: coinsApplied, coinsBalance: updatedCoins,
+      coinDiscountInr, amountPaidInr: fullPrice - coinDiscountInr,
+      fileUrl,
     }, '🎉 Purchase successful! Full PDF unlocked.');
+  }
+
+  // ── Shared: file URL lookup ──────────────────────────────────
+  private async fileUrlForMaterial(materialId: string): Promise<string | null> {
+    const [mat] = await this.db.query(`SELECT file_key FROM study_materials WHERE id=$1`, [materialId]);
+    return mat?.file_key ? this.fileUrl(mat.file_key) : null;
+  }
+
+  // ── GET: seller wallet summary + transaction history ─────────
+  async getWallet(userId: string, page = 1, limit = 30) {
+    const offset = (page - 1) * limit;
+
+    await this.db.query(`
+      INSERT INTO seller_wallets (user_id, balance, total_earned)
+      VALUES ($1,0,0) ON CONFLICT (user_id) DO NOTHING
+    `, [userId]);
+
+    const [wallet] = await this.db.query(
+      `SELECT balance, total_earned FROM seller_wallets WHERE user_id=$1`, [userId]
+    );
+
+    const [transactions, [countRow]] = await Promise.all([
+      this.db.query(
+        `SELECT wt.id, wt.type, wt.amount, wt.status, wt.description, wt.balance_after,
+                wt.created_at, wt.disbursed_at, sm.title AS material_title
+         FROM wallet_transactions wt
+         LEFT JOIN study_materials sm ON sm.id = wt.material_id
+         WHERE wt.user_id=$1 ORDER BY wt.created_at DESC LIMIT $2 OFFSET $3`,
+        [userId, limit, offset]
+      ),
+      this.db.query(`SELECT COUNT(*) FROM wallet_transactions WHERE user_id=$1`, [userId]),
+    ]);
+
+    return successResponse({
+      balance: wallet.balance,
+      totalEarned: wallet.total_earned,
+      transactions,
+      meta: paginationMeta(parseInt(countRow.count, 10), page, limit),
+    });
   }
 
   // ── GET: preview (free pages URL — for locked content) ───
@@ -1198,10 +1407,28 @@ export class StudyMaterialsController {
     return this.svc.removeDownload(materialId, r.user.id);
   }
 
-  @Post(':id/purchase')
+  // ── Marketplace purchase — hybrid coins + Razorpay checkout ──
+  // POST /study-materials/:id/purchase/init  body: { coinsToApply?: number }
+  // Returns either a completed purchase (free or fully coin-covered)
+  // or a Razorpay order to pay the remaining ₹ balance.
+  @Post(':id/purchase/init')
   @HttpCode(HttpStatus.OK)
-  purchaseMaterial(@Param('id', ParseUUIDPipe) id: string, @Req() r: any) {
-    return this.svc.purchaseMaterial(id, r.user.id);
+  initPurchase(@Param('id', ParseUUIDPipe) id: string, @Body() b: any, @Req() r: any) {
+    return this.svc.initPurchase(id, r.user.id, +(b?.coinsToApply ?? 0));
+  }
+
+  // POST /study-materials/:id/purchase/confirm
+  // body: { purchaseOrderId, razorpayPaymentId, razorpaySignature, paymentMethod? }
+  @Post(':id/purchase/confirm')
+  @HttpCode(HttpStatus.OK)
+  confirmPurchase(@Param('id', ParseUUIDPipe) id: string, @Body() b: any, @Req() r: any) {
+    return this.svc.confirmPurchase(id, r.user.id, b);
+  }
+
+  // ── GET: seller's ₹ wallet balance + transaction history ─────
+  @Get('wallet')
+  getWallet(@Query('page') page = 1, @Query('limit') limit = 30, @Req() r: any) {
+    return this.svc.getWallet(r.user.id, +page, +limit);
   }
 
   @Get(':id/preview')
