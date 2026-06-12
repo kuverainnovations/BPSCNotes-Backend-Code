@@ -1299,4 +1299,4 @@ export class AdminStudyMaterialsController {
   providers:   [StudyMaterialsService],
   exports:     [StudyMaterialsService],
 })
-export class StudyMaterialsModule {}/Users/apple/Downloads/1780200000000-MarketplaceNegotiation.ts
+export class StudyMaterialsModule {}
