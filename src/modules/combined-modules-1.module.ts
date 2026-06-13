@@ -1043,6 +1043,28 @@ console.log('sample token:', tokens[0]);
       await this.db.query(`UPDATE user_notifications SET is_read=TRUE, read_at=NOW() WHERE user_id=$1 AND id=ANY($2)`, [userId, ids]);
     } else {
       await this.db.query(`UPDATE user_notifications SET is_read=TRUE, read_at=NOW() WHERE user_id=$1`, [userId]);
+
+      // Broadcast notifications ('all'/'free'/'pro' targets) may not have a
+      // user_notifications row for this user yet — getUserNotifications()
+      // surfaces them via a LEFT JOIN with is_read defaulting to FALSE, so
+      // without a row they'd appear unread forever. Create read rows for
+      // any such broadcasts the user is eligible to see.
+      await this.db.query(`
+        INSERT INTO user_notifications (user_id, notification_id, title, body, is_read, read_at)
+        SELECT $1, n.id, n.title, n.body, TRUE, NOW()
+        FROM notifications n
+        WHERE n.status = 'sent'
+          AND NOT EXISTS (SELECT 1 FROM user_notifications un WHERE un.user_id=$1 AND un.notification_id=n.id)
+          AND (
+            n.target = 'all'
+            OR (n.target = 'pro' AND EXISTS(
+              SELECT 1 FROM subscriptions s WHERE s.user_id=$1 AND s.status='active' AND s.ends_at > NOW()
+            ))
+            OR (n.target = 'free' AND NOT EXISTS(
+              SELECT 1 FROM subscriptions s WHERE s.user_id=$1 AND s.status='active' AND s.ends_at > NOW()
+            ))
+          )
+      `, [userId]);
     }
     return successResponse(null, 'Marked as read');
   }
