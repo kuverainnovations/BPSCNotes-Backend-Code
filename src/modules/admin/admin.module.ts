@@ -259,8 +259,8 @@ export class AdminDashboardService {
   async getRevenueBreakdown() {
     const result = await this.db.query(`
       SELECT plan,
-             COUNT(*) AS count,
-             COALESCE(SUM(final_amount), 0) AS amount
+             COUNT(*)::int AS count,
+             COALESCE(SUM(final_amount), 0)::int AS amount
       FROM subscriptions
       WHERE payment_status = 'success'
       GROUP BY plan
@@ -268,8 +268,8 @@ export class AdminDashboardService {
       UNION ALL
 
       SELECT 'study_materials' AS plan,
-             COUNT(*) AS count,
-             COALESCE(SUM(platform_fee), 0) AS amount
+             COUNT(*)::int AS count,
+             COALESCE(SUM(platform_fee), 0)::int AS amount
       FROM material_purchases
       WHERE price_paid > 0
       HAVING COUNT(*) > 0
