@@ -513,7 +513,8 @@ if (query.search)  { conditions.push(`(sm.title ILIKE $${pi} OR sm.subject ILIKE
     const where = conditions.join(' AND ');
     const [rows, [cnt]] = await Promise.all([
       this.db.query(
-        `SELECT sm.*, u.name AS uploader_name FROM study_materials sm LEFT JOIN users u ON u.id=sm.uploader_id
+        `SELECT sm.*, sm.is_featured AS "isFeatured", sm.is_trending AS "isTrending", u.name AS uploader_name
+         FROM study_materials sm LEFT JOIN users u ON u.id=sm.uploader_id
          WHERE ${where} ORDER BY sm.created_at DESC LIMIT $${pi++} OFFSET $${pi++}`,
         [...params, limit, offset]
       ),
@@ -879,6 +880,13 @@ if (query.search)  { conditions.push(`(sm.title ILIKE $${pi} OR sm.subject ILIKE
     if (!row) throw new NotFoundException();
     await this.db.query(`UPDATE study_materials SET is_featured=$2 WHERE id=$1`, [id, !row.is_featured]);
     return successResponse({ isFeatured: !row.is_featured });
+  }
+
+  async adminToggleTrending(id: string) {
+    const [row] = await this.db.query(`SELECT is_trending FROM study_materials WHERE id=$1`, [id]);
+    if (!row) throw new NotFoundException();
+    await this.db.query(`UPDATE study_materials SET is_trending=$2 WHERE id=$1`, [id, !row.is_trending]);
+    return successResponse({ isTrending: !row.is_trending });
   }
 
   async adminDelete(id: string) {
@@ -1763,6 +1771,11 @@ export class AdminStudyMaterialsController {
   @RequirePermission('study-materials')
   @HttpCode(HttpStatus.OK)
   toggleFeature(@Param('id', ParseUUIDPipe) id: string) { return this.svc.adminToggleFeature(id); }
+
+  @Patch(':id/trending')
+  @RequirePermission('study-materials')
+  @HttpCode(HttpStatus.OK)
+  toggleTrending(@Param('id', ParseUUIDPipe) id: string) { return this.svc.adminToggleTrending(id); }
 
   @Delete(':id')
   @RequirePermission('study-materials')
