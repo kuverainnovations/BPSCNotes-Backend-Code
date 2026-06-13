@@ -370,7 +370,7 @@ export class CoursesService {
   }
 
   async enroll(courseId: string, userId: string) {
-    const course = await this.db.query(`SELECT id, is_paid FROM courses WHERE id=$1 AND status='published'`, [courseId]);
+    const course = await this.db.query(`SELECT id, is_paid, price, title FROM courses WHERE id=$1 AND status='published'`, [courseId]);
     if (!course.length) throw new NotFoundException('Course not found');
 
     if (course[0].is_paid) {
