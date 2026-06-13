@@ -199,7 +199,7 @@ export class CoursesRepository {
                      'duration_mins',  l.duration_mins,
                      'type',           l.type,
                      'is_free_preview',l.is_free_preview,
-                     'is_locked',      l.is_locked,
+                     'is_locked',      (l.is_locked AND c.is_paid),
                      'sort_order',     l.sort_order,
                      'is_completed',   ${userId
                        ? `(SELECT lp.is_completed FROM lesson_progress lp WHERE lp.user_id=$2 AND lp.lesson_id=l.id LIMIT 1)`
@@ -352,6 +352,16 @@ export class CoursesService {
     private readonly activityLog?: ActivityLogService,
   ) {}
 
+  // Reads a numeric value from app_settings (e.g. coin_to_inr_rate,
+  // max_coins_per_purchase), falling back to a default if unset/invalid.
+  private async getSettingNumber(key: string, fallback: number): Promise<number> {
+    const [row] = await this.db.query(
+      `SELECT value FROM app_settings WHERE key=$1 LIMIT 1`, [key]
+    ).catch(() => []);
+    const n = parseFloat(row?.value);
+    return isNaN(n) ? fallback : n;
+  }
+
   async findAll(query: CourseQueryDto, userId?: string) {
     const cacheKey = `courses:${JSON.stringify(query)}:${userId || 'anon'}`;
     const cached   = await this.cache.get(cacheKey);
@@ -369,7 +379,7 @@ export class CoursesService {
     return successResponse({ course });
   }
 
-  async enroll(courseId: string, userId: string) {
+  async enroll(courseId: string, userId: string, coinsToApply = 0) {
     const course = await this.db.query(`SELECT id, is_paid, price, title FROM courses WHERE id=$1 AND status='published'`, [courseId]);
     if (!course.length) throw new NotFoundException('Course not found');
 
@@ -394,6 +404,10 @@ export class CoursesService {
             UNIQUE(user_id, course_id)
           )
         `);
+        // Coin-discount tracking columns — added separately so existing
+        // deployments with the table already created still pick them up.
+        await this.db.query(`ALTER TABLE course_purchases ADD COLUMN IF NOT EXISTS coins_applied INTEGER NOT NULL DEFAULT 0`);
+        await this.db.query(`ALTER TABLE course_purchases ADD COLUMN IF NOT EXISTS coin_discount_inr INTEGER NOT NULL DEFAULT 0`);
 
         const individualPurchase = await this.db.query(
           `SELECT id FROM course_purchases WHERE user_id=$1 AND course_id=$2 AND status='completed'`,
@@ -401,47 +415,88 @@ export class CoursesService {
         );
         if (!individualPurchase.length) {
           const coursePrice = course[0].price || 0;
-          let razorpayOrderId: string | null = null;
-          try {
-            const rpKey    = process.env.RAZORPAY_KEY_ID;
-            const rpSecret = process.env.RAZORPAY_KEY_SECRET;
-            const rpRes = await fetch('https://api.razorpay.com/v1/orders', {
-              method: 'POST',
-              headers: {
-                'Content-Type': 'application/json',
-                'Authorization': 'Basic ' + Buffer.from(`${rpKey}:${rpSecret}`).toString('base64'),
-              },
-              body: JSON.stringify({
-                amount:   coursePrice * 100,
-                currency: 'INR',
-                receipt:  `course_${courseId.substring(0,8)}_${userId.substring(0,8)}`,
-                notes:    { courseId, userId, type: 'course_purchase' },
-              }),
-            });
-            const rpData = await rpRes.json();
-            razorpayOrderId = rpData.id || null;
 
-            if (razorpayOrderId) {
-              await this.db.query(
-                `INSERT INTO course_purchases (user_id, course_id, amount, razorpay_order_id, status)
-                 VALUES ($1,$2,$3,$4,'pending')
-                 ON CONFLICT (user_id, course_id) DO UPDATE SET razorpay_order_id=$4, status='pending'`,
-                [userId, courseId, coursePrice, razorpayOrderId]
-              );
+          // ── Coin discount (1 coin = coin_to_inr_rate ₹, capped) ──
+          const maxCoins      = await this.getSettingNumber('max_coins_per_purchase', 50);
+          const coinToInrRate = await this.getSettingNumber('coin_to_inr_rate', 1);
+          const coinsApplied  = Math.max(0, Math.min(Math.floor(coinsToApply || 0), maxCoins));
+
+          if (coinsApplied > 0) {
+            const [userRow] = await this.db.query(`SELECT coins FROM users WHERE id=$1`, [userId]);
+            if (!userRow || userRow.coins < coinsApplied) {
+              throw new BadRequestException(`You only have ${userRow?.coins ?? 0} coins.`);
             }
-          } catch (err: any) {
-            console.error('Course order creation failed:', err.message);
           }
 
-          throw new HttpException({
-            message:         'Purchase required to enroll in this course',
-            code:            'PURCHASE_REQUIRED',
-            price:           coursePrice,
-            razorpayOrderId,
-            razorpayKeyId:   process.env.RAZORPAY_KEY_ID,
-            courseTitle:     course[0].title,
-            courseId,
-          }, HttpStatus.PAYMENT_REQUIRED);
+          const coinDiscountInr = Math.min(coursePrice, Math.floor(coinsApplied * coinToInrRate));
+          const amountDueInr    = coursePrice - coinDiscountInr;
+
+          // ── Fully covered by coins — no Razorpay needed ──
+          if (amountDueInr <= 0) {
+            if (coinsApplied > 0) {
+              await this.db.query(`UPDATE users SET coins = coins - $1 WHERE id=$2`, [coinsApplied, userId]);
+              const [u] = await this.db.query(`SELECT coins FROM users WHERE id=$1`, [userId]);
+              await this.db.query(
+                `INSERT INTO coin_transactions (user_id,type,amount,description,action,balance)
+                 VALUES ($1,'spent',$2,'Course purchase discount: '||$3,'course_purchase_discount',$4)`,
+                [userId, coinsApplied, course[0].title, u.coins]
+              );
+            }
+            await this.db.query(
+              `INSERT INTO course_purchases (user_id, course_id, amount, coins_applied, coin_discount_inr, status)
+               VALUES ($1,$2,$3,$4,$5,'completed')
+               ON CONFLICT (user_id, course_id) DO UPDATE
+                 SET amount=$3, coins_applied=$4, coin_discount_inr=$5, status='completed', updated_at=NOW()`,
+              [userId, courseId, coursePrice, coinsApplied, coinDiscountInr]
+            );
+            // Fall through to grant enrollment below.
+          } else {
+            let razorpayOrderId: string | null = null;
+            try {
+              const rpKey    = process.env.RAZORPAY_KEY_ID;
+              const rpSecret = process.env.RAZORPAY_KEY_SECRET;
+              const rpRes = await fetch('https://api.razorpay.com/v1/orders', {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  'Authorization': 'Basic ' + Buffer.from(`${rpKey}:${rpSecret}`).toString('base64'),
+                },
+                body: JSON.stringify({
+                  amount:   amountDueInr * 100,
+                  currency: 'INR',
+                  receipt:  `course_${courseId.substring(0,8)}_${userId.substring(0,8)}`,
+                  notes:    { courseId, userId, type: 'course_purchase', coinsApplied },
+                }),
+              });
+              const rpData = await rpRes.json();
+              razorpayOrderId = rpData.id || null;
+
+              if (razorpayOrderId) {
+                await this.db.query(
+                  `INSERT INTO course_purchases (user_id, course_id, amount, coins_applied, coin_discount_inr, razorpay_order_id, status)
+                   VALUES ($1,$2,$3,$4,$5,$6,'pending')
+                   ON CONFLICT (user_id, course_id) DO UPDATE
+                     SET amount=$3, coins_applied=$4, coin_discount_inr=$5, razorpay_order_id=$6, status='pending', updated_at=NOW()`,
+                  [userId, courseId, amountDueInr, coinsApplied, coinDiscountInr, razorpayOrderId]
+                );
+              }
+            } catch (err: any) {
+              console.error('Course order creation failed:', err.message);
+            }
+
+            throw new HttpException({
+              message:         'Purchase required to enroll in this course',
+              code:            'PURCHASE_REQUIRED',
+              price:           amountDueInr,
+              coursePrice,
+              coinsApplied,
+              coinDiscountInr,
+              razorpayOrderId,
+              razorpayKeyId:   process.env.RAZORPAY_KEY_ID,
+              courseTitle:     course[0].title,
+              courseId,
+            }, HttpStatus.PAYMENT_REQUIRED);
+          }
         }
       }
     }
@@ -497,7 +552,7 @@ export class CoursesService {
 
     // 2. Find pending purchase row created by enroll()
     const [purchase] = await this.db.query(
-      `SELECT id, amount FROM course_purchases
+      `SELECT id, amount, coins_applied FROM course_purchases
        WHERE user_id=$1 AND course_id=$2 AND status='pending'
        ORDER BY created_at DESC LIMIT 1`,
       [userId, courseId]
@@ -531,6 +586,18 @@ export class CoursesService {
        WHERE id=$3`,
       [dto.razorpayPaymentId, dto.paymentMethod || 'upi', purchase.id]
     );
+
+    // 4b. Deduct any coins that were reserved as a discount for this order
+    if (purchase.coins_applied > 0) {
+      await this.db.query(`UPDATE users SET coins = coins - $1 WHERE id=$2`, [purchase.coins_applied, userId]);
+      const [u] = await this.db.query(`SELECT coins FROM users WHERE id=$1`, [userId]);
+      const [courseRow] = await this.db.query(`SELECT title FROM courses WHERE id=$1`, [courseId]);
+      await this.db.query(
+        `INSERT INTO coin_transactions (user_id,type,amount,description,action,balance)
+         VALUES ($1,'spent',$2,'Course purchase discount: '||$3,'course_purchase_discount',$4)`,
+        [userId, purchase.coins_applied, courseRow?.title ?? '', u.coins]
+      );
+    }
 
     // 5. Grant enrollment
     await this.db.query(
@@ -984,8 +1051,8 @@ export class CoursesController {
 
   @Post(':id/enroll')
   @HttpCode(HttpStatus.CREATED)
-  enroll(@Param('id', ParseUUIDPipe) id: string, @Req() req: any) {
-    return this.service.enroll(id, req.user.id);
+  enroll(@Param('id', ParseUUIDPipe) id: string, @Body() body: { coinsToApply?: number }, @Req() req: any) {
+    return this.service.enroll(id, req.user.id, body?.coinsToApply ?? 0);
   }
 
   @Post(':id/purchase/confirm')
