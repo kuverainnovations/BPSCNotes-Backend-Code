@@ -96,7 +96,7 @@ export class TierRoomsService {
         COUNT(DISTINCT ss.id)::int       AS active_sessions
       FROM room_tiers t
       LEFT JOIN user_room_tier urt ON urt.current_tier_id = t.id
-      LEFT JOIN study_sessions ss  ON ss.tier_id = t.id AND ss.ended_at IS NULL
+      LEFT JOIN study_sessions ss  ON COALESCE(ss.room_tier_id, ss.tier_id) = t.id AND ss.ended_at IS NULL
       WHERE t.is_active = TRUE
       GROUP BY t.id
       ORDER BY t.sort_order ASC
@@ -125,7 +125,7 @@ export class TierRoomsService {
         u.total_study_minutes, u.streak, u.quizzes_attempted,
         u.accuracy, u.xp, u.xp_level, u.coins,
         (SELECT COUNT(*) FROM user_room_tier WHERE current_tier_id = ct.id)::int AS tier_member_count,
-        (SELECT COUNT(*) FROM study_sessions WHERE tier_id = ct.id AND ended_at IS NULL)::int AS active_now
+        (SELECT COUNT(*) FROM study_sessions WHERE COALESCE(room_tier_id, tier_id) = ct.id AND ended_at IS NULL)::int AS active_now
       FROM user_room_tier urt
       JOIN room_tiers ct ON ct.id = urt.current_tier_id
       JOIN users u       ON u.id  = urt.user_id
@@ -548,7 +548,7 @@ export class StudySessionsService {
     }
   }
 
-  async startSession(userId: string, roomId?: string, mode: string = 'study') {
+  async startSession(userId: string, roomId?: string, mode: string = 'study', roomTierKey?: string) {
     // ── Anti-cheat: block session velocity + concurrent session abuse ──
     const startCheck = await this.antiCheat.checkSessionStart(userId);
     if (startCheck.result === 'BLOCK') {
@@ -569,10 +569,27 @@ export class StudySessionsService {
     const validModes = ['study','pomodoro','silent'];
     const sessionMode = validModes.includes(mode) ? mode : 'study';
 
+    // room_tier_id: the tier ROOM the user is actually sitting in for this
+    // session. May differ from tier_id (their reward tier) if they joined
+    // a lower, already-unlocked tier's room. Falls back to tier_id (their
+    // own room) when roomTierKey is absent or doesn't resolve.
+    let roomTierId = tierId;
+    let roomTierKeyResolved = tierRow[0]?.tier_key ?? null;
+    if (roomTierKey) {
+      const roomTierRow = await this.db.query(
+        `SELECT id, tier_key FROM room_tiers WHERE tier_key=$1 AND is_active=TRUE LIMIT 1`,
+        [roomTierKey]
+      );
+      if (roomTierRow.length) {
+        roomTierId = roomTierRow[0].id;
+        roomTierKeyResolved = roomTierRow[0].tier_key;
+      }
+    }
+
     const session = await this.db.query(`
-      INSERT INTO study_sessions (user_id, room_id, tier_id, mode, last_heartbeat)
-      VALUES ($1,$2,$3,$4,NOW()) RETURNING id, started_at, mode, tier_id
-    `, [userId, roomId || null, tierId, sessionMode]);
+      INSERT INTO study_sessions (user_id, room_id, tier_id, room_tier_id, mode, last_heartbeat)
+      VALUES ($1,$2,$3,$4,$5,NOW()) RETURNING id, started_at, mode, tier_id, room_tier_id
+    `, [userId, roomId || null, tierId, roomTierId, sessionMode]);
 
     // Track in Redis for fast concurrent-session detection
 
@@ -581,8 +598,8 @@ export class StudySessionsService {
 
     // Broadcast presence update + member_joined event so other users see
     // the new member immediately (without waiting 30s for polling refresh)
-    if (tierRow[0]?.tier_key) {
-      const tierKey = tierRow[0].tier_key;
+    if (roomTierKeyResolved) {
+      const tierKey = roomTierKeyResolved;
       // Get user's name for the member_joined broadcast
       const [userRow] = await this.db.query(`SELECT name FROM users WHERE id=$1`, [userId]);
       const userName  = userRow?.name ?? 'Member';
@@ -707,7 +724,57 @@ export class StudySessionsService {
     `, [sessionId, userId]);
     if (!sessions.length) throw new NotFoundException('Active session not found.');
 
-    const s = sessions[0];
+    let s = sessions[0];
+
+    // ── Credit the final partial interval ──────────────────────
+    // The heartbeat (every 5 min) is what normally awards coins/XP and
+    // increments active_minutes. A session ended before its first
+    // heartbeat (e.g. a 3-minute session) would otherwise show 0m / 0
+    // coins / 0 XP even though the user was actively studying. Apply the
+    // same calculation heartbeat() uses for the time since last_heartbeat,
+    // as long as it doesn't look like an AFK gap.
+    const finalGapSecs = (Date.now() - new Date(s.last_heartbeat).getTime()) / 1000;
+    if (finalGapSecs > 0 && finalGapSecs <= this.AFK_THRESHOLD_S) {
+      const activeMins     = Math.min(finalGapSecs / 60, 5);
+      const coinMultiplier = +s.coin_multiplier || 1.0;
+      const xpMultiplier   = +s.xp_multiplier   || 1.0;
+      let coinsThisBeat    = Math.floor((activeMins / 60) * this.BASE_COINS_PER_HOUR * coinMultiplier);
+      let xpThisBeat       = Math.floor(activeMins * this.BASE_XP_PER_MINUTE * xpMultiplier);
+
+      if (coinsThisBeat > 0) {
+        const capped = await this.checkDailyCap(userId, 'study_time');
+        if (capped) {
+          coinsThisBeat = 0;
+        } else {
+          await this.awardSessionCoins(userId, sessionId, coinsThisBeat, coinMultiplier);
+        }
+      }
+      if (xpThisBeat > 0) await this.awardSessionXp(userId, sessionId, xpThisBeat);
+
+      const roundMins = Math.round(activeMins);
+      await this.db.query(`
+        UPDATE study_sessions
+        SET active_minutes=active_minutes+$1, coins_earned=coins_earned+$2,
+            xp_earned=xp_earned+$3, last_heartbeat=NOW()
+        WHERE id=$4
+      `, [roundMins, coinsThisBeat, xpThisBeat, sessionId]);
+
+      if (roundMins > 0) {
+        await this.db.query(
+          `UPDATE users SET total_study_minutes=total_study_minutes+$1 WHERE id=$2`,
+          [roundMins, userId]
+        );
+      }
+
+      // Reflect the credited amounts in `s` for the rest of this method
+      s = {
+        ...s,
+        active_minutes: s.active_minutes + roundMins,
+        coins_earned:   s.coins_earned + coinsThisBeat,
+        xp_earned:      s.xp_earned + xpThisBeat,
+      };
+    }
+
     const durationMins = Math.round((Date.now() - new Date(s.started_at).getTime()) / 60000);
     let bonusCoins = 0;
     if (s.active_minutes >= 30) {
@@ -790,8 +857,20 @@ export class StudySessionsService {
     }
 
     await this.activityLog?.log(userId, ACTIONS.STUDY_SESSION_ENDED, `Study session ended - ${s.active_minutes} active mins`, { sessionId, activeMinutes: s.active_minutes, coins: s.coins_earned }).catch(()=>{});
+
+    // Sum of active_minutes across all of today's sessions (including this
+    // one, now that it's been credited above) — shown as "Today Total"
+    // on the session summary screen.
+    const [todayRow] = await this.db.query(
+      `SELECT COALESCE(SUM(active_minutes),0)::int AS total
+       FROM study_sessions WHERE user_id=$1 AND started_at::date=CURRENT_DATE`,
+      [userId]
+    );
+    const todayStudyMinutes = todayRow?.total ?? s.active_minutes;
+
     return successResponse({
       sessionId, durationMinutes: durationMins, activeMinutes: s.active_minutes,
+      todayStudyMinutes,
       totalCoins: s.coins_earned + bonusCoins, totalXp: s.xp_earned, bonusCoins,
       message: s.active_minutes >= 60
         ? `Great session! ${(s.active_minutes / 60).toFixed(1)} hours of focused study.`
@@ -802,7 +881,8 @@ export class StudySessionsService {
   async getActiveSession(userId: string) {
     const rows = await this.db.query(`
       SELECT ss.*, t.name AS tier_name, t.icon_emoji, t.color_hex
-      FROM study_sessions ss LEFT JOIN room_tiers t ON t.id=ss.tier_id
+      FROM study_sessions ss
+      LEFT JOIN room_tiers t ON t.id = COALESCE(ss.room_tier_id, ss.tier_id)
       WHERE ss.user_id=$1 AND ss.ended_at IS NULL LIMIT 1
     `, [userId]);
     if (!rows.length) return successResponse({ session: null }, 'No active session');
@@ -1167,7 +1247,7 @@ export class TierRoomsController {
   @Post('sessions/start')
   @HttpCode(HttpStatus.CREATED)
   startSession(@Req() r: any, @Body() body: any) {
-    return this.sessionsService.startSession(r.user.id, body.roomId, body.mode);
+    return this.sessionsService.startSession(r.user.id, body.roomId, body.mode, body.tierKey);
   }
 
   @Post('sessions/heartbeat')
