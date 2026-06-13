@@ -1355,7 +1355,8 @@ export class ExamsModule {}
 //   id, front, back, subject, exam_tags, difficulty, is_active, created_by, created_at
 //
 // Android FlashcardDto expects:
-//   id, subject, topic, question, answer, hint, example, difficulty, related_mcq
+//   id, subject, topic, question, answer, hint, difficulty, related_mcq
+//   (the "example" field was removed — unused by any client)
 //
 // Mapping: front→question, back→answer, topic="General" (not in schema, derive from subject)
 // ════════════════════════════════════════════════════════════
@@ -1393,7 +1394,6 @@ class FlashcardsService {
          f.front     AS question,
          f.back      AS answer,
          COALESCE(f.hint,'')    AS hint,
-         COALESCE(f.example,'') AS example,
          COALESCE(f.card_type,'text') AS card_type,
          f.image_url,
          f.back_image_url,
@@ -1440,8 +1440,8 @@ class FlashcardsService {
     const imageUrl = cardType === 'image' ? (data.imageUrl || data.image_url || null) : null;
     const result = await this.db.query(
       `INSERT INTO flashcards
-         (front, back, subject, exam_tags, card_type, image_url, back_image_url, topic, hint, example, created_by)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11) RETURNING *`,
+         (front, back, subject, exam_tags, card_type, image_url, back_image_url, topic, hint, created_by)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,
       [
         front,
         back,
@@ -1452,7 +1452,6 @@ class FlashcardsService {
         backImageUrl,
         data.topic || data.subject || 'General',
         data.hint || '',
-        data.example || '',
         adminId,
       ]
     );
@@ -1468,7 +1467,7 @@ class FlashcardsService {
     const map: any = {
       front: 'front', back: 'back', question: 'front', answer: 'back',
       subject: 'subject', isActive: 'is_active',
-      topic: 'topic', hint: 'hint', example: 'example',
+      topic: 'topic', hint: 'hint',
     };
     // Handle back_image_url separately (camelCase from admin, snake_case from API)
     if (data.backImageUrl !== undefined || data.back_image_url !== undefined) {

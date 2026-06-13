@@ -1,1596 +1,1223 @@
 import {
   Module, Injectable, Controller, Get, Post, Put, Delete,
   Body, Param, Query, Req, HttpCode, HttpStatus,
-  NotFoundException, BadRequestException, ForbiddenException,
-  UseGuards, ParseUUIDPipe,
-  Patch, Logger, OnModuleInit,
+  NotFoundException, BadRequestException, ConflictException,
+  UseGuards, ParseUUIDPipe, OnModuleInit,
 } from '@nestjs/common';
-import { Cron } from '@nestjs/schedule';
-import { ScheduleModule } from '@nestjs/schedule';
 import { InjectDataSource } from '@nestjs/typeorm';
 import { DataSource } from 'typeorm';
 import { CACHE_MANAGER } from '@nestjs/cache-manager';
 import { Cache } from 'cache-manager';
-import { Inject, Optional } from '@nestjs/common';
+import { Inject , Optional } from '@nestjs/common';
 import { ApiTags, ApiBearerAuth } from '@nestjs/swagger';
 import { ConfigModule, ConfigService } from '@nestjs/config';
-import { AuthModule, AuthService } from './auth/auth.module';
-import { NotificationsModule, NotificationService } from './combined-modules-1.module';
-// Phase 2 achievements + challenges — imported here to wire into
-// DailyTargets and Quizzes so completions trigger achievement checks
-import { AchievementsService, WeeklyChallengesService } from './achievements/achievements.module';
+import * as admin from 'firebase-admin';
 
 import { JwtAuthGuard, AdminJwtGuard, PermissionGuard, RequirePermission, Public } from '../common/guards';
-import { FileInterceptor } from '@nestjs/platform-express';
-import { diskStorage }     from 'multer';
-import { extname, join }   from 'path';
-import * as fs             from 'fs';
-import { generateCertificatePdf } from '../common/utils/certificate-generator.util';
-import * as crypto         from 'crypto';
 import { PaginationDto } from '../common/dtos/pagination.dto';
 import { successResponse, paginationMeta } from '../common/utils/response.util';
-
-import {
-  UseInterceptors,
-  UploadedFile,
-} from '@nestjs/common';
+import { AuthService } from './auth/auth.module';
+import { ensureFirebaseAdmin } from '../common/firebase/firebase-admin';
 
 // ════════════════════════════════════════════════════════════
-// STUDY ROOMS MODULE
+// CURRENT AFFAIRS MODULE
 // ════════════════════════════════════════════════════════════
 @Injectable()
-class StudyRoomsService {
-  constructor(
-    @InjectDataSource() private readonly db: DataSource,
-    private readonly authService: AuthService,
-  ) {}
-
-  async findAll(query: any, userId: string) {
-    const { subject, exam } = query;
-    const conditions = [`sr.status='active'`], params: any[] = [];
-    if (subject) { conditions.push(`sr.subject=$${params.length+1}`); params.push(subject); }
-    if (exam)    { conditions.push(`$${params.length+1}=ANY(sr.exam_tags)`); params.push(exam); }
-    const rows = await this.db.query(
-      `SELECT sr.*, COALESCE(u.name, 'BPSCNotes') AS host_name,
-         COUNT(rm.user_id) FILTER (WHERE rm.left_at IS NULL) AS current_members,
-         (SELECT TRUE FROM room_members WHERE room_id=sr.id AND user_id=$${params.length+1} AND left_at IS NULL) AS is_member
-       FROM study_rooms sr LEFT JOIN users u ON sr.host_id=u.id
-       LEFT JOIN room_members rm ON sr.id=rm.room_id
-       WHERE ${conditions.join(' AND ')}
-       GROUP BY sr.id, u.name ORDER BY sr.created_at DESC`,
-      [...params, userId]
-    );
-    return successResponse({ rooms: rows });
-  }
-
-  async create(data: any, userId: string) {
-    if (!data.name || !data.subject) throw new BadRequestException('Name and subject required');
-    const joinCode = Math.random().toString(36).substring(2, 8).toUpperCase();
-    const result   = await this.db.query(
-      `INSERT INTO study_rooms (name, subject, host_id, max_members, is_private, join_code, exam_tags)
-       VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
-      [data.name, data.subject, userId, data.maxMembers||20, data.isPrivate||false, joinCode, data.examTags||[]]
-    );
-    const room = result[0];
-    await this.db.query(`INSERT INTO room_members (room_id, user_id) VALUES ($1,$2)`, [room.id, userId]);
-    await this.authService.awardCoins(userId, 'study_room', room.id);
-    return successResponse({ room }, 'Study room created!');
-  }
-
-  /**
-   * Admin creates a room — host_id is NULL because admins are not in the users table.
-   * The room is marked as featured and official so it shows prominently in the app.
-   */
-  async createByAdmin(data: any) {
-    if (!data.name || !data.subject) throw new BadRequestException('Name and subject required');
-    const joinCode = Math.random().toString(36).substring(2, 8).toUpperCase();
-    const result   = await this.db.query(
-      `INSERT INTO study_rooms
-         (name, subject, host_id, max_members, is_private, join_code, exam_tags, status)
-       VALUES ($1, $2, NULL, $3, $4, $5, $6, 'active')
-       RETURNING *`,
-      [
-        data.name,
-        data.subject,
-        data.maxMembers   || 100,
-        data.isPrivate    || false,
-        joinCode,
-        data.examTags     || [],
-      ]
-    );
-    return successResponse({ room: result[0] }, 'Study room created!');
-  }
-
-  async join(roomId: string, userId: string, joinCode?: string) {
-    const room = await this.db.query(`SELECT * FROM study_rooms WHERE id=$1 AND status='active'`, [roomId]);
-    if (!room.length) throw new NotFoundException('Room not found or ended');
-    const r = room[0];
-    if (r.is_private && r.join_code !== joinCode) throw new ForbiddenException('Invalid room code');
-    const memberCount = await this.db.query(`SELECT COUNT(*) FROM room_members WHERE room_id=$1 AND left_at IS NULL`, [roomId]);
-    if (parseInt(memberCount[0].count) >= r.max_members) throw new BadRequestException('Room is full');
-    await this.db.query(
-      `INSERT INTO room_members (room_id, user_id) VALUES ($1,$2) ON CONFLICT (room_id, user_id) DO UPDATE SET left_at=NULL, joined_at=NOW()`,
-      [roomId, userId]
-    );
-    await this.authService.awardCoins(userId, 'study_room', roomId);
-    return successResponse({ room: r }, 'Joined study room!');
-  }
-
-  async leave(roomId: string, userId: string) {
-    await this.db.query(`UPDATE room_members SET left_at=NOW() WHERE room_id=$1 AND user_id=$2`, [roomId, userId]);
-    return successResponse(null, 'Left the room');
-  }
-
-  async findAllAdmin() {
-    const rows = await this.db.query(
-      `SELECT sr.*, COALESCE(u.name, 'BPSCNotes') AS host_name,
-         COUNT(rm.user_id) FILTER (WHERE rm.left_at IS NULL) AS current_members
-       FROM study_rooms sr LEFT JOIN users u ON sr.host_id=u.id
-       LEFT JOIN room_members rm ON sr.id=rm.room_id
-       GROUP BY sr.id, u.name ORDER BY sr.created_at DESC`
-    );
-    return successResponse({ rooms: rows });
-  }
-
-  async endRoom(roomId: string) {
-    await this.db.query(`UPDATE study_rooms SET status='ended', ended_at=NOW(), updated_at=NOW() WHERE id=$1`, [roomId]);
-    return successResponse(null, 'Room ended');
-  }
-}
-
-@ApiTags('Study Rooms') @ApiBearerAuth() @UseGuards(JwtAuthGuard) @Controller('study-rooms')
-class StudyRoomsController {
-  constructor(private s: StudyRoomsService) {}
-  @Get()      findAll(@Query() q: any, @Req() r: any) { return this.s.findAll(q, r.user.id); }
-  @Post()     @HttpCode(201) create(@Body() dto: any, @Req() r: any) { return this.s.create(dto, r.user.id); }
-  @Post(':id/join')  @HttpCode(200) join(@Param('id', ParseUUIDPipe) id: string, @Req() r: any, @Body() b: any) { return this.s.join(id, r.user.id, b.joinCode); }
-  @Post(':id/leave') @HttpCode(200) leave(@Param('id', ParseUUIDPipe) id: string, @Req() r: any) { return this.s.leave(id, r.user.id); }
-}
-
-// @ApiTags('Admin — Study Rooms') @ApiBearerAuth()
-// @UseGuards(AdminJwtGuard, PermissionGuard) @Controller('admin/study-rooms')
-// class AdminStudyRoomsController {
-//   constructor(private s: StudyRoomsService) {}
-//   @Get()         @RequirePermission('study-rooms') findAll()  { return this.s.findAllAdmin(); }
-//   @Put(':id/end') @RequirePermission('study-rooms') end(@Param('id', ParseUUIDPipe) id: string) { return this.s.endRoom(id); }
-//   @Post()
-//   @RequirePermission('study-rooms')
-//   @HttpCode(201)
-//   create(@Body() dto: any, @Req() r: any) {
-//     return this.s.createByAdmin(dto);
-//   }
-// }
-
-@ApiTags('Admin — Study Rooms')
-@ApiBearerAuth()
-@UseGuards(AdminJwtGuard, PermissionGuard)
-@Controller('admin/study-rooms')
-class AdminStudyRoomsController {
-  constructor(private s: StudyRoomsService) {}
-
-  @Get()
-  @RequirePermission('study-rooms')
-  findAll() {
-    return this.s.findAllAdmin();
-  }
-
-  @Post()
-  @RequirePermission('study-rooms')
-  @HttpCode(201)
-  create(@Body() dto: any) {
-    return this.s.createByAdmin(dto);
-  }
-
-  @Put(':id/end')
-  @RequirePermission('study-rooms')
-  end(@Param('id', ParseUUIDPipe) id: string) {
-    return this.s.endRoom(id);
-  }
-}
-
-@Module({ imports:[AuthModule], controllers:[StudyRoomsController, AdminStudyRoomsController], providers:[StudyRoomsService] })
-export class StudyRoomsModule {}
-
-// ════════════════════════════════════════════════════════════
-// DAILY TARGETS SERVICE
-// Handles:
-//   GET  /users/daily-targets          — fetch today's targets
-//   POST /users/daily-targets          — create a custom target
-//   PATCH /users/daily-targets/:id/complete — mark complete/incomplete
-//   DELETE /users/daily-targets/:id    — delete a target
-//
-// Design decisions:
-//   1. Targets are per-user per-day (target_date = today by default)
-//   2. Uncompleted targets from previous days are automatically
-//      "carried forward" and shown alongside today's targets
-//   3. Creating a target awards coins via the existing coin system
-// ════════════════════════════════════════════════════════════
-@Injectable()
-class DailyTargetsService {
+class CurrentAffairsService {
   constructor(
     @InjectDataSource() private readonly db: DataSource,
     @Inject(CACHE_MANAGER) private readonly cache: Cache,
-    private readonly achievementsService: AchievementsService,
-    private readonly challengesService: WeeklyChallengesService,
-    private readonly authService: AuthService,
+  ) {}
+
+  async findAll(query: any, userId: string) {
+    const { page=1, limit=20, date, category, exam, important } = query;
+    const offset = (page-1)*limit;
+    const conditions = [`ca.status='published'`], params: any[] = [];
+    if (date)      { conditions.push(`ca.date=$${params.length+1}`); params.push(date); }
+    if (category)  { conditions.push(`ca.category=$${params.length+1}`); params.push(category); }
+    if (exam)      { conditions.push(`$${params.length+1}=ANY(ca.exam_tags)`); params.push(exam); }
+    if (important === 'true') conditions.push(`ca.is_important=TRUE`);
+    const where = conditions.join(' AND ');
+
+    const cacheKey = `affairs:${where}:${params.join(',')}:${page}:${limit}:${userId}`;
+    const cached   = await this.cache.get(cacheKey);
+    if (cached) return cached;
+
+    const [rows, countResult] = await Promise.all([
+      this.db.query(
+        `SELECT ca.id,ca.title,ca.summary,ca.category,ca.date,ca.is_important,ca.exam_tags,ca.tags,ca.view_count,ca.bookmark_count,
+           COALESCE(ca.read_time, 1) AS read_time,
+           (SELECT TRUE FROM affairs_bookmarks ab WHERE ab.user_id=$${params.length+1} AND ab.affair_id=ca.id) AS is_bookmarked,
+           (SELECT COUNT(*) FROM ca_mcqs m WHERE m.affair_id=ca.id)::int AS mcq_count
+         FROM current_affairs ca WHERE ${where}
+         ORDER BY ca.date DESC, ca.is_important DESC LIMIT $${params.length+2} OFFSET $${params.length+3}`,
+        [...params, userId, limit, offset]
+      ),
+      this.db.query(`SELECT COUNT(*) FROM current_affairs ca WHERE ${where}`, params),
+    ]);
+    const result = successResponse({ affairs: rows }, 'Success', paginationMeta(parseInt(countResult[0].count), page, limit));
+    await this.cache.set(cacheKey, result, 120);
+    return result;
+  }
+
+  async findOne(affairId: string, userId: string) {
+    const result = await this.db.query(
+      `SELECT ca.*, (SELECT TRUE FROM affairs_bookmarks WHERE user_id=$2 AND affair_id=ca.id) AS is_bookmarked
+       FROM current_affairs ca WHERE ca.id=$1 AND ca.status='published'`,
+      [affairId, userId]
+    );
+    if (!result.length) throw new NotFoundException('Article not found');
+    this.db.query(`UPDATE current_affairs SET view_count=view_count+1 WHERE id=$1`, [affairId]).catch(() => {});
+    return successResponse({ affair: result[0] });
+  }
+
+  async toggleBookmark(affairId: string, userId: string) {
+    const existing = await this.db.query(`SELECT user_id FROM affairs_bookmarks WHERE user_id=$1 AND affair_id=$2`, [userId, affairId]);
+    if (existing.length) {
+      await this.db.query(`DELETE FROM affairs_bookmarks WHERE user_id=$1 AND affair_id=$2`, [userId, affairId]);
+      await this.db.query(`UPDATE current_affairs SET bookmark_count=bookmark_count-1 WHERE id=$1`, [affairId]);
+      return successResponse({ isBookmarked: false });
+    }
+    await this.db.query(`INSERT INTO affairs_bookmarks VALUES ($1,$2)`, [userId, affairId]);
+    await this.db.query(`UPDATE current_affairs SET bookmark_count=bookmark_count+1 WHERE id=$1`, [affairId]);
+    return successResponse({ isBookmarked: true });
+  }
+
+  async findAllAdmin(query: any) {
+    // Note: current_affairs table has no 'type' column — type is stored in exam_tags[0]
+    const { page=1, limit=20, status, date, search, category, exam } = query;
+    const offset = (page-1)*limit;
+    const conditions = ['1=1'], params: any[] = [];
+    if (status)   { conditions.push(`ca.status=$${params.length+1}`);     params.push(status); }
+    if (date)     { conditions.push(`ca.date=$${params.length+1}`);        params.push(date); }
+    if (category) { conditions.push(`ca.category=$${params.length+1}`);    params.push(category); }
+    if (search)   { conditions.push(`ca.title ILIKE $${params.length+1}`); params.push(`%${search}%`); }
+    if (exam)     { conditions.push(`$${params.length+1}=ANY(ca.exam_tags)`); params.push(exam); }
+    const where = conditions.join(' AND ');
+    const [rows, countResult] = await Promise.all([
+      this.db.query(
+        `SELECT ca.id, ca.title, ca.summary, ca.full_content, ca.category,
+                ca.date, ca.is_important, ca.exam_tags, ca.tags, ca.status,
+                ca.view_count, ca.bookmark_count, ca.created_at, ca.read_time,
+                (SELECT COUNT(*) FROM ca_mcqs m WHERE m.affair_id=ca.id)::int AS mcq_count
+         FROM current_affairs ca
+         WHERE ${where}
+         ORDER BY ca.date DESC, ca.created_at DESC
+         LIMIT $${params.length+1} OFFSET $${params.length+2}`,
+        [...params, limit, offset]
+      ),
+      this.db.query(`SELECT COUNT(*) FROM current_affairs ca WHERE ${where}`, params),
+    ]);
+    return successResponse({ affairs: rows }, 'Success', paginationMeta(parseInt(countResult[0].count), page, limit));
+  }
+
+  async adminCreate(data: any, adminId: string) {
+    if (!data.title || !data.summary) throw new BadRequestException('Title and summary required');
+    // Store type (prelims/mains/both) as the first exam_tag for easy filtering
+    const examTagsWithType = data.examTags || [];
+    const typeTag = data.type || 'prelims';
+    // Always ensure the type is in exam_tags as first element
+    const mergedTags = [typeTag, ...examTagsWithType.filter((t: string) => !['prelims','mains','both'].includes(t))];
+    const result = await this.db.query(
+      `INSERT INTO current_affairs (title, summary, full_content, category, source, date, is_important, exam_tags, tags, status, author, read_time, created_by)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *`,
+      [data.title, data.summary, data.fullContent, data.category, data.source, data.date||new Date().toISOString().split('T')[0], data.isImportant||false, mergedTags, data.tags||[], data.status||'draft', data.author, data.readTime||1, adminId]
+    );
+    return successResponse({ affair: result[0] }, 'Article created — live in app ✅');
+  }
+
+  async adminUpdate(affairId: string, data: any) {
+    const fields: string[] = [], vals: any[] = [];
+    let i = 1;
+    const map: any = { title:'title', summary:'summary', fullContent:'full_content', category:'category', source:'source', date:'date', isImportant:'is_important', status:'status', readTime:'read_time' };
+    for (const [key, col] of Object.entries(map)) {
+      if (data[key] !== undefined) { fields.push(`${col}=$${i++}`); vals.push(data[key]); }
+    }
+    // Merge type into exam_tags so it persists
+    const examTagsToSave = data.examTags !== undefined ? data.examTags : undefined;
+    if (data.type || examTagsToSave !== undefined) {
+      const typeTag = data.type || 'prelims';
+      const otherTags = (examTagsToSave || []).filter((t: string) => !['prelims','mains','both'].includes(t));
+      fields.push(`exam_tags=$${i++}`); vals.push([typeTag, ...otherTags]);
+    }
+    if (data.tags)     { fields.push(`tags=$${i++}`); vals.push(data.tags); }
+    if (fields.length) { fields.push('updated_at=NOW()'); await this.db.query(`UPDATE current_affairs SET ${fields.join(',')} WHERE id=$${i}`, [...vals, affairId]); }
+    return successResponse(null, 'Article updated — live in app ✅');
+  }
+
+  async adminDelete(affairId: string) {
+    await this.db.query(`DELETE FROM current_affairs WHERE id=$1`, [affairId]);
+    return successResponse(null, 'Article deleted');
+  }
+
+  // ── CA MCQs ──────────────────────────────────────────────────────────
+  async ensureCaMcqTable() {
+    await this.db.query(`
+      CREATE TABLE IF NOT EXISTS ca_mcqs (
+        id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        affair_id    UUID NOT NULL REFERENCES current_affairs(id) ON DELETE CASCADE,
+        question     TEXT NOT NULL,
+        option_a     TEXT NOT NULL,
+        option_b     TEXT NOT NULL,
+        option_c     TEXT NOT NULL,
+        option_d     TEXT NOT NULL,
+        correct      CHAR(1) NOT NULL CHECK (correct IN ('a','b','c','d','e')),
+        option_e     TEXT NOT NULL DEFAULT '',
+        explanation  TEXT,
+        difficulty   VARCHAR(10) DEFAULT 'medium',
+        created_at   TIMESTAMPTZ DEFAULT NOW()
+      )
+    `);
+  }
+
+  async getMcqs(affairId: string) {
+    await this.ensureCaMcqTable();
+    const rows = await this.db.query(
+      `SELECT * FROM ca_mcqs WHERE affair_id=$1 ORDER BY created_at ASC`,
+      [affairId]
+    );
+    return successResponse({ mcqs: rows });
+  }
+
+  async logActivity(userId: string, activityType: string, durationSecs: number) {
+    // Ensure table exists — migration-safe
+    await this.db.query(`
+      CREATE TABLE IF NOT EXISTS ca_activity (
+        id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        user_id      UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        activity_type VARCHAR(50) NOT NULL DEFAULT 'ca_reading',
+        duration_secs INT NOT NULL DEFAULT 0,
+        created_at   TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `).catch(() => {});
+
+    const safeDuration = Math.max(0, Math.min(durationSecs, 3600)); // cap at 1hr
+    if (safeDuration < 10) return successResponse(null, 'Too short to log');
+
+    await this.db.query(
+      `INSERT INTO ca_activity (user_id, activity_type, duration_secs)
+       VALUES ($1, $2, $3)`,
+      [userId, activityType || 'ca_reading', safeDuration]
+    );
+
+    // Add to total_study_minutes on users table too
+    const durationMins = Math.ceil(safeDuration / 60);
+    await this.db.query(
+      `UPDATE users SET total_study_minutes = total_study_minutes + $1 WHERE id=$2`,
+      [durationMins, userId]
+    );
+    await this.cache.del(`user:${userId}`);
+
+    return successResponse({ logged: true, durationSecs: safeDuration });
+  }
+
+  async addMcq(affairId: string, data: any) {
+    await this.ensureCaMcqTable();
+    if (!data.question || !data.optionA || !data.optionB || !data.correct) {
+      throw new BadRequestException('question, optionA, optionB and correct are required');
+    }
+    const row = await this.db.query(
+      `INSERT INTO ca_mcqs (affair_id, question, option_a, option_b, option_c, option_d, option_e, correct, explanation)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
+      [affairId, data.question, data.optionA||'', data.optionB||'', data.optionC||'',
+       data.optionD||'', data.optionE||'',
+       data.correct.toLowerCase(), data.explanation || '']
+    );
+    return successResponse({ mcq: row[0] }, 'MCQ added ✅');
+  }
+
+  async updateMcq(mcqId: string, data: any) {
+    await this.ensureCaMcqTable();
+    const fields: string[] = [], vals: any[] = [];
+    let i = 1;
+    const map: any = { question:'question', optionA:'option_a', optionB:'option_b',
+      optionC:'option_c', optionD:'option_d', optionE:'option_e', correct:'correct',
+      explanation:'explanation' };
+    for (const [k, col] of Object.entries(map)) {
+      if (data[k] !== undefined) { fields.push(`${col}=$${i++}`); vals.push(data[k]); }
+    }
+    if (!fields.length) throw new BadRequestException('No fields to update');
+    await this.db.query(`UPDATE ca_mcqs SET ${fields.join(',')} WHERE id=$${i}`, [...vals, mcqId]);
+    return successResponse(null, 'MCQ updated ✅');
+  }
+
+  async deleteMcq(mcqId: string) {
+    await this.ensureCaMcqTable();
+    await this.db.query(`DELETE FROM ca_mcqs WHERE id=$1`, [mcqId]);
+    return successResponse(null, 'MCQ deleted');
+  }
+}
+
+@ApiTags('Current Affairs') @ApiBearerAuth() @UseGuards(JwtAuthGuard) @Controller('current-affairs')
+class CurrentAffairsController {
+  constructor(private s: CurrentAffairsService) {}
+  @Get() findAll(@Query() q: any, @Req() r: any) { return this.s.findAll(q, r.user.id); }
+  @Get(':id') findOne(@Param('id', ParseUUIDPipe) id: string, @Req() r: any) { return this.s.findOne(id, r.user.id); }
+  @Post(':id/bookmark') @HttpCode(200) toggleBookmark(@Param('id', ParseUUIDPipe) id: string, @Req() r: any) { return this.s.toggleBookmark(id, r.user.id); }
+  @Get(':id/mcqs') getMcqs(@Param('id', ParseUUIDPipe) id: string) { return this.s.getMcqs(id); }
+  @Post('log-activity') @HttpCode(200) logActivity(@Body() body: any, @Req() r: any) {
+    return this.s.logActivity(r.user.id, body.activityType, body.durationSecs);
+  }
+}
+
+@ApiTags('Admin — Current Affairs') @ApiBearerAuth() @Public()
+@UseGuards(AdminJwtGuard, PermissionGuard) @Controller('admin/current-affairs')
+class AdminCurrentAffairsController {
+  constructor(private s: CurrentAffairsService) {}
+  @Get() @RequirePermission('current-affairs') findAll(@Query() q: any) { return this.s.findAllAdmin(q); }
+  @Post() @RequirePermission('current-affairs') @HttpCode(201) create(@Body() dto: any, @Req() r: any) { return this.s.adminCreate(dto, r.admin.id); }
+  @Put(':id') @RequirePermission('current-affairs') update(@Param('id', ParseUUIDPipe) id: string, @Body() dto: any) { return this.s.adminUpdate(id, dto); }
+  @Delete(':id') @RequirePermission('current-affairs') remove(@Param('id', ParseUUIDPipe) id: string) { return this.s.adminDelete(id); }
+  // MCQ management
+  @Get(':id/mcqs') @RequirePermission('current-affairs') getMcqs(@Param('id', ParseUUIDPipe) id: string) { return this.s.getMcqs(id); }
+  @Post(':id/mcqs') @RequirePermission('current-affairs') @HttpCode(201) addMcq(@Param('id', ParseUUIDPipe) id: string, @Body() dto: any) { return this.s.addMcq(id, dto); }
+  @Put('mcqs/:mcqId') @RequirePermission('current-affairs') updateMcq(@Param('mcqId', ParseUUIDPipe) mcqId: string, @Body() dto: any) { return this.s.updateMcq(mcqId, dto); }
+  @Delete('mcqs/:mcqId') @RequirePermission('current-affairs') deleteMcq(@Param('mcqId', ParseUUIDPipe) mcqId: string) { return this.s.deleteMcq(mcqId); }
+}
+
+@Module({ controllers:[CurrentAffairsController, AdminCurrentAffairsController], providers:[CurrentAffairsService] })
+export class CurrentAffairsModule {}
+
+// ════════════════════════════════════════════════════════════
+// JOBS MODULE
+// ════════════════════════════════════════════════════════════
+@Injectable()
+class JobsService implements OnModuleInit {
+  constructor(
+    @InjectDataSource() private readonly db: DataSource,
+    @Inject(CACHE_MANAGER) private readonly cache: Cache,
+    @Inject('NOTIFICATION_SERVICE') @Optional() private readonly notifService?: { pushToAll: (title: string, body: string, data?: Record<string, string>) => Promise<void> },
+  ) {}
+
+  async onModuleInit() {
+    await this.ensureColumns();
+  }
+
+  async findAll(query: any, userId: string) {
+    const { page=1, limit=20, status='active', category, exam } = query;
+    const offset = (page-1)*limit;
+    const conditions = [`j.status=$1`], params: any[] = [status];
+    if (category) { conditions.push(`j.category=$${params.length+1}`); params.push(category); }
+    if (exam)     { conditions.push(`$${params.length+1}=ANY(j.exam_tags)`); params.push(exam); }
+    const where = conditions.join(' AND ');
+    const [rows, countResult] = await Promise.all([
+      this.db.query(
+        `SELECT
+           j.id, j.title,
+           j.organization                        AS department,
+           j.category,
+           j.total_posts,
+           COALESCE(j.qualification,'')          AS qualification,
+           COALESCE(j.age_limit,'')              AS age_limit,
+           COALESCE(j.description,'')            AS description,
+           COALESCE(j.brief_description,'')      AS brief_description,
+           COALESCE(j.pdf_url,'')                AS pdf_url,
+           COALESCE(j.application_link,'')       AS official_link,
+           j.status,
+           j.exam_tags,
+           j.notification_date::TEXT             AS notification_date,
+           j.notification_date::TEXT             AS apply_start_date,
+           j.last_date::TEXT                     AS apply_end_date,
+           j.exam_date::TEXT                     AS exam_date,
+           j.created_at,
+           -- Columns that don't exist in table yet — coalesce with safe defaults
+           FALSE                                               AS is_featured,
+FALSE                                               AS is_new,
+CASE WHEN j.last_date <= NOW() + INTERVAL '3 days'
+     THEN TRUE ELSE FALSE END                      AS is_urgent,
+'{}'::TEXT[]                                       AS nearby_districts,
+COALESCE(j.location,'')                                    AS location,
+COALESCE(j.salary_range,'')                                AS salary_range,
+           (SELECT TRUE FROM job_saves js
+            WHERE js.user_id=$${params.length+1} AND js.job_id=j.id) AS is_saved
+         FROM job_vacancies j WHERE ${where}
+         ORDER BY j.last_date ASC LIMIT $${params.length+2} OFFSET $${params.length+3}`,
+        [...params, userId, limit, offset]
+      ),
+      this.db.query(`SELECT COUNT(*) FROM job_vacancies j WHERE ${where}`, params),
+    ]);
+    return successResponse({ jobs: rows }, 'Success', paginationMeta(parseInt(countResult[0].count), page, limit));
+  }
+
+  /** Ensure location + salary_range + brief_description + pdf_url columns exist (run once on startup) */
+  async ensureColumns() {
+    await this.db.query(`
+      ALTER TABLE job_vacancies 
+        ADD COLUMN IF NOT EXISTS location          TEXT DEFAULT '',
+        ADD COLUMN IF NOT EXISTS salary_range      TEXT DEFAULT '',
+        ADD COLUMN IF NOT EXISTS brief_description TEXT DEFAULT '',
+        ADD COLUMN IF NOT EXISTS pdf_url           TEXT DEFAULT ''
+    `).catch(() => {});
+    await this.db.query(`
+      ALTER TABLE current_affairs
+        ADD COLUMN IF NOT EXISTS read_time INTEGER DEFAULT 1
+    `).catch(() => {});
+  }
+
+  async toggleSave(jobId: string, userId: string) {
+    const existing = await this.db.query(`SELECT user_id FROM job_saves WHERE user_id=$1 AND job_id=$2`, [userId, jobId]);
+    if (existing.length) {
+      await this.db.query(`DELETE FROM job_saves WHERE user_id=$1 AND job_id=$2`, [userId, jobId]);
+      await this.db.query(`UPDATE job_vacancies SET save_count=save_count-1 WHERE id=$1`, [jobId]);
+      return successResponse({ isSaved: false });
+    }
+    await this.db.query(`INSERT INTO job_saves VALUES ($1,$2)`, [userId, jobId]);
+    await this.db.query(`UPDATE job_vacancies SET save_count=save_count+1, view_count=view_count+1 WHERE id=$1`, [jobId]);
+    return successResponse({ isSaved: true });
+  }
+
+  async findAllAdmin(query: any) {
+    const { page=1, limit=20, search, category, status, sort } = query;
+    const orderBy = sort === 'last_date_asc' ? 'j.last_date ASC' : sort === 'last_date_desc' ? 'j.last_date DESC' : sort === 'created_asc' ? 'j.created_at ASC' : 'j.created_at DESC';
+    const offset = (page-1)*limit;
+    const conditions: string[] = ['1=1'];
+    const params: any[] = [];
+    if (search)   { conditions.push(`(j.title ILIKE $${params.length+1} OR j.organization ILIKE $${params.length+1})`); params.push(`%${search}%`); }
+    if (category) { conditions.push(`j.category=$${params.length+1}`); params.push(category); }
+    if (status)   { conditions.push(`j.status=$${params.length+1}`); params.push(status); }
+    const where = conditions.join(' AND ');
+    const [rows, countResult, govtCount, totalAllCount] = await Promise.all([
+      this.db.query(`SELECT j.*, a.name AS created_by_name FROM job_vacancies j LEFT JOIN admin_users a ON j.created_by=a.id WHERE ${where} ORDER BY ${orderBy} LIMIT $${params.length+1} OFFSET $${params.length+2}`, [...params, limit, offset]),
+      this.db.query(`SELECT COUNT(*) FROM job_vacancies j WHERE ${where}`, params),
+      this.db.query(`SELECT COUNT(*) FROM job_vacancies WHERE category NOT IN ('Private','Part-time')`),
+      this.db.query(`SELECT COUNT(*) FROM job_vacancies`),
+    ]);
+    return successResponse({
+      jobs: rows,
+      govtJobsTotal: Number(govtCount[0].count),
+      totalJobsAll: Number(totalAllCount[0].count),
+    }, 'Success', paginationMeta(parseInt(countResult[0].count), page, limit));
+  }
+
+  async adminCreate(data: any, adminId: string) {
+    if (!data.title || !data.organization || !data.lastDate) throw new BadRequestException('Title, organization and last date required');
+    const result = await this.db.query(
+      `INSERT INTO job_vacancies (title, organization, category, total_posts, notification_date, last_date, exam_date, age_limit, qualification, application_link, description, brief_description, pdf_url, location, salary_range, exam_tags, created_by)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) RETURNING *`,
+      [data.title, data.organization, data.category, data.totalPosts||data.totalVacancies||0, data.notificationDate||null, data.lastDate, data.examDate||null, data.ageLimit||'', data.qualification||'', data.applicationLink||data.applicationUrl||'', data.description||'', data.briefDescription||'', data.pdfUrl||'', data.location||'', data.salary||data.salaryRange||'', data.examTags||[], adminId]
+    );
+    // 🔔 New job alert to all users (only if notification service available)
+    this.notifService?.pushToAll(
+      `📋 New Job: ${data.title}`,
+      `${data.organization} · Last date: ${data.lastDate?.split('T')[0] || ''}`,
+      { type: 'new_job', screen: 'jobs' }
+    ).catch(() => {});
+
+    return successResponse({ job: result[0] }, 'Job vacancy created — live in app ✅');
+  }
+
+  async adminUpdate(jobId: string, data: any) {
+    const fields: string[] = [], vals: any[] = [];
+    let i = 1;
+    const map: any = {
+      title:'title', organization:'organization', category:'category',
+      totalPosts:'total_posts', totalVacancies:'total_posts',
+      lastDate:'last_date', examDate:'exam_date', status:'status',
+      applicationLink:'application_link', applicationUrl:'application_link',
+      description:'description', briefDescription:'brief_description', pdfUrl:'pdf_url',
+      location:'location', salary:'salary_range', salaryRange:'salary_range',
+      ageLimit:'age_limit', qualification:'qualification',
+    };
+    for (const [key, col] of Object.entries(map)) {
+      if (data[key] !== undefined) { fields.push(`${col}=$${i++}`); vals.push(data[key]); }
+    }
+    if (fields.length) { fields.push('updated_at=NOW()'); await this.db.query(`UPDATE job_vacancies SET ${fields.join(',')} WHERE id=$${i}`, [...vals, jobId]); }
+    return successResponse(null, 'Job updated — live in app ✅');
+  }
+
+  async adminDelete(jobId: string) {
+    await this.db.query(`DELETE FROM job_vacancies WHERE id=$1`, [jobId]);
+    return successResponse(null, 'Job vacancy deleted');
+  }
+}
+
+@ApiTags('Jobs') @ApiBearerAuth() @UseGuards(JwtAuthGuard) @Controller('jobs')
+class JobsController {
+  constructor(private s: JobsService) {}
+  @Get() findAll(@Query() q: any, @Req() r: any) { return this.s.findAll(q, r.user.id); }
+  @Post(':id/save') @HttpCode(200) toggleSave(@Param('id', ParseUUIDPipe) id: string, @Req() r: any) { return this.s.toggleSave(id, r.user.id); }
+}
+
+@ApiTags('Admin — Jobs') @ApiBearerAuth() @Public()
+@UseGuards(AdminJwtGuard, PermissionGuard) @Controller('admin/jobs')
+class AdminJobsController {
+  constructor(private s: JobsService) {}
+  @Get() @RequirePermission('jobs') findAll(@Query() q: any) { return this.s.findAllAdmin(q); }
+  @Post() @RequirePermission('jobs') @HttpCode(201) create(@Body() dto: any, @Req() r: any) { return this.s.adminCreate(dto, r.admin.id); }
+  @Put(':id') @RequirePermission('jobs') update(@Param('id', ParseUUIDPipe) id: string, @Body() dto: any) { return this.s.adminUpdate(id, dto); }
+  @Delete(':id') @RequirePermission('jobs') remove(@Param('id', ParseUUIDPipe) id: string) { return this.s.adminDelete(id); }
+}
+
+@Module({ controllers:[JobsController, AdminJobsController], providers:[JobsService] })
+export class JobsModule {}
+
+// ════════════════════════════════════════════════════════════
+// SUBSCRIPTIONS MODULE
+// ════════════════════════════════════════════════════════════
+@Injectable()
+class SubscriptionsService {
+  private readonly PLANS = {
+    monthly:   { price: 199, originalPrice: 299,  duration: '1 month',  bonusCoins: 20 },
+    quarterly: { price: 499, originalPrice: 899,  duration: '3 months', bonusCoins: 60 },
+    annual:    { price: 1499,originalPrice: 2999, duration: '12 months',bonusCoins: 200 },
+  };
+  constructor(
+    @InjectDataSource() private readonly db: DataSource,
+    private readonly config: ConfigService,
+    @Inject(CACHE_MANAGER) private readonly cache: Cache,
     @Inject('NOTIFICATION_SERVICE') @Optional() private readonly notifService?: {
       pushToUser: (userId: string, title: string, body: string, data?: Record<string, string>) => Promise<boolean>;
     },
   ) {}
 
-  // ── GET /users/daily-targets ──────────────────────────────
-  // Returns:
-  //   • today's targets  (target_date = CURRENT_DATE)
-  //   • carried-forward targets (incomplete targets from prev days)
-  async getTargets(userId: string) {
-    const today = new Date().toISOString().split('T')[0]; // YYYY-MM-DD
-
-    // Only run carry-forward if there are actually incomplete past targets.
-    // This pre-check avoids a write query on every Dashboard open when there
-    // is nothing to carry forward (the common case after the first load of day).
-    const [pendingCount] = await this.db.query(
-      `SELECT COUNT(*) FROM daily_targets
-       WHERE user_id = $1
-         AND is_completed = FALSE
-         AND is_carried_forward = FALSE
-         AND target_date >= ($2::date - INTERVAL '3 days')
-         AND target_date < $2::date`,
-      [userId, today]
-    );
-
-    if (parseInt(pendingCount.count) > 0) {
-      await this.db.query(
-        `INSERT INTO daily_targets
-           (user_id, title, subject, difficulty, time_slot, estimated_minutes,
-            total_questions, is_carried_forward, target_date, source_quiz_id, source_note_id)
-         SELECT
-           dt.user_id, dt.title, dt.subject, dt.difficulty, dt.time_slot,
-           dt.estimated_minutes, dt.total_questions,
-           TRUE, -- is_carried_forward
-           $2::date, -- today
-           dt.source_quiz_id, dt.source_note_id
-         FROM daily_targets dt
-         WHERE dt.user_id = $1
-           AND dt.is_completed = FALSE
-           AND dt.is_carried_forward = FALSE
-           AND dt.target_date >= ($2::date - INTERVAL '3 days')
-           AND dt.target_date < $2::date
-           AND NOT EXISTS (
-             SELECT 1 FROM daily_targets existing
-             WHERE existing.user_id = dt.user_id
-               AND existing.title = dt.title
-               AND existing.target_date = $2::date
-               AND existing.is_carried_forward = TRUE
-           )`,
-        [userId, today]
-      );
-    }
-
-    // Fetch today's targets + carried-forward ones
-    const rows = await this.db.query(
-      `SELECT
-         dt.id,
-         dt.title,
-         dt.subject,
-         dt.difficulty,
-         dt.time_slot,
-         dt.estimated_minutes,
-         dt.total_questions,
-         dt.attempted_questions,
-         dt.is_completed,
-         dt.is_carried_forward,
-         dt.target_date,
-         dt.completed_at,
-         q.title AS linked_quiz_title,
-         q.id    AS linked_quiz_id,
-         ln.title AS linked_note_title,
-         ln.id    AS linked_note_id
-       FROM daily_targets dt
-       LEFT JOIN quizzes q        ON dt.source_quiz_id = q.id
-       LEFT JOIN library_notes ln ON dt.source_note_id = ln.id
-       WHERE dt.user_id = $1
-         AND dt.target_date = $2::date
-       ORDER BY
-         dt.is_completed ASC,          -- incomplete first
-         dt.is_carried_forward DESC,   -- carried forward before today's
-         CASE dt.time_slot
-           WHEN 'morning'   THEN 1
-           WHEN 'afternoon' THEN 2
-           WHEN 'night'     THEN 3
-         END,
-         dt.created_at ASC`,
-      [userId, today]
-    );
-
-    const completed = rows.filter((r: any) => r.is_completed).length;
-    const total     = rows.length;
-
+  async getPlans() {
     return successResponse({
-      targets:   rows,
-      summary: {
-        total,
-        completed,
-        pending:          total - completed,
-        completionPct:    total > 0 ? Math.round((completed / total) * 100) : 0,
-        coinsAvailable:   total - completed,  // 1 coin per completed target
-      },
+      plans: [
+        { id:'monthly',   name:'Monthly',   price:199, originalPrice:299,  duration:'1 Month',   billingCycle:'Billed monthly',  bonusCoins:20,  savings:100 },
+        { id:'quarterly', name:'Quarterly', price:499, originalPrice:899,  duration:'3 Months',  billingCycle:'₹166/month',      bonusCoins:60,  savings:400, isPopular:true },
+        { id:'annual',    name:'Annual',    price:1499,originalPrice:2999, duration:'12 Months', billingCycle:'₹125/month',      bonusCoins:200, savings:1500 },
+      ],
+      coinValueInr:        parseFloat(this.config.get('business.coinValueInr')),
+      maxCoinDiscountSub:  this.config.get('business.maxCoinDiscountSub'),
+      maxCoinDiscountCourse: this.config.get('business.maxCoinDiscountCourse'),
     });
   }
 
-  // ── POST /users/daily-targets ─────────────────────────────
-  // Create one or more custom targets for today.
-  // Body: { titles: string[] }  OR  { title: string, subject?, ... }
-  async createTargets(userId: string, data: any) {
-    const today = new Date().toISOString().split('T')[0];
+  async initiate(userId: string, data: any) {
+    const plan = this.PLANS[data.plan];
+    if (!plan) throw new BadRequestException('Invalid plan');
+    const { price } = plan;
+    const coinValue    = parseFloat(this.config.get('business.coinValueInr'));
+    const maxCoinPct   = parseInt(this.config.get('business.maxCoinDiscountSub'));
+    const userCoins    = (await this.db.query(`SELECT coins FROM users WHERE id=$1`, [userId]))[0]?.coins || 0;
+    const maxCoinDisc  = Math.floor(price * maxCoinPct / 100);
+    const coinsToUse   = Math.min(data.coinsToUse || 0, userCoins, Math.floor(maxCoinDisc / coinValue));
+    const coinDiscount = Math.floor(coinsToUse * coinValue);
 
-    // Support both single object and batch array
-    const inputs: any[] = Array.isArray(data.titles)
-      ? data.titles.map((t: string) => ({ title: t }))
-      : [data];
-
-    if (!inputs.length || !inputs[0].title) {
-      throw new BadRequestException('At least one target title is required');
-    }
-
-    // Max 10 targets per day
-    const existing = await this.db.query(
-      `SELECT COUNT(*) FROM daily_targets WHERE user_id=$1 AND target_date=$2::date`,
-      [userId, today]
-    );
-    const currentCount = parseInt(existing[0].count);
-    if (currentCount + inputs.length > 10) {
-      throw new BadRequestException(
-        `Cannot add ${inputs.length} target(s). Maximum 10 per day (${currentCount} already exist).`
+    let couponDiscount = 0, validCoupon: any = null;
+    if (data.couponCode) {
+      const couponResult = await this.db.query(
+        `SELECT * FROM coupons WHERE code=$1 AND is_active=TRUE AND (expires_at IS NULL OR expires_at>NOW()) AND (max_uses IS NULL OR used_count<max_uses) AND applies_to IN ('subscription','both')`,
+        [data.couponCode.toUpperCase()]
       );
-    }
-
-    const created: any[] = [];
-    for (const input of inputs) {
-      if (!input.title?.trim()) continue;
-
-      const result = await this.db.query(
-        `INSERT INTO daily_targets
-           (user_id, title, subject, difficulty, time_slot, estimated_minutes,
-            total_questions, target_date, source_quiz_id, source_note_id)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8::date, $9, $10)
-         RETURNING *`,
-        [
-          userId,
-          input.title.trim(),
-          input.subject     || 'General',
-          input.difficulty  || 'medium',
-          input.timeSlot    || 'morning',
-          input.estimatedMinutes || 25,
-          input.totalQuestions   || 10,
-          today,
-          input.sourceQuizId     || null,
-          input.sourceNoteId     || null,
-        ]
-      );
-      created.push(result[0]);
-    }
-
-    if (!created.length) throw new BadRequestException('No valid targets to create');
-
-    // Award coin for creating a plan (once per day)
-    const todayCreations = await this.db.query(
-      `SELECT COUNT(*) FROM coin_transactions
-       WHERE user_id=$1 AND action='daily_target_create' AND created_at::date=CURRENT_DATE`,
-      [userId]
-    );
-    if (parseInt(todayCreations[0].count) === 0) {
-      // Give 2 coins for creating a plan today (uses existing coin_rules system)
-      const rule = await this.db.query(
-        `SELECT coins_awarded FROM coin_rules WHERE action='daily_target_create' AND is_active=TRUE`
-      );
-      if (rule.length) {
-        const coins = rule[0].coins_awarded;
-        const bal   = (await this.db.query(`UPDATE users SET coins=coins+$1 WHERE id=$2 RETURNING coins`, [coins, userId]))[0].coins;
-        await this.db.query(
-          `INSERT INTO coin_transactions (user_id,type,amount,description,action,balance)
-           VALUES ($1,'earned',$2,'Daily target plan created','daily_target_create',$3)`,
-          [userId, coins, bal]
-        );
+      if (couponResult.length) {
+        validCoupon = couponResult[0];
+        couponDiscount = validCoupon.type === 'flat' ? Math.min(validCoupon.value, price) : Math.floor(price * validCoupon.value / 100);
       }
     }
 
-    return successResponse(
-      { targets: created },
-      `${created.length} target${created.length > 1 ? 's' : ''} created successfully!`
+    const finalAmount = Math.max(1, price - coinDiscount - couponDiscount);
+    const subResult = await this.db.query(
+      `INSERT INTO subscriptions (user_id, plan, amount, original_amount, coins_used, coin_discount, coupon_code, coupon_discount, final_amount, payment_status, status)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'pending','pending') RETURNING id`,
+      [userId, data.plan, price, price, coinsToUse, coinDiscount, validCoupon?.code||null, couponDiscount, finalAmount]
     );
-  }
+    const subscriptionId = subResult[0].id;
 
-  // ── PATCH /users/daily-targets/:id/complete ───────────────
-  // Toggle complete/incomplete and award coins on first completion
-  async toggleComplete(targetId: string, userId: string) {
-    const rows = await this.db.query(
-      `SELECT * FROM daily_targets WHERE id=$1 AND user_id=$2`,
-      [targetId, userId]
-    );
-    if (!rows.length) throw new NotFoundException('Target not found');
-
-    const target     = rows[0];
-    const nowComplete = !target.is_completed;
-
-    await this.db.query(
-      `UPDATE daily_targets
-       SET is_completed=$1, completed_at=$2, attempted_questions=$3, updated_at=NOW()
-       WHERE id=$4 AND user_id=$5`,
-      [
-        nowComplete,
-        nowComplete ? new Date() : null,
-        nowComplete ? target.total_questions : 0,
-        targetId,
-        userId,
-      ]
-    );
-
-    // ── Trigger achievements + challenge progress on completion ──
-    if (nowComplete) {
-      // Fire-and-forget so UI isn't blocked by achievement checks
-      Promise.all([
-        this.achievementsService
-          .checkAndAward(userId, 'goal_complete')
-          .catch(e => console.error('achievement check failed:', e.message)),
-        this.challengesService
-          .updateProgress(userId, 'goal_complete', 1)
-          .catch(e => console.error('challenge update failed:', e.message)),
-      ]);
-    }
-    
-
-    // Award coin only on first-ever completion of this specific target
-    // If user uncompletes and re-completes, no extra coin awarded
-    let coinsEarned = 0;
-    if (nowComplete) {
-      const alreadyAwarded = await this.db.query(
-        `SELECT id FROM coin_transactions
-         WHERE user_id=$1 AND action='target_complete' AND ref_id=$2
-         LIMIT 1`,
-        [userId, targetId]
-      );
-      if (!alreadyAwarded.length) {
-        coinsEarned = await this.authService.awardCoins(userId, 'target_complete', targetId);
-        // Only add study minutes on first completion
-        await this.db.query(
-          `UPDATE users SET total_study_minutes=total_study_minutes+$1 WHERE id=$2`,
-          [target.estimated_minutes, userId]
-        );
-      }
-    }
-
-    // Invalidate user cache so stats refresh
-    await this.cache.del(`user:${userId}`);
-    await this.cache.del(`profile:${userId}`);
-
-    return successResponse(
-      {
-        id:          targetId,
-        isCompleted: nowComplete,
-        coinsEarned,
-      },
-      nowComplete ? `Target completed! +${coinsEarned} coins 🎉` : 'Target marked as incomplete'
-    );
-
-    // 🔔 Target complete push
-    if (nowComplete && coinsEarned > 0) {
-      this.notifService.pushToUser(
-        userId,
-        '✅ Daily Target Done!',
-        `Keep it up! You earned 🪙 +${coinsEarned} coins.`,
-        { type: 'target_complete', screen: 'daily_targets' }
-      ).catch(() => {});
-    }
-  }
-
-  // ── DELETE /users/daily-targets/:id ──────────────────────
-  async deleteTarget(targetId: string, userId: string) {
-    const rows = await this.db.query(
-      `SELECT id, title, is_completed, is_carried_forward, target_date
-       FROM daily_targets WHERE id=$1 AND user_id=$2`,
-      [targetId, userId]
-    );
-    if (!rows.length) throw new NotFoundException('Target not found');
-
-    const target      = rows[0];
-    const wasCompleted = target.is_completed;
-
-    // ── KEY FIX: if this is a carried-forward copy, also delete ALL
-    // source originals (same title, same user, not carried forward, incomplete)
-    // so getTargets() cannot re-create this target on next load.
-    if (target.is_carried_forward) {
-      await this.db.query(
-        `DELETE FROM daily_targets
-         WHERE user_id=$1
-           AND title=$2
-           AND is_carried_forward = FALSE
-           AND is_completed = FALSE`,
-        [userId, target.title]
-      );
-      // Also delete any other carried-forward copies of the same title today
-      await this.db.query(
-        `DELETE FROM daily_targets
-         WHERE user_id=$1
-           AND title=$2
-           AND is_carried_forward = TRUE
-           AND id != $3`,
-        [userId, target.title, targetId]
-      );
-    }
-
-    // If completed, debit the exact coins awarded for THIS specific target
-    if (wasCompleted) {
+    // Create Razorpay order (amount in paise)
+    let razorpayOrder: any = null;
+    let activeRpKey = '';   // track whichever key we actually used for the return
+    if (finalAmount > 0) {
       try {
-        // Look up by ref_id which is set to targetId when coins are awarded
-        const coinTx = await this.db.query(
-          `SELECT id, amount FROM coin_transactions
-           WHERE user_id=$1 AND action='target_complete' AND ref_id=$2
-           LIMIT 1`,
-          [userId, targetId]
-        );
-        if (coinTx.length) {
-          const amount = Math.abs(Number(coinTx[0].amount));
-          if (amount > 0) {
-            await this.db.query(
-              `UPDATE users SET coins = GREATEST(0, coins - $1) WHERE id=$2`,
-              [amount, userId]
-            );
-            const bal = (await this.db.query(`SELECT coins FROM users WHERE id=$1`, [userId]))[0]?.coins ?? 0;
-            await this.db.query(
-              `INSERT INTO coin_transactions (user_id, type, amount, description, action, balance)
-               VALUES ($1, 'spent', $2, 'Target deleted — coins reversed', 'target_deleted', $3)`,
-              [userId, -amount, bal]
-            ).catch(() => {});
+        // Priority: env vars → payment_settings DB → warn
+        let rpKey    = process.env.RAZORPAY_KEY_ID    || '';
+        let rpSecret = process.env.RAZORPAY_KEY_SECRET || '';
+        if (!rpKey || !rpSecret) {
+          const rows = await this.db.query(
+            `SELECT key, value FROM payment_settings WHERE key IN ('razorpay_key_id','razorpay_key_secret') AND value IS NOT NULL AND value != ''`
+          ).catch(() => []);
+          for (const r of rows) {
+            if (r.key === 'razorpay_key_id')     rpKey    = r.value;
+            if (r.key === 'razorpay_key_secret')  rpSecret = r.value;
           }
         }
-      } catch (_) {
-        // Coin debit failure must NOT block the delete
+        if (!rpKey || !rpSecret) {
+          console.warn('Razorpay keys not configured — razorpayOrderId will be null');
+        } else {
+          activeRpKey = rpKey;
+          const rpResponse = await fetch('https://api.razorpay.com/v1/orders', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': 'Basic ' + Buffer.from(`${rpKey}:${rpSecret}`).toString('base64'),
+            },
+            body: JSON.stringify({
+              amount:   finalAmount * 100,
+              currency: 'INR',
+              receipt:  `sub_${subscriptionId.substring(0,8)}`,
+              notes:    { subscriptionId, userId, plan: data.plan },
+            }),
+          });
+          razorpayOrder = await rpResponse.json();
+          if (razorpayOrder.id) {
+            await this.db.query(
+              `UPDATE subscriptions SET razorpay_order_id=$1 WHERE id=$2`,
+              [razorpayOrder.id, subscriptionId]
+            );
+          } else {
+            // Log Razorpay error for debugging (e.g. bad credentials)
+            console.error('Razorpay order creation error:', JSON.stringify(razorpayOrder));
+          }
+        }
+      } catch (err: any) {
+        console.error('Razorpay order creation failed:', err.message);
       }
     }
 
-    // Delete the target itself
-    await this.db.query(
-      `DELETE FROM daily_targets WHERE id=$1 AND user_id=$2`,
-      [targetId, userId]
-    );
-
-    return successResponse(
-      { coinsDebited: wasCompleted },
-      wasCompleted ? 'Target deleted — coins reversed' : 'Target deleted'
-    );
-  }
-
-  async updateTarget(targetId: string, userId: string, title: string, subject: string) {
-    const rows = await this.db.query(
-      `SELECT id FROM daily_targets WHERE id=$1 AND user_id=$2`,
-      [targetId, userId]
-    );
-    if (!rows.length) throw new NotFoundException('Target not found');
-
-    await this.db.query(
-      `UPDATE daily_targets SET title=$1, subject=$2, updated_at=NOW() WHERE id=$3 AND user_id=$4`,
-      [title.trim(), subject || 'General Studies', targetId, userId]
-    );
-
-    return this.getTargets(userId);
-  }
-}
-
-// ── Controller ─────────────────────────────────────────────
-@ApiTags('Daily Targets')
-@ApiBearerAuth()
-@UseGuards(JwtAuthGuard)
-@Controller('users/daily-targets')
-class DailyTargetsController {
-  constructor(private s: DailyTargetsService) {}
-
-  /** GET /api/v1/users/daily-targets — fetch today's plan */
-  @Get()
-  getTargets(@Req() r: any) {
-    return this.s.getTargets(r.user.id);
-  }
-
-  /**
-   * POST /api/v1/users/daily-targets
-   * Body: { title, subject?, difficulty?, timeSlot?, estimatedMinutes? }
-   *    OR { titles: ['Title 1', 'Title 2', ...] }   ← batch
-   */
-  @Post()
-  @HttpCode(HttpStatus.CREATED)
-  createTargets(@Body() dto: any, @Req() r: any) {
-    return this.s.createTargets(r.user.id, dto);
-  }
-
-  /**
-   * PATCH /api/v1/users/daily-targets/:id/complete
-   * Toggles completion status and awards coins
-   */
-  @Patch(':id/complete')
-  @HttpCode(HttpStatus.OK)
-  toggleComplete(
-    @Param('id', ParseUUIDPipe) id: string,
-    @Req() r: any,
-  ) {
-    return this.s.toggleComplete(id, r.user.id);
-  }
-
-  /**
-   * DELETE /api/v1/users/daily-targets/:id
-   * Remove a pending (incomplete) target
-   */
-  @Delete(':id')
-  @HttpCode(HttpStatus.OK)
-  deleteTarget(
-    @Param('id', ParseUUIDPipe) id: string,
-    @Req() r: any,
-  ) {
-    return this.s.deleteTarget(id, r.user.id);
-  }
-
-  /**
-   * PATCH /api/v1/users/daily-targets/:id
-   * Update title and subject of a target
-   */
-  @Patch(':id')
-  @HttpCode(HttpStatus.OK)
-  updateTarget(
-    @Param('id', ParseUUIDPipe) id: string,
-    @Body() dto: any,
-    @Req() r: any,
-  ) {
-    return this.s.updateTarget(id, r.user.id, dto.title, dto.subject);
-  }
-}
-
-@Module({
-  imports: [AuthModule, NotificationsModule],
-  controllers: [DailyTargetsController],
-  providers: [
-    DailyTargetsService,
-    AchievementsService,
-    WeeklyChallengesService,
-    NotificationService,
-  ],
-})
-
-export class DailyTargetsModule {}
-
-
-// ════════════════════════════════════════════════════════════
-// USERS MODULE  (profile, stats, leaderboard, live classes, certs, downloads)
-// ════════════════════════════════════════════════════════════
-@Injectable()
-class UsersService {
-  constructor(
-    @InjectDataSource() private readonly db: DataSource,
-    @Inject(CACHE_MANAGER) private readonly cache: Cache,
-    private readonly config: ConfigService,
-  ) {}
-
-  async getProfile(userId: string) {
-    const cacheKey = `profile:${userId}`;
-    const cached   = await this.cache.get(cacheKey);
-    if (cached) return cached;
-
-    const result = await this.db.query(
-      `SELECT u.id,u.name,u.email,u.mobile,u.avatar_url,u.bio,u.district,u.state,
-              u.primary_exam,u.secondary_exam,u.prep_level,u.target_year,
-              u.streak,u.longest_streak,u.coins,u.total_coins_earned,
-              u.total_study_minutes,u.accuracy,u.quizzes_attempted,
-              u.rank,u.is_verified,u.referral_code,u.created_at AS joined_date,
-              u.notification_enabled,
-              (SELECT COUNT(*) FROM user_enrollments WHERE user_id=u.id) AS enrolled_courses,
-              (SELECT COUNT(*) FROM certificates WHERE user_id=u.id) AS certificates_count,
-              (SELECT COUNT(*) FROM subscriptions WHERE user_id=u.id AND status='active' AND ends_at>NOW())>0 AS is_subscribed,
-              (SELECT plan FROM subscriptions WHERE user_id=u.id AND status='active' AND ends_at>NOW() LIMIT 1) AS current_plan
-       FROM users u WHERE u.id=$1 AND u.deleted_at IS NULL`,
-      [userId]
-    );
-    if (!result.length) throw new NotFoundException('User not found');
-    const data = successResponse({ user: result[0] });
-    await this.cache.set(cacheKey, data, 60);
-    return data;
-  }
-
-  async updateProfile(userId: string, data: any) {
-    const fields: string[] = [], vals: any[] = [];
-    let i = 1;
-    const allowed = ['name','bio','email','district','state','avatar_url'];
-    for (const key of allowed) {
-      if (data[key] !== undefined) { fields.push(`${key}=$${i++}`); vals.push(data[key]); }
-    }
-    if (fields.length) { fields.push('updated_at=NOW()'); await this.db.query(`UPDATE users SET ${fields.join(',')} WHERE id=$${i}`, [...vals, userId]); }
-    await this.cache.del(`profile:${userId}`);
-    await this.cache.del(`user:${userId}`);
-    return successResponse(null, 'Profile updated');
-  }
-
-  async uploadAvatar(userId: string, file: Express.Multer.File) {
-    if (!file) throw new Error('No file uploaded');
-    const path     = require('path');
-    const fs       = require('fs');
-    const uploadDir = process.env.UPLOAD_DIR ?? path.join(process.cwd(), 'uploads');
-    const avatarDir = path.join(uploadDir, 'avatars');
-    fs.mkdirSync(avatarDir, { recursive: true });
-    const ext      = path.extname(file.originalname) || '.jpg';
-    const filename = `avatar_${userId}_${Date.now()}${ext}`;
-    const destPath = path.join(avatarDir, filename);
-    fs.copyFileSync(file.path, destPath);
-    try { fs.unlinkSync(file.path); } catch (_) {}   // clean up temp, non-blocking
-    const baseUrl  = process.env.APP_URL ?? 'https://api.bpscnotes.in';
-    const url      = `${baseUrl}/uploads/avatars/${filename}`;
-    await this.db.query(`UPDATE users SET avatar_url=$1, updated_at=NOW() WHERE id=$2`, [url, userId]);
-    await this.cache.del(`profile:${userId}`);
-    await this.cache.del(`user:${userId}`);
-    return successResponse({ url }, 'Avatar updated');
-  }
-
-  async updateExamTarget(userId: string, data: any) {
-    await this.db.query(
-      `UPDATE users SET primary_exam=$1, secondary_exam=$2, prep_level=$3, target_year=$4, updated_at=NOW() WHERE id=$5`,
-      [data.primaryExam, data.secondaryExam||null, data.prepLevel||'beginner', data.targetYear||null, userId]
-    );
-    await this.cache.del(`profile:${userId}`);
-    await this.cache.del(`user:${userId}`);
-    return successResponse(null, 'Exam target updated');
-  }
-
-  async getStats(userId: string) {
-    // Recreate ca_activity with correct schema if columns are wrong
-    // DROP + CREATE is safe — we lose no meaningful data (it's just time tracking)
-    await this.db.query(`
-      DO $$
-      BEGIN
-        -- Check if created_at column exists; if not, recreate the table
-        IF NOT EXISTS (
-          SELECT 1 FROM information_schema.columns
-          WHERE table_name = 'ca_activity' AND column_name = 'created_at'
-        ) THEN
-          DROP TABLE IF EXISTS ca_activity;
-        END IF;
-      END$$;
-
-      CREATE TABLE IF NOT EXISTS ca_activity (
-        id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-        user_id       UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-        activity_type VARCHAR(50) NOT NULL DEFAULT 'ca_reading',
-        duration_secs INT NOT NULL DEFAULT 0,
-        created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      );
-    `).catch(() => {});
-
-    const [userRow, subjectStats, recentQuizzes, weeklyActivity] = await Promise.all([
-      // Fetch user-level stats so Android header (rank/accuracy/study) always has data
-      this.db.query(
-        `SELECT streak, accuracy, rank, total_study_minutes, quizzes_attempted FROM users WHERE id=$1`,
-        [userId]
-      ),
-      this.db.query(
-        `-- FIX: qa.score is already a percentage (0-100), not raw count
-         -- Do NOT divide by total_questions again
-         SELECT q.subject,
-                COUNT(*) AS attempts,
-                ROUND(
-                  AVG(
-                    CASE
-                      WHEN qa.score IS NOT NULL
-                           AND qa.score <= 100
-                      THEN qa.score::decimal
-                      ELSE NULL
-                    END
-                  ),
-                  1
-                ) AS avg_accuracy
-         FROM quiz_attempts qa
-         JOIN quizzes q ON qa.quiz_id = q.id
-         WHERE qa.user_id = $1
-           AND qa.total_questions > 0
-         GROUP BY q.subject
-         ORDER BY attempts DESC`,
-        [userId]
-      ),
-      this.db.query(
-        `SELECT qa.score, qa.total_questions, qa.attempted_at, qa.is_passed, q.title, q.type, q.subject
-         FROM quiz_attempts qa JOIN quizzes q ON qa.quiz_id=q.id
-         WHERE qa.user_id=$1 ORDER BY qa.attempted_at DESC LIMIT 10`,
-        [userId]
-      ),
-      this.db.query(
-        `-- FIX: 28-day activity for heatmap
-         -- Combines quiz attempts + study session minutes + CA reading time per day
-      
-         WITH days AS (
-           SELECT generate_series(
-             CURRENT_DATE - INTERVAL '27 days',
-             CURRENT_DATE,
-             INTERVAL '1 day'
-           )::DATE AS day
-         ),
-      
-         quiz_activity AS (
-           -- Use actual time_taken_secs recorded when the user submitted the quiz.
-           -- Convert seconds → minutes, cap each attempt at 30 min so retakes
-           -- don't inflate the count (a 4-second speed-run counts as <1 min, not 5).
-           SELECT
-             DATE(qa.attempted_at) AS date,
-             SUM(LEAST(CEIL(qa.time_taken_secs::numeric / 60), 30))::int AS study_mins
-           FROM quiz_attempts qa
-           WHERE qa.user_id = $1
-             AND qa.attempted_at >= NOW() - INTERVAL '28 days'
-           GROUP BY DATE(qa.attempted_at)
-         ),
-      
-         session_activity AS (
-           SELECT
-             DATE(ss.started_at) AS date,
-             COALESCE(SUM(ss.duration_minutes), 0) AS study_mins
-           FROM study_sessions ss
-           WHERE ss.user_id = $1
-             AND ss.started_at >= NOW() - INTERVAL '28 days'
-           GROUP BY DATE(ss.started_at)
-         ),
-
-         ca_reading_activity AS (
-           -- Current affairs reading + MCQ time (logged by Android TrackStudyTime)
-           SELECT
-             DATE(ca.created_at) AS date,
-             CEIL(SUM(ca.duration_secs)::numeric / 60)::int AS study_mins
-           FROM ca_activity ca
-           WHERE ca.user_id = $1
-             AND ca.created_at >= NOW() - INTERVAL '28 days'
-           GROUP BY DATE(ca.created_at)
-         ),
-      
-         combined AS (
-           SELECT
-             date,
-             SUM(study_mins) AS study_mins
-           FROM (
-             SELECT date, study_mins FROM quiz_activity
-             UNION ALL
-             SELECT date, study_mins FROM session_activity
-             UNION ALL
-             SELECT date, study_mins FROM ca_reading_activity
-           ) src
-           GROUP BY date
-         )
-      
-         SELECT
-           d.day AS date,
-           COALESCE(c.study_mins, 0) AS activity
-         FROM days d
-         LEFT JOIN combined c ON c.date = d.day
-         ORDER BY d.day ASC`,
-        [userId]
-      ),
-    ]);
-
-    const u = userRow[0] || {};
     return successResponse({
-      // ── Top-level user stats (for Dashboard header) ──────────
-      // These are the fields UserStatsData DTO expects
-      accuracy:           parseFloat(u.accuracy) || 0,
-      current_streak:     u.streak || 0,
-      total_study_minutes: u.total_study_minutes || 0,
-      quizzes_attempted:  u.quizzes_attempted || 0,
-      // FIX: compute live rank — u.rank in DB is null until batch job runs
-      rank: u.rank || await this.db.query(
-        `SELECT row_num FROM (
-           SELECT id, ROW_NUMBER() OVER (ORDER BY coins DESC, CAST(accuracy AS FLOAT) DESC, streak DESC) AS row_num
-           FROM users WHERE status='active' AND deleted_at IS NULL
-         ) r WHERE r.id = $1`,
-        [userId]
-      ).then((r: any[]) => r[0]?.row_num || null).catch(() => null),
-      // ── Activity data ─────────────────────────────────────────
-      weekly_activity:    weeklyActivity,       // snake_case matches @SerializedName("weekly_activity")
-      subjectAccuracy:    subjectStats,
-      recentQuizzes,
+      subscriptionId,
+      razorpayOrderId: razorpayOrder?.id || null,
+      razorpayKeyId:   activeRpKey || null,   // return the key actually used, not empty env var
+      breakdown: { baseAmount: price, coinDiscount, couponDiscount, finalAmount, coinsUsed: coinsToUse, couponCode: validCoupon?.code }
     });
   }
 
-  async getLeaderboard(query: any, userId: string) {
-    const { exam } = query;
-    let userQuery = `SELECT id, name, avatar_url, primary_exam, streak, accuracy, rank, coins, total_study_minutes FROM users WHERE status='active' AND deleted_at IS NULL`;
-    const params: any[] = [];
-    if (exam) { userQuery += ` AND primary_exam=$1`; params.push(exam); }
-    userQuery += ` ORDER BY rank ASC NULLS LAST, coins DESC LIMIT 100`;
-    const [rows, myRank] = await Promise.all([
-      this.db.query(userQuery, params),
-      this.db.query(`SELECT rank, coins, streak, accuracy FROM users WHERE id=$1`, [userId]),
-    ]);
-    return successResponse({ leaderboard: rows, myRank: myRank[0] });
-  }
+  async confirm(subId: string, userId: string, data: any) {
+    const subResult = await this.db.query(`SELECT * FROM subscriptions WHERE id=$1 AND user_id=$2 AND payment_status='pending'`, [subId, userId]);
+    if (!subResult.length) throw new NotFoundException('Subscription not found or already processed');
+    const sub = subResult[0];
+    const plan = this.PLANS[sub.plan];
+    if (!plan) throw new BadRequestException('Invalid plan');
 
-  async getMyEnrollments(userId: string) {
-    const rows = await this.db.query(
-      `SELECT ue.*, c.title, c.instructor, c.thumbnail_url, c.total_lessons, c.subject, c.exam_tags
-       FROM user_enrollments ue JOIN courses c ON ue.course_id=c.id
-       WHERE ue.user_id=$1 ORDER BY ue.enrolled_at DESC`,
-      [userId]
-    );
-    return successResponse({ enrollments: rows });
-  }
+    // Validate no duplicate transaction
+    const dupCheck = await this.db.query(`SELECT id FROM subscriptions WHERE razorpay_payment_id=$1`, [data.transactionId]);
+    if (dupCheck.length) throw new ConflictException('Transaction already processed');
 
-  async getDownloads(userId: string) {
-    const rows = await this.db.query(
-      `SELECT ln.id, ln.title, ln.subject, ln.type, ln.file_url, ln.file_size_mb, ln.pages, nd.downloaded_at
-       FROM note_downloads nd JOIN library_notes ln ON nd.note_id=ln.id
-       WHERE nd.user_id=$1 ORDER BY nd.downloaded_at DESC`,
-      [userId]
-    );
-    return successResponse({ downloads: rows });
-  }
+    // Verify Razorpay signature — mandatory, no bypass
+    const rpSecret = process.env.RAZORPAY_KEY_SECRET;
+    if (!rpSecret) {
+      throw new BadRequestException('Payment gateway not configured. Contact support.');
+    }
+    if (!data.razorpaySignature || !sub.razorpay_order_id) {
+      throw new BadRequestException('Missing payment verification data.');
+    }
+    const crypto = require('crypto');
+    const expectedSig = crypto
+      .createHmac('sha256', rpSecret)
+      .update(`${sub.razorpay_order_id}|${data.transactionId}`)
+      .digest('hex');
+    if (expectedSig !== data.razorpaySignature) {
+      console.error(`PAYMENT TAMPER DETECTED: user=${userId} order=${sub.razorpay_order_id} payment=${data.transactionId}`);
+      throw new BadRequestException('Payment signature verification failed');
+    }
 
-  async getCertificates(userId: string) {
-    const rows = await this.db.query(
-      `SELECT c.*, co.title AS course_title, co.subject, co.instructor, u.name AS user_name
-       FROM certificates c
-       JOIN courses co ON c.course_id=co.id
-       JOIN users u    ON c.user_id=u.id
-       WHERE c.user_id=$1 ORDER BY c.issued_at DESC`,
-      [userId]
+    const endsAt = new Date();
+    if (sub.plan === 'monthly')   endsAt.setMonth(endsAt.getMonth() + 1);
+    if (sub.plan === 'quarterly') endsAt.setMonth(endsAt.getMonth() + 3);
+    if (sub.plan === 'annual')    endsAt.setFullYear(endsAt.getFullYear() + 1);
+
+    await this.db.query(
+      `UPDATE subscriptions SET payment_status='success', status='active', payment_method=$1, upi_id=$2,
+       razorpay_payment_id=$3, starts_at=NOW(), ends_at=$4, updated_at=NOW() WHERE id=$5`,
+      [data.paymentMethod||'upi', data.upiId||null, data.transactionId, endsAt, subId]
     );
 
-    // Lazy-generation backfill: any certificate row created before PDF
-    // generation existed will have certificate_url = NULL. Generate it
-    // on first fetch so older completions still get a real download.
-    const uploadDir = process.env.UPLOAD_DIR ?? join(process.cwd(), 'uploads');
-    const baseUrl = this.config.get<string>('BASE_URL') ?? 'https://api.bpscnotes.in';
+    // Deduct coins
+    if (sub.coins_used > 0) {
+      await this.db.query(`UPDATE users SET coins=coins-$1 WHERE id=$2`, [sub.coins_used, userId]);
+      const bal = (await this.db.query(`SELECT coins FROM users WHERE id=$1`, [userId]))[0].coins;
+      await this.db.query(`INSERT INTO coin_transactions (user_id,type,amount,description,action,balance) VALUES ($1,'spent',$2,'Subscription payment discount','subscription_payment',$3)`, [userId, sub.coins_used, bal]);
+    }
 
-    for (const cert of rows) {
-      if (!cert.certificate_url) {
-        try {
-          const relativePath = await generateCertificatePdf(uploadDir, {
-            userName: cert.user_name || 'Student',
-            courseTitle: cert.course_title || 'BPSCNotes Course',
-            instructor: cert.instructor,
-            completedAt: cert.issued_at,
-            certificateId: cert.id,
-          });
-          cert.certificate_url = `${baseUrl}/uploads/${relativePath}`;
-          await this.db.query(
-            `UPDATE certificates SET certificate_url=$1 WHERE id=$2`,
-            [cert.certificate_url, cert.id]
-          );
-        } catch (err) {
-          console.error('Lazy certificate generation failed:', err);
-          // leave certificate_url as null — app will show "not yet available"
-        }
+    // Update coupon usage
+    if (sub.coupon_code) await this.db.query(`UPDATE coupons SET used_count=used_count+1 WHERE code=$1`, [sub.coupon_code]);
+
+    // Award bonus coins
+    await this.db.query(`UPDATE users SET coins=coins+$1 WHERE id=$2`, [plan.bonusCoins, userId]);
+    const newBal = (await this.db.query(`SELECT coins FROM users WHERE id=$1`, [userId]))[0].coins;
+    await this.db.query(`INSERT INTO coin_transactions (user_id,type,amount,description,action,balance) VALUES ($1,'earned',$2,'Subscription bonus coins','subscription_bonus',$3)`, [userId, plan.bonusCoins, newBal]);
+
+    await this.cache.del(`user:${userId}`);
+
+    // 🔔 Subscription welcome push
+    this.notifService?.pushToUser(
+      userId,
+      '🎉 BPSCNotes Pro Activated!',
+      `Your ${sub.plan} plan is live. Enjoy unlimited access + 🪙 ${plan.bonusCoins} bonus coins!`,
+      { type: 'subscription', screen: 'courses' }
+    ).catch(() => {});
+
+    return successResponse({ bonusCoinsEarned: plan.bonusCoins }, '🎉 Subscription activated! Enjoy BPSCNotes Pro');
+  }
+
+  async getStatus(userId: string) {
+    const result = await this.db.query(
+      `SELECT id, plan, status, starts_at, ends_at, auto_renew, payment_method FROM subscriptions WHERE user_id=$1 AND status='active' AND ends_at>NOW() ORDER BY ends_at DESC LIMIT 1`,
+      [userId]
+    );
+    return successResponse({ isActive: result.length > 0, subscription: result[0] || null });
+  }
+
+  // ── Razorpay Webhook Handler ─────────────────────────────────
+  async handleRazorpayWebhook(req: any, body: any) {
+    const crypto = require('crypto');
+
+    // Verify webhook signature
+    const webhookSecret = process.env.RAZORPAY_WEBHOOK_SECRET;
+    const signature     = req.headers['x-razorpay-signature'];
+    if (webhookSecret && signature) {
+      const expected = crypto
+        .createHmac('sha256', webhookSecret)
+        .update(JSON.stringify(body))
+        .digest('hex');
+      if (expected !== signature) {
+        console.error('Razorpay webhook: invalid signature');
+        return { status: 'invalid_signature' };
       }
     }
 
-    return successResponse({ certificates: rows });
+    const event   = body.event;
+    const payment = body.payload?.payment?.entity;
+    const orderId = payment?.order_id;
+
+    if (!orderId) return { status: 'ignored' };
+
+    // payment.captured — successful payment
+    if (event === 'payment.captured') {
+      const [sub] = await this.db.query(
+        `SELECT * FROM subscriptions WHERE razorpay_order_id=$1 AND payment_status='pending'`,
+        [orderId]
+      );
+      if (!sub) return { status: 'not_found' };
+
+      // Idempotency guard
+      const dup = await this.db.query(
+        `SELECT id FROM subscriptions WHERE razorpay_payment_id=$1`, [payment.id]
+      );
+      if (dup.length) return { status: 'already_processed' };
+
+      const plan   = this.PLANS[sub.plan];
+      const endsAt = new Date();
+      if (sub.plan === 'monthly')   endsAt.setMonth(endsAt.getMonth() + 1);
+      if (sub.plan === 'quarterly') endsAt.setMonth(endsAt.getMonth() + 3);
+      if (sub.plan === 'annual')    endsAt.setFullYear(endsAt.getFullYear() + 1);
+
+      await this.db.query(
+        `UPDATE subscriptions
+         SET payment_status='success', status='active',
+             payment_method=$1, upi_id=$2,
+             razorpay_payment_id=$3, starts_at=NOW(), ends_at=$4, updated_at=NOW()
+         WHERE id=$5`,
+        [payment.method || 'upi', payment.vpa || null, payment.id, endsAt, sub.id]
+      );
+
+      // Bonus coins
+      if (plan?.bonusCoins > 0) {
+        await this.db.query(`UPDATE users SET coins=coins+$1 WHERE id=$2`, [plan.bonusCoins, sub.user_id]);
+        const [bal] = await this.db.query(`SELECT coins FROM users WHERE id=$1`, [sub.user_id]);
+        await this.db.query(
+          `INSERT INTO coin_transactions (user_id,type,amount,description,action,balance)
+           VALUES ($1,'earned',$2,'Subscription bonus coins','subscription_bonus',$3)`,
+          [sub.user_id, plan.bonusCoins, bal.coins]
+        );
+      }
+
+      await this.cache.del(`user:${sub.user_id}`);
+      console.log(`Webhook: subscription ${sub.id} activated for user ${sub.user_id}`);
+    }
+
+    // payment.failed
+    if (event === 'payment.failed') {
+      await this.db.query(
+        `UPDATE subscriptions SET payment_status='failed', status='failed', updated_at=NOW()
+         WHERE razorpay_order_id=$1 AND payment_status='pending'`,
+        [orderId]
+      );
+    }
+
+    return { status: 'ok' };
   }
 
-  async getLiveClasses(userId: string) {
-    const rows = await this.db.query(
-      `SELECT lc.*, (SELECT TRUE FROM live_class_registrations WHERE live_class_id=lc.id AND user_id=$1) AS is_registered
-       FROM live_classes lc WHERE lc.status!='cancelled' ORDER BY lc.scheduled_at ASC`,
-      [userId]
-    );
-    return successResponse({ liveClasses: rows });
-  }
-
-  async registerLiveClass(classId: string, userId: string) {
-    await this.db.query(`INSERT INTO live_class_registrations VALUES ($1,$2) ON CONFLICT DO NOTHING`, [classId, userId]);
-    await this.db.query(`UPDATE live_classes SET registered_count=registered_count+1 WHERE id=$1`, [classId]);
-    return successResponse(null, 'Registered for live class!');
-  }
-
-  async updateNotificationSettings(userId: string, enabled: boolean) {
-    await this.db.query(`UPDATE users SET notification_enabled=$1, updated_at=NOW() WHERE id=$2`, [enabled, userId]);
-    await this.cache.del(`user:${userId}`);
-    return successResponse(null, 'Notification settings updated');
-  }
-
-  // Admin
-  async getAdminLeaderboard() {
-    const rows = await this.db.query(
-      `SELECT id, name, primary_exam, streak, coins, accuracy, rank, total_study_minutes FROM users WHERE status='active' AND deleted_at IS NULL ORDER BY rank ASC NULLS LAST, coins DESC LIMIT 100`
-    );
-    return successResponse({ leaderboard: rows });
-  }
-
-  async recalculateRanks() {
-    await this.db.query(
-      `UPDATE users u SET rank=ranks.new_rank FROM (SELECT id, ROW_NUMBER() OVER (ORDER BY coins DESC, accuracy DESC, streak DESC) AS new_rank FROM users WHERE status='active' AND deleted_at IS NULL) ranks WHERE u.id=ranks.id`
-    );
-    return successResponse(null, 'Leaderboard recalculated ✅');
-  }
-
-  async getCertificatesAdmin(query: any) {
-    const { page=1, limit=20 } = query;
-    const offset = (page-1)*limit;
-    const [rows, countResult] = await Promise.all([
-      this.db.query(
-        `SELECT c.*, u.name AS user_name, u.email, co.title AS course_title FROM certificates c JOIN users u ON c.user_id=u.id JOIN courses co ON c.course_id=co.id ORDER BY c.issued_at DESC LIMIT $1 OFFSET $2`,
-        [limit, offset]
-      ),
-      this.db.query(`SELECT COUNT(*) FROM certificates`),
-    ]);
-    return successResponse({ certificates: rows }, 'Success', paginationMeta(parseInt(countResult[0].count), page, limit));
-  }
-
-  async getLiveClassesAdmin(query: any) {
-    const rows = await this.db.query(
-      `SELECT lc.*,
-              lc.status = 'live' AS is_live,
-              lc.meeting_link AS meet_url,
-              (SELECT COUNT(*) FROM live_class_registrations WHERE live_class_id=lc.id) AS registered_count
-       FROM live_classes lc ORDER BY lc.scheduled_at DESC`
-    );
-    return successResponse({ liveClasses: rows });
-  }
-
-  async createLiveClass(data: any, adminId: string) {
-    if (!data.title || !data.instructor) throw new BadRequestException('Title and instructor required');
+  async validateCoupon(code: string, type: string) {
     const result = await this.db.query(
-      `INSERT INTO live_classes (title, instructor, subject, description, meeting_link, scheduled_at, duration_mins, exam_tags, created_by) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
-      [data.title, data.instructor, data.subject, data.description, data.meetUrl || data.meetingLink || null, data.scheduledAt, data.durationMins||60, data.examTags||[], adminId]
+      `SELECT * FROM coupons WHERE code=$1 AND is_active=TRUE AND (expires_at IS NULL OR expires_at>NOW()) AND (max_uses IS NULL OR used_count<max_uses) AND applies_to IN ($2,'both')`,
+      [code.toUpperCase(), type]
     );
-    return successResponse({ liveClass: result[0] }, 'Live class scheduled — visible in app ✅');
-  }
-
-  async toggleLiveClass(classId: string, isLive: boolean) {
-    const newStatus = isLive ? 'live' : 'ended';
-    const result = await this.db.query(
-      `UPDATE live_classes SET status=$1, updated_at=NOW() WHERE id=$2 RETURNING *`,
-      [newStatus, classId]
-    );
-    if (!result.length) throw new NotFoundException('Live class not found');
-    return successResponse({ status: newStatus, isLive }, isLive ? 'Class is now LIVE 🔴' : 'Class ended ⏹');
-  }
-
-  async updateLiveClass(classId: string, data: any) {
-    const fields: string[] = [], vals: any[] = [];
-    let i = 1;
-    const map: any = { title:'title', instructor:'instructor', subject:'subject', description:'description', scheduledAt:'scheduled_at', durationMins:'duration_mins', status:'status', meetingLink:'meeting_link', meetUrl:'meeting_link' };
-    for (const [key, col] of Object.entries(map)) {
-      if (data[key] !== undefined) { fields.push(`${col}=$${i++}`); vals.push(data[key]); }
-    }
-    if (fields.length) { fields.push('updated_at=NOW()'); await this.db.query(`UPDATE live_classes SET ${fields.join(',')} WHERE id=$${i}`, [...vals, classId]); }
-    return successResponse(null, 'Live class updated ✅');
-  }
-}
-
-@ApiTags('Users') @ApiBearerAuth() @UseGuards(JwtAuthGuard) @Controller('users')
-class UsersController {
-  constructor(private s: UsersService) {}
-  @Get('profile')     getProfile(@Req() r: any) { return this.s.getProfile(r.user.id); }
-  @Put('profile')     updateProfile(@Req() r: any, @Body() dto: any) { return this.s.updateProfile(r.user.id, dto); }
-  @Post('upload-avatar')
-  @UseInterceptors(FileInterceptor('avatar', { dest: '/tmp/bpsc-uploads' }))
-  uploadAvatar(@Req() r: any, @UploadedFile() file: Express.Multer.File) {
-    return this.s.uploadAvatar(r.user.id, file);
-  }
-  @Put('exam-target') updateExamTarget(@Req() r: any, @Body() dto: any) { return this.s.updateExamTarget(r.user.id, dto); }
-  @Get('stats')       getStats(@Req() r: any) { return this.s.getStats(r.user.id); }
-  @Get('leaderboard') getLeaderboard(@Query() q: any, @Req() r: any) { return this.s.getLeaderboard(q, r.user.id); }
-  @Get('enrollments') getEnrollments(@Req() r: any) { return this.s.getMyEnrollments(r.user.id); }
-  @Get('downloads')   getDownloads(@Req() r: any) { return this.s.getDownloads(r.user.id); }
-  @Get('certificates') getCertificates(@Req() r: any) { return this.s.getCertificates(r.user.id); }
-  @Get('live-classes') getLiveClasses(@Req() r: any) { return this.s.getLiveClasses(r.user.id); }
-  @Post('live-classes/:id/register') @HttpCode(200) registerLiveClass(@Param('id', ParseUUIDPipe) id: string, @Req() r: any) { return this.s.registerLiveClass(id, r.user.id); }
-  @Put('notification-settings') updateNotifSettings(@Req() r: any, @Body() b: any) { return this.s.updateNotificationSettings(r.user.id, b.enabled); }
-}
-
-@ApiTags('Admin — Leaderboard & Live') @ApiBearerAuth() @Public()
-@UseGuards(AdminJwtGuard, PermissionGuard) @Controller('admin')
-class AdminUsersExtraController {
-  constructor(private s: UsersService) {}
-  @Get('leaderboard')           @RequirePermission('leaderboard') getLeaderboard()    { return this.s.getAdminLeaderboard(); }
-  @Post('leaderboard/recalculate') @RequirePermission('leaderboard') recalculate()  { return this.s.recalculateRanks(); }
-  @Get('certificates')          @RequirePermission('certificates') getCerts(@Query() q: any) { return this.s.getCertificatesAdmin(q); }
-  @Get('live-classes')          @RequirePermission('live-classes') getLiveClasses(@Query() q: any) { return this.s.getLiveClassesAdmin(q); }
-  @Post('live-classes')         @RequirePermission('live-classes') @HttpCode(201) createLiveClass(@Body() dto: any, @Req() r: any) { return this.s.createLiveClass(dto, r.admin.id); }
-  @Put('live-classes/:id')      @RequirePermission('live-classes') updateLiveClass(@Param('id', ParseUUIDPipe) id: string, @Body() dto: any) { return this.s.updateLiveClass(id, dto); }
-  @Put('live-classes/:id/toggle') @RequirePermission('live-classes') toggleLiveClass(@Param('id', ParseUUIDPipe) id: string, @Body() dto: any) { return this.s.toggleLiveClass(id, dto.isLive ?? false); }
-}
-
-// ─────────────────────────────────────────────────────────────
-// Leaderboard Cron — runs every hour to keep ranks fresh.
-// Avoids the manual admin click requirement.
-// ─────────────────────────────────────────────────────────────
-@Injectable()
-class LeaderboardCronService implements OnModuleInit {
-  private readonly logger = new Logger(LeaderboardCronService.name);
-
-  constructor(
-    @InjectDataSource() private readonly db: DataSource,
-  ) {}
-
-  // Run once on startup so ranks are fresh after a restart
-  async onModuleInit() {
-    await this.recalculate().catch(e =>
-      this.logger.warn('Startup rank recalculation failed: ' + e.message)
-    );
-  }
-
-  // Recalculate every hour
-  @Cron('0 * * * *')
-  async recalculate() {
-    await this.db.query(
-      `UPDATE users u
-       SET rank = ranks.new_rank
-       FROM (
-         SELECT id,
-                ROW_NUMBER() OVER (
-                  ORDER BY coins DESC, accuracy DESC, streak DESC
-                ) AS new_rank
-         FROM users
-         WHERE status='active' AND deleted_at IS NULL
-       ) ranks
-       WHERE u.id = ranks.id`
-    );
-    this.logger.log('Leaderboard ranks recalculated');
-  }
-}
-
-@Module({ imports:[ConfigModule], controllers:[UsersController, AdminUsersExtraController], providers:[UsersService, LeaderboardCronService], exports:[UsersService] })
-export class UsersModule {}
-
-// ════════════════════════════════════════════════════════════
-// IMAGE UPLOAD — Admin endpoint for flashcard / MCQ images
-// POST /admin/upload/image  → saves to local disk → returns { data: { url } }
-// ════════════════════════════════════════════════════════════
-@Public()
-@UseGuards(AdminJwtGuard)
-@Controller('admin/upload')
-class AdminUploadController {
-
-  @Post('image')
-  @HttpCode(200)
-  @UseInterceptors(
-    FileInterceptor('image', {
-      storage: diskStorage({
-        destination: (_req: any, _file: any, cb: any) => {
-          const uploadDir = process.env.UPLOAD_DIR ?? join(process.cwd(), 'uploads');
-          const dest = join(uploadDir, 'images');
-          fs.mkdirSync(dest, { recursive: true });
-          cb(null, dest);
-        },
-        filename: (_req: any, file: any, cb: any) => {
-          const ext  = extname(file.originalname).toLowerCase() || '.jpg';
-          const name = `${Date.now()}_${crypto.randomBytes(8).toString('hex')}${ext}`;
-          cb(null, name);
-        },
-      }),
-      limits: { fileSize: 10 * 1024 * 1024 },   // 10 MB max
-      fileFilter: (_req: any, file: any, cb: any) => {
-        if (file.mimetype.startsWith('image/')) cb(null, true);
-        else cb(new Error('Only image files are allowed'), false);
-      },
-    }),
-  )
-  uploadImage(@UploadedFile() file: Express.Multer.File, @Req() _req: any) {
-    if (!file) throw new Error('No file uploaded');
-    const uploadDir = process.env.UPLOAD_DIR ?? join(process.cwd(), 'uploads');
-    const baseUrl   = process.env.BASE_URL    ?? 'https://api.bpscnotes.in';
-    const fileKey   = file.path.replace(uploadDir + '/', '').replace(/\\/g, '/');
-    const url       = `${baseUrl}/uploads/${fileKey}`;
-    return { success: true, message: 'Image uploaded', data: { url, fileKey } };
-  }
-}
-
-@Module({ controllers: [AdminUploadController] })
-export class AdminUploadModule {}
-
-// ════════════════════════════════════════════════════════════
-// BANNERS MODULE
-// ════════════════════════════════════════════════════════════
-@Injectable()
-class BannersService {
-  constructor(
-    @InjectDataSource() private readonly db: DataSource,
-    @Inject(CACHE_MANAGER) private readonly cache: Cache,
-  ) {}
-
-  async getActiveBanners(userExam?: string) {
-    const cacheKey = `banners:${userExam||'all'}`;
-    const cached   = await this.cache.get(cacheKey);
-    if (cached) return cached;
-
-    const rows = await this.db.query(
-      `SELECT id, title, subtitle, image_url, action_link, type, bg_gradient, target
-       FROM banners WHERE is_active=TRUE AND (target='all' OR target=$1)
-       ORDER BY sort_order ASC, created_at DESC LIMIT 10`,
-      [userExam || 'all']
-    );
-    const result = successResponse({ banners: rows });
-    await this.cache.set(cacheKey, result, 120);
-    return result;
-  }
-
-  async findAllAdmin() {
-    const rows = await this.db.query(`SELECT * FROM banners ORDER BY sort_order, created_at DESC`);
-    return successResponse({ banners: rows });
-  }
-
-  async create(data: any, adminId: string) {
-    const result = await this.db.query(
-      `INSERT INTO banners (title, subtitle, image_url, action_link, type, target, bg_gradient, sort_order, created_by)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
-      [data.title, data.subtitle, data.imageUrl, data.actionLink, data.type||'promotion', data.target||'all', data.bgGradient, data.sortOrder||0, adminId]
-    );
-    await this.invalidateCache();
-    return successResponse({ banner: result[0] }, 'Banner created — live in app ✅');
-  }
-
-  async update(bannerId: string, data: any) {
-    const fields: string[] = [], vals: any[] = [];
-    let i = 1;
-    const map: any = { title:'title', subtitle:'subtitle', isActive:'is_active', sortOrder:'sort_order', actionLink:'action_link', imageUrl:'image_url' };
-    for (const [key, col] of Object.entries(map)) {
-      if (data[key] !== undefined) { fields.push(`${col}=$${i++}`); vals.push(data[key]); }
-    }
-    if (fields.length) { fields.push('updated_at=NOW()'); await this.db.query(`UPDATE banners SET ${fields.join(',')} WHERE id=$${i}`, [...vals, bannerId]); }
-    await this.invalidateCache();
-    return successResponse(null, 'Banner updated ✅');
-  }
-
-  async remove(bannerId: string) {
-    await this.db.query(`DELETE FROM banners WHERE id=$1`, [bannerId]);
-    await this.invalidateCache();
-    return successResponse(null, 'Banner deleted');
-  }
-
-  async trackImpression(bannerId: string) {
-    await this.db.query(`UPDATE banners SET impression_count=impression_count+1 WHERE id=$1`, [bannerId]);
-  }
-
-  async trackClick(bannerId: string) {
-    await this.db.query(`UPDATE banners SET click_count=click_count+1 WHERE id=$1`, [bannerId]);
-  }
-
-  private async invalidateCache() {
-    // Delete all banner cache keys — in production use Redis SCAN
-    const patterns = ['banners:all', 'banners:BPSC 70th CCE', 'banners:Bihar Police SI'];
-    for (const key of patterns) await this.cache.del(key);
-  }
-}
-
-@ApiTags('Banners') @ApiBearerAuth() @UseGuards(JwtAuthGuard) @Controller('banners')
-class BannersController {
-  constructor(private s: BannersService) {}
-  @Get()                    getBanners(@Req() r: any) { return this.s.getActiveBanners(r.user?.primary_exam); }
-  @Post(':id/impression')   @HttpCode(200) impression(@Param('id', ParseUUIDPipe) id: string) { this.s.trackImpression(id); return { success: true }; }
-  @Post(':id/click')        @HttpCode(200) click(@Param('id', ParseUUIDPipe) id: string) { this.s.trackClick(id); return { success: true }; }
-}
-
-@ApiTags('Admin — Banners') @ApiBearerAuth() @Public()
-@UseGuards(AdminJwtGuard, PermissionGuard) @Controller('admin/banners')
-class AdminBannersController {
-  constructor(private s: BannersService) {}
-  @Get()         @RequirePermission('banners') findAll()   { return this.s.findAllAdmin(); }
-  @Post()        @RequirePermission('banners') @HttpCode(201) create(@Body() dto: any, @Req() r: any) { return this.s.create(dto, r.admin.id); }
-  @Put(':id')    @RequirePermission('banners') update(@Param('id', ParseUUIDPipe) id: string, @Body() dto: any) { return this.s.update(id, dto); }
-  @Delete(':id') @RequirePermission('banners') remove(@Param('id', ParseUUIDPipe) id: string) { return this.s.remove(id); }
-}
-
-@Module({ imports:[ConfigModule], controllers:[BannersController, AdminBannersController], providers:[BannersService] })
-export class BannersModule {}
-
-// ════════════════════════════════════════════════════════════
-// EXAMS MODULE
-// ════════════════════════════════════════════════════════════
-@Injectable()
-class ExamsService {
-  constructor(
-    @InjectDataSource() private readonly db: DataSource,
-    @Inject(CACHE_MANAGER) private readonly cache: Cache,
-  ) {}
-
-  async findAll() {
-    const cacheKey = 'exams:active';
-    const cached   = await this.cache.get(cacheKey);
-    if (cached) return cached;
-
-    const rows = await this.db.query(`SELECT * FROM exams WHERE is_active=TRUE ORDER BY sort_order, name`);
-    const result = successResponse({ exams: rows });
-    await this.cache.set(cacheKey, result, 600); // 10 min — exams change rarely
-    return result;
-  }
-
-  async findAllAdmin() {
-    const rows = await this.db.query(
-      `SELECT e.*,
-         COUNT(u.id) FILTER (WHERE u.primary_exam=e.name) AS total_users,
-         COUNT(u.id) FILTER (WHERE u.primary_exam=e.name AND u.last_active_at>NOW()-INTERVAL '7 days') AS active_users
-       FROM exams e LEFT JOIN users u ON u.primary_exam=e.name AND u.status='active' AND u.deleted_at IS NULL
-       GROUP BY e.id ORDER BY e.sort_order, e.name`
-    );
-    return successResponse({ exams: rows });
-  }
-
-  async create(data: any) {
-    if (!data.name || !data.fullName || !data.category) throw new BadRequestException('Name, fullName, category required');
-    const result = await this.db.query(
-      `INSERT INTO exams (name, full_name, category, emoji, sort_order) VALUES ($1,$2,$3,$4,$5) RETURNING *`,
-      [data.name, data.fullName, data.category, data.emoji||'🎯', data.sortOrder||0]
-    );
-    await this.cache.del('exams:active');
-    return successResponse({ exam: result[0] }, 'Exam added — visible in app ✅');
-  }
-
-  async update(examId: string, data: any) {
-    const fields: string[] = [], vals: any[] = [];
-    let i = 1;
-    const map: any = { name:'name', fullName:'full_name', category:'category', emoji:'emoji', isActive:'is_active', sortOrder:'sort_order' };
-    for (const [key, col] of Object.entries(map)) {
-      if (data[key] !== undefined) { fields.push(`${col}=$${i++}`); vals.push(data[key]); }
-    }
-    if (fields.length) { fields.push('updated_at=NOW()'); await this.db.query(`UPDATE exams SET ${fields.join(',')} WHERE id=$${i}`, [...vals, examId]); }
-    await this.cache.del('exams:active');
-    return successResponse(null, 'Exam updated ✅');
-  }
-}
-
-@ApiTags('Exams') @Public() @Controller('exams')
-class ExamsController {
-  constructor(private s: ExamsService) {}
-  @Get() findAll() { return this.s.findAll(); }
-}
-
-@ApiTags('Admin — Exams') @ApiBearerAuth() @Public()
-@UseGuards(AdminJwtGuard, PermissionGuard) @Controller('admin/exams')
-class AdminExamsController {
-  constructor(private s: ExamsService) {}
-  @Get()      @RequirePermission('dashboard') findAll()  { return this.s.findAllAdmin(); }
-  @Post()     @RequirePermission('settings')  @HttpCode(201) create(@Body() dto: any) { return this.s.create(dto); }
-  @Put(':id') @RequirePermission('settings')  update(@Param('id', ParseUUIDPipe) id: string, @Body() dto: any) { return this.s.update(id, dto); }
-}
-
-@Module({ imports:[ConfigModule], controllers:[ExamsController, AdminExamsController], providers:[ExamsService] })
-export class ExamsModule {}
-
-// ════════════════════════════════════════════════════════════
-// FLASHCARDS MODULE
-// GET  /api/v1/flashcards          — list for Active Recall screen
-// GET  /admin/flashcards           — admin list with full fields
-// POST /admin/flashcards           — create
-// PUT  /admin/flashcards/:id       — update
-// DELETE /admin/flashcards/:id     — delete
-//
-// Table schema (from migration):
-//   id, front, back, subject, exam_tags, difficulty, is_active, created_by, created_at
-//
-// Android FlashcardDto expects:
-//   id, subject, topic, question, answer, hint, difficulty, related_mcq
-//   (the "example" field was removed — unused by any client)
-//
-// Mapping: front→question, back→answer, topic="General" (not in schema, derive from subject)
-// ════════════════════════════════════════════════════════════
-
-@Injectable()
-class FlashcardsService {
-  constructor(
-    @InjectDataSource() private readonly db: DataSource,
-    @Inject(CACHE_MANAGER) private readonly cache: Cache,
-  ) {}
-
-  async findAll(query: any) {
-    const { subject, limit = 200, exam } = query;
-    const cacheKey = `flashcards:${subject || 'all'}:${exam || 'all'}`;
-    const cached = await this.cache.get(cacheKey);
-    if (cached) return cached;
-
-    const conditions = [`f.is_active = TRUE`];
-    const params: any[] = [];
-
-    if (subject) {
-      conditions.push(`f.subject = $${params.length + 1}`);
-      params.push(subject);
-    }
-    if (exam) {
-      conditions.push(`$${params.length + 1} = ANY(f.exam_tags)`);
-      params.push(exam);
-    }
-
-    const rows = await this.db.query(
-      `SELECT
-         f.id,
-         f.subject,
-         COALESCE(NULLIF(f.topic,''), f.subject) AS topic,
-         f.front     AS question,
-         f.back      AS answer,
-         COALESCE(f.hint,'')    AS hint,
-         COALESCE(f.card_type,'text') AS card_type,
-         f.image_url,
-         f.back_image_url,
-         NULL        AS related_mcq,
-         f.exam_tags
-       FROM flashcards f
-       WHERE ${conditions.join(' AND ')}
-       ORDER BY f.subject, f.created_at ASC
-       LIMIT $${params.length + 1}`,
-      [...params, limit]
-    );
-
-    const result = successResponse({ flashcards: rows });
-    await this.cache.set(cacheKey, result, 300);
-    return result;
+    if (!result.length) throw new NotFoundException('Invalid or expired coupon code');
+    const coupon = result[0];
+    return successResponse({ code: coupon.code, type: coupon.type, value: coupon.value, description: coupon.description },
+      `Coupon applied! ${coupon.type === 'flat' ? `₹${coupon.value} off` : `${coupon.value}% off`}`);
   }
 
   async findAllAdmin(query: any) {
-    const { page = 1, limit = 50, subject } = query;
-    const offset = (page - 1) * limit;
-    const conditions = ['1=1'];
-    const params: any[] = [];
-    if (subject) { conditions.push(`subject=$${params.length + 1}`); params.push(subject); }
+    const { page=1, limit=30, status, plan } = query;
+    const offset = (page-1)*limit;
+    const conditions = ['1=1'], params: any[] = [];
+    if (status) { conditions.push(`s.status=$${params.length+1}`); params.push(status); }
+    if (plan)   { conditions.push(`s.plan=$${params.length+1}`);   params.push(plan); }
+    const where = conditions.join(' AND ');
     const [rows, countResult] = await Promise.all([
       this.db.query(
-        `SELECT * FROM flashcards WHERE ${conditions.join(' AND ')} ORDER BY subject, created_at ASC LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
+        `SELECT s.*, u.name AS user_name, u.email AS user_email, u.mobile AS user_mobile FROM subscriptions s JOIN users u ON s.user_id=u.id WHERE ${where} ORDER BY s.created_at DESC LIMIT $${params.length+1} OFFSET $${params.length+2}`,
         [...params, limit, offset]
       ),
-      this.db.query(`SELECT COUNT(*) FROM flashcards WHERE ${conditions.join(' AND ')}`, params),
+      this.db.query(`SELECT COUNT(*) FROM subscriptions s WHERE ${where}`, params),
     ]);
-    return successResponse({ flashcards: rows, total: parseInt(countResult[0].count) });
+    return successResponse({ subscriptions: rows }, 'Success', paginationMeta(parseInt(countResult[0].count), page, limit));
   }
 
-  async create(data: any, adminId: string) {
-    console.log('Flashcard create payload:', JSON.stringify(data));
-    const front = data.front || data.question;
-    const back  = data.back  || data.answer || '';
-    const backImageUrl = data.backImageUrl || data.back_image_url || null;
-    // front (question) is always required
-    // back (answer) is required UNLESS a back image is provided
-    if (!front) throw new BadRequestException('front (question) is required');
-    if (!back && !backImageUrl) throw new BadRequestException('back (answer) or a back image is required');
-    const cardType = data.cardType || data.card_type || 'text';
-    const imageUrl = cardType === 'image' ? (data.imageUrl || data.image_url || null) : null;
+  async getCouponsAdmin() {
+    const result = await this.db.query(`SELECT * FROM coupons ORDER BY created_at DESC`);
+    return successResponse({ coupons: result });
+  }
+
+  async createCoupon(data: any, adminId: string) {
+    if (!data.code || !data.type || !data.value) throw new BadRequestException('Code, type and value required');
     const result = await this.db.query(
-      `INSERT INTO flashcards
-         (front, back, subject, exam_tags, card_type, image_url, back_image_url, topic, hint, created_by)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,
-      [
-        front,
-        back,
-        data.subject || 'General',
-        data.examTags || data.exam_tags || [],
-        cardType,
-        imageUrl,
-        backImageUrl,
-        data.topic || data.subject || 'General',
-        data.hint || '',
-        adminId,
-      ]
+      `INSERT INTO coupons (code, type, value, description, applies_to, max_uses, expires_at, created_by) VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *`,
+      [data.code.toUpperCase(), data.type, data.value, data.description, data.appliesTo||'both', data.maxUses||null, data.expiresAt||null, adminId]
     );
-    await this.invalidateCache();
-    return successResponse({ flashcard: result[0] }, 'Flashcard created ✅');
+    return successResponse({ coupon: result[0] }, 'Coupon created — active now ✅');
   }
 
-  async update(id: string, data: any) {
-    const existing = await this.db.query(`SELECT id FROM flashcards WHERE id=$1`, [id]);
-    if (!existing.length) throw new NotFoundException('Flashcard not found');
+  async updateCoupon(couponId: string, data: any) {
     const fields: string[] = [], vals: any[] = [];
     let i = 1;
-    const map: any = {
-      front: 'front', back: 'back', question: 'front', answer: 'back',
-      subject: 'subject', isActive: 'is_active',
-      topic: 'topic', hint: 'hint',
+    // Map camelCase → snake_case columns (handles isActive→is_active automatically)
+    const colMap: Record<string, string> = {
+      isActive: 'is_active', maxUses: 'max_uses', expiresAt: 'expires_at', value: 'value'
     };
-    // Handle back_image_url separately (camelCase from admin, snake_case from API)
-    if (data.backImageUrl !== undefined || data.back_image_url !== undefined) {
-      fields.push(`back_image_url=$${i++}`);
-      vals.push(data.backImageUrl ?? data.back_image_url ?? null);
+    for (const [camel, snake] of Object.entries(colMap)) {
+      const val = data[camel] !== undefined ? data[camel] : data[snake];
+      if (val !== undefined) { fields.push(`${snake}=$${i++}`); vals.push(val); }
     }
-    for (const [key, col] of Object.entries(map)) {
-      if (data[key] !== undefined) { fields.push(`${col}=$${i++}`); vals.push(data[key]); }
+    if (fields.length) { fields.push('updated_at=NOW()'); await this.db.query(`UPDATE coupons SET ${fields.join(',')} WHERE id=$${i}`, [...vals, couponId]); }
+    return successResponse(null, 'Coupon updated ✅');
+  }
+
+  async deleteCoupon(couponId: string) {
+    await this.db.query(`DELETE FROM coupons WHERE id=$1`, [couponId]);
+    return successResponse(null, 'Coupon deleted');
+  }
+}
+
+@ApiTags('Subscriptions') @ApiBearerAuth() @UseGuards(JwtAuthGuard) @Controller('subscriptions')
+class SubscriptionsController {
+  constructor(private s: SubscriptionsService) {}
+  @Get('plans') @HttpCode(200) getPlans() { return this.s.getPlans(); }
+  @Post('initiate') @HttpCode(200) initiate(@Req() r: any, @Body() dto: any) { return this.s.initiate(r.user.id, dto); }
+  @Post('create')   @HttpCode(200) create(@Req() r: any, @Body() dto: any)   { return this.s.initiate(r.user.id, dto); }  // alias for Razorpay flow
+  @Post(':id/confirm') @HttpCode(200) confirm(@Param('id', ParseUUIDPipe) id: string, @Req() r: any, @Body() dto: any) { return this.s.confirm(id, r.user.id, dto); }
+  @Get('status') getStatus(@Req() r: any) { return this.s.getStatus(r.user.id); }
+  @Post('coupons/validate') @HttpCode(200) validateCoupon(@Body() body: any) { return this.s.validateCoupon(body.code, body.type||'subscription'); }
+}
+
+@ApiTags('Admin — Subscriptions') @ApiBearerAuth() @Public()
+@UseGuards(AdminJwtGuard, PermissionGuard) @Controller('admin/subscriptions')
+class AdminSubscriptionsController {
+  constructor(private s: SubscriptionsService) {}
+  @Get() @RequirePermission('subscriptions') findAll(@Query() q: any) { return this.s.findAllAdmin(q); }
+  @Get('coupons') @RequirePermission('subscriptions') getCoupons() { return this.s.getCouponsAdmin(); }
+  @Post('coupons') @RequirePermission('subscriptions') @HttpCode(201) createCoupon(@Body() dto: any, @Req() r: any) { return this.s.createCoupon(dto, r.admin.id); }
+  @Put('coupons/:id') @RequirePermission('subscriptions') updateCoupon(@Param('id', ParseUUIDPipe) id: string, @Body() dto: any) { return this.s.updateCoupon(id, dto); }
+  @Delete('coupons/:id') @RequirePermission('subscriptions') deleteCoupon(@Param('id', ParseUUIDPipe) id: string) { return this.s.deleteCoupon(id); }
+}
+
+@Module({ imports:[ConfigModule], controllers:[SubscriptionsController, AdminSubscriptionsController], providers:[SubscriptionsService] })
+export class SubscriptionsModule {}
+
+// ════════════════════════════════════════════════════════════
+// NOTIFICATIONS MODULE
+// ════════════════════════════════════════════════════════════
+@Injectable()
+export class NotificationService {
+  private firebaseInitialized = false;
+
+  constructor(
+    @InjectDataSource() private readonly db: DataSource,
+    private readonly config: ConfigService,
+  ) {
+    this.initFirebase();
+  }
+
+  private initFirebase() {
+    this.firebaseInitialized = ensureFirebaseAdmin();
+  }
+
+  async send(data: any, adminId: string) {
+    if (!data.title || !data.body) throw new BadRequestException('Title and body required');
+
+    if (data.scheduledAt) {
+      const result = await this.db.query(
+        `INSERT INTO notifications (title, body, type, target, target_exam, data, status, scheduled_at, created_by) VALUES ($1,$2,$3,$4,$5,$6,'scheduled',$7,$8) RETURNING id`,
+        [data.title, data.body, data.type||'announcement', data.target||'all', data.targetExam||null, JSON.stringify(data.data||{}), data.scheduledAt, adminId]
+      );
+      return successResponse({ notificationId: result[0].id }, `Notification scheduled for ${data.scheduledAt}`);
     }
-    if (data.examTags)  { fields.push(`exam_tags=$${i++}`);  vals.push(data.examTags); }
-    if (data.cardType || data.card_type) {
-      const ct = data.cardType || data.card_type;
-      fields.push(`card_type=$${i++}`); vals.push(ct);
-      if (ct === 'image' && (data.imageUrl || data.image_url)) {
-        fields.push(`image_url=$${i++}`); vals.push(data.imageUrl || data.image_url);
+
+    const notifResult = await this.db.query(
+      `INSERT INTO notifications (title, body, type, target, target_exam, data, status, sent_at, created_by) VALUES ($1,$2,$3,$4,$5,$6,'sent',NOW(),$7) RETURNING id`,
+      [data.title, data.body, data.type||'announcement', data.target||'all', data.targetExam||null, JSON.stringify(data.data||{}), adminId]
+    );
+    const notifId = notifResult[0].id;
+
+    let userQuery = `SELECT id, fcm_token FROM users WHERE status='active' AND notification_enabled=TRUE AND deleted_at IS NULL`;
+    const params: any[] = [];
+    if (data.target === 'pro' || data.target === 'premium') {
+      userQuery += ` AND id IN (SELECT user_id FROM subscriptions WHERE status='active' AND ends_at>NOW())`;
+    } else if (data.target === 'free') {
+      userQuery += ` AND id NOT IN (SELECT user_id FROM subscriptions WHERE status='active' AND ends_at>NOW())`;
+    } else if (data.target === 'inactive') {
+      userQuery += ` AND (last_active_at IS NULL OR last_active_at < NOW() - INTERVAL '7 days')`;
+    } else if (data.target === 'exam' && data.targetExam) {
+      userQuery += ` AND primary_exam=$1`;
+      params.push(data.targetExam);
+    } else if (data.target === 'user' && data.targetUserId) {
+      userQuery += ` AND id=$1`;
+      params.push(data.targetUserId);
+    }
+
+    const users = await this.db.query(userQuery, params);
+
+    // Batch insert into user_notifications
+    if (users.length > 0) {
+      const chunkSize = 1000;
+      for (let i = 0; i < users.length; i += chunkSize) {
+        const chunk = users.slice(i, i + chunkSize);
+        const vals  = chunk.map((_: any, j: number) => `($${j*4+1},$${j*4+2},$${j*4+3},$${j*4+4})`).join(',');
+        const flat  = chunk.flatMap((u: any) => [u.id, notifId, data.title, data.body]);
+        await this.db.query(`INSERT INTO user_notifications (user_id, notification_id, title, body) VALUES ${vals}`, flat);
       }
-      if (ct === 'text') { fields.push(`image_url=$${i++}`); vals.push(null); }
     }
-    if (!fields.length) throw new BadRequestException('No fields to update');
-    await this.db.query(`UPDATE flashcards SET ${fields.join(',')} WHERE id=$${i}`, [...vals, id]);
-    await this.invalidateCache();
-    return successResponse(null, 'Flashcard updated ✅');
+
+    // FCM push
+    let pushSuccess = 0, pushFail = 0;
+    console.log('==== PUSH DEBUG ====');
+console.log('firebaseInitialized:', this.firebaseInitialized);
+console.log('users count:', users.length);
+    if (this.firebaseInitialized) {
+      const tokens = users.map((u: any) => u.fcm_token).filter(Boolean);
+      console.log('tokens count:', tokens.length);
+console.log('sample token:', tokens[0]);
+      if (tokens.length > 0) {
+        for (let i = 0; i < tokens.length; i += 500) {
+          try {
+            const result = await admin.messaging().sendEachForMulticast({
+              tokens: tokens.slice(i, i + 500),
+              notification: { title: data.title, body: data.body },
+              data: { type: data.type || 'announcement', notifId },
+              android: { priority: 'high' },
+            });
+            pushSuccess += result.successCount;
+            pushFail    += result.failureCount;
+          } catch (err) {
+            console.error('FCM FULL ERROR:', err);
+            // console.error('FCM error:', err.message);
+          }
+        }
+      }
+    }
+
+    await this.db.query(`UPDATE notifications SET total_sent=$1 WHERE id=$2`, [users.length, notifId]);
+    return successResponse({ notificationId: notifId, totalSent: users.length, pushSuccess, pushFail }, `Notification sent to ${users.length} users ✅`);
   }
 
-  async remove(id: string) {
-    await this.db.query(`UPDATE flashcards SET is_active=FALSE WHERE id=$1`, [id]);
-    await this.invalidateCache();
-    return successResponse(null, 'Flashcard deleted ✅');
+  async getUserNotifications(userId: string, query: any) {
+    const { page=1, limit=20 } = query;
+    const offset = (page-1)*limit;
+
+    // FIX: Also pull broadcast notifications (target='all') that may not have a user_notifications row
+    // This happens when admin sends before this user created their account, or due to batch insert failures
+    // Strategy: union user_notifications (personal) with 'all'/'free'/'pro' broadcasts
+    const [notifs, unread] = await Promise.all([
+      this.db.query(
+        `SELECT
+           COALESCE(un.id::text, n.id::text)        AS id,
+           COALESCE(un.title, n.title)               AS title,
+           COALESCE(un.body, n.body)                 AS body,
+           n.type,
+           n.data,
+           COALESCE(un.is_read, FALSE)               AS is_read,
+           COALESCE(un.created_at, n.created_at)     AS created_at
+         FROM notifications n
+         LEFT JOIN user_notifications un
+           ON un.notification_id = n.id AND un.user_id = $1
+         WHERE n.status = 'sent'
+           AND (
+             un.user_id = $1
+             OR n.target = 'all'
+             OR (n.target = 'pro' AND EXISTS(
+               SELECT 1 FROM subscriptions s
+               WHERE s.user_id=$1 AND s.status='active' AND s.ends_at > NOW()
+             ))
+             OR (n.target = 'free' AND NOT EXISTS(
+               SELECT 1 FROM subscriptions s
+               WHERE s.user_id=$1 AND s.status='active' AND s.ends_at > NOW()
+             ))
+           )
+         ORDER BY COALESCE(un.created_at, n.created_at) DESC
+         LIMIT $2 OFFSET $3`,
+        [userId, limit, offset]
+      ),
+      this.db.query(
+        `SELECT COUNT(*) FROM user_notifications WHERE user_id=$1 AND is_read=FALSE`, [userId]
+      ),
+    ]);
+
+    return successResponse({ notifications: notifs, unreadCount: parseInt(unread[0].count) }, 'Success',
+      paginationMeta(0, page, limit));
   }
 
-  private async invalidateCache() {
-    await this.cache.del('flashcards:all:all');
-    const subjects = ['Polity','History','Geography','Economy','Bihar GK','Science','Environment'];
-    for (const s of subjects) await this.cache.del(`flashcards:${s}:all`);
-  }
-
-  /** GET /flashcards/progress — return user's mastered/weak card IDs */
-  async getUserProgress(userId: string) {
+  async getUnreadCount(userId: string) {
     const rows = await this.db.query(
-      `SELECT ufp.flashcard_id AS "flashcardId", ufp.status, ufp.streak,
-              ufp.ease_factor AS "easeFactor", ufp.repetitions, ufp.next_review AS "nextReview"
-       FROM user_flashcard_progress ufp
-       INNER JOIN flashcards f ON f.id = ufp.flashcard_id AND f.is_active = TRUE
-       WHERE ufp.user_id = $1`,
+      `SELECT COUNT(*) FROM user_notifications WHERE user_id=$1 AND is_read=FALSE`,
       [userId]
-    ).catch(() => []);
-
-    const mastered = rows.filter((r: any) => r.status === 'mastered').map((r: any) => r.flashcardId);
-    const weak     = rows.filter((r: any) => r.status === 'weak').map((r: any) => r.flashcardId);
-    return successResponse({ mastered, weak, total: rows.length });
+    );
+    return successResponse({ count: parseInt(rows[0].count) });
   }
 
-  /** POST /flashcards/progress — upsert card rating for user */
-  async saveProgress(userId: string, dto: { flashcardId: string; rating: 'mastered' | 'weak' | 'skipped'; streak?: number }) {
-    const { flashcardId, rating, streak = 0 } = dto;
-    if (rating === 'skipped') return successResponse({ saved: false });
+  // ── Direct push helpers (called by other modules) ──────────
+  async pushToUser(userId: string, title: string, body: string, data: Record<string, string> = {}) {
+    const rows = await this.db.query(
+      `SELECT fcm_token, notification_enabled FROM users WHERE id=$1 AND fcm_token IS NOT NULL LIMIT 1`,
+      [userId]
+    );
+    const user  = rows[0];
+    const token = user?.fcm_token;
 
-    await this.db.query(
-      `INSERT INTO user_flashcard_progress
-         (user_id, flashcard_id, status, streak, repetitions, last_reviewed, next_review)
-       VALUES ($1, $2, $3, $4, 1, NOW(),
-         CURRENT_DATE + INTERVAL '1 day' * CASE WHEN $3='mastered' THEN GREATEST(1, $4) ELSE 1 END)
-       ON CONFLICT (user_id, flashcard_id) DO UPDATE SET
-         status       = EXCLUDED.status,
-         streak       = EXCLUDED.streak,
-         repetitions  = user_flashcard_progress.repetitions + 1,
-         last_reviewed = NOW(),
-         next_review  = CURRENT_DATE + INTERVAL '1 day' * CASE WHEN EXCLUDED.status='mastered' THEN GREATEST(1, EXCLUDED.streak) ELSE 1 END`,
-      [userId, flashcardId, rating, streak]
-    ).catch(async (e: any) => {
-      // Table may not have status/streak columns — add them gracefully
+    // ── Always save to user_notifications so inbox is populated ──
+    // This runs regardless of FCM success/failure and notification_enabled setting
+    // (user should still see past notifications in-app even if push was disabled)
+    try {
+      // Insert a notifications record (system/trigger type — no admin user)
+      const [notifRow] = await this.db.query(
+        `INSERT INTO notifications (title, body, type, target, data, status, sent_at, created_by)
+         VALUES ($1, $2, $3, 'user', $4, 'sent', NOW(), NULL)
+         RETURNING id`,
+        [title, body, data.type || 'system', JSON.stringify(data)]
+      );
+      const notifId = notifRow?.id;
+
+      if (notifId) {
+        await this.db.query(
+          `INSERT INTO user_notifications (user_id, notification_id, title, body)
+           VALUES ($1, $2, $3, $4)
+           ON CONFLICT DO NOTHING`,
+          [userId, notifId, title, body]
+        );
+      }
+    } catch (dbErr: any) {
+      console.error('pushToUser DB insert failed:', dbErr.message);
+    }
+
+    // ── FCM push (only if user has token and notifications enabled) ──
+    if (!token || !user?.notification_enabled || !admin.apps.length) return false;
+    try {
+      await admin.messaging().send({
+        token,
+        notification: { title, body },
+        data,
+        android: { priority: 'high', notification: { channelId: data.type || 'general' } },
+      });
+      return true;
+    } catch (err: any) {
+      console.error('FCM push failed:', err.message);
+      return false;
+    }
+  }
+
+  async pushToAll(title: string, body: string, data: Record<string, string> = {}) {
+    const tokens = await this.db.query(
+      `SELECT fcm_token FROM users WHERE notification_enabled=TRUE AND fcm_token IS NOT NULL AND status='active' LIMIT 2000`
+    );
+    const fcmTokens = tokens.map((t: any) => t.fcm_token).filter(Boolean);
+    if (!fcmTokens.length || !admin.apps.length) return 0;
+    let sent = 0;
+    for (let i = 0; i < fcmTokens.length; i += 500) {
+      try {
+        const res = await admin.messaging().sendEachForMulticast({
+          tokens: fcmTokens.slice(i, i + 500),
+          notification: { title, body },
+          data,
+          android: { priority: 'high' },
+        });
+        sent += res.successCount;
+      } catch (err: any) {
+        console.error('FCM multicast failed:', err.message);
+      }
+    }
+    return sent;
+  }
+
+  async markRead(userId: string, ids?: string[]) {
+    if (ids?.length) {
+      await this.db.query(`UPDATE user_notifications SET is_read=TRUE, read_at=NOW() WHERE user_id=$1 AND id=ANY($2)`, [userId, ids]);
+    } else {
+      await this.db.query(`UPDATE user_notifications SET is_read=TRUE, read_at=NOW() WHERE user_id=$1`, [userId]);
+
+      // Broadcast notifications ('all'/'free'/'pro' targets) may not have a
+      // user_notifications row for this user yet — getUserNotifications()
+      // surfaces them via a LEFT JOIN with is_read defaulting to FALSE, so
+      // without a row they'd appear unread forever. Create read rows for
+      // any such broadcasts the user is eligible to see.
       await this.db.query(`
-        DO $$ BEGIN
-          ALTER TABLE user_flashcard_progress ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'unseen';
-          ALTER TABLE user_flashcard_progress ADD COLUMN IF NOT EXISTS streak INTEGER DEFAULT 0;
-        EXCEPTION WHEN duplicate_column THEN NULL;
-        END $$;
-      `).catch(() => {});
-    });
+        INSERT INTO user_notifications (user_id, notification_id, title, body, is_read, read_at)
+        SELECT $1, n.id, n.title, n.body, TRUE, NOW()
+        FROM notifications n
+        WHERE n.status = 'sent'
+          AND NOT EXISTS (SELECT 1 FROM user_notifications un WHERE un.user_id=$1 AND un.notification_id=n.id)
+          AND (
+            n.target = 'all'
+            OR (n.target = 'pro' AND EXISTS(
+              SELECT 1 FROM subscriptions s WHERE s.user_id=$1 AND s.status='active' AND s.ends_at > NOW()
+            ))
+            OR (n.target = 'free' AND NOT EXISTS(
+              SELECT 1 FROM subscriptions s WHERE s.user_id=$1 AND s.status='active' AND s.ends_at > NOW()
+            ))
+          )
+      `, [userId]);
+    }
+    return successResponse(null, 'Marked as read');
+  }
 
-    return successResponse({ saved: true, flashcardId, rating });
+  async findAllAdmin(query: any) {
+    const result = await this.db.query(
+      `SELECT n.*, a.name AS created_by_name FROM notifications n LEFT JOIN admin_users a ON n.created_by=a.id ORDER BY n.created_at DESC LIMIT 50`
+    );
+    return successResponse({ notifications: result });
   }
 }
 
-@ApiTags('Flashcards')
-@ApiBearerAuth()
-@UseGuards(JwtAuthGuard)
-@Controller('flashcards')
-class FlashcardsController {
-  constructor(private s: FlashcardsService) {}
-
-  /** GET /api/v1/flashcards/progress — user's mastered/weak card IDs */
-  @Get('progress')
-  getProgress(@Req() r: any) { return this.s.getUserProgress(r.user.id); }
-
-  /** POST /api/v1/flashcards/progress — save card rating */
-  @Post('progress')
-  @HttpCode(HttpStatus.OK)
-  saveProgress(@Body() dto: any, @Req() r: any) {
-    return this.s.saveProgress(r.user.id, dto);
-  }
-
-  /** GET /api/v1/flashcards?subject=Polity&limit=200 */
-  @Get()
-  findAll(@Query() q: any) { return this.s.findAll(q); }
+@ApiTags('Notifications') @ApiBearerAuth() @UseGuards(JwtAuthGuard) @Controller('notifications')
+class NotificationsController {
+  constructor(private s: NotificationService) {}
+  @Get() getUserNotifs(@Query() q: any, @Req() r: any) { return this.s.getUserNotifications(r.user.id, q); }
+  /** GET /notifications/unread-count — fast single COUNT query, no list fetch */
+  @Get('unread-count') getUnreadCount(@Req() r: any) { return this.s.getUnreadCount(r.user.id); }
+  @Post('mark-read') @HttpCode(200) markRead(@Req() r: any, @Body() body: any) { return this.s.markRead(r.user.id, body.ids); }
 }
 
-@ApiTags('Admin — Flashcards')
-@ApiBearerAuth()
-@Public()
-@UseGuards(AdminJwtGuard, PermissionGuard)
-@Controller('admin/flashcards')
-class AdminFlashcardsController {
-  constructor(private s: FlashcardsService) {}
-
-  @Get()                @RequirePermission('library')    findAll(@Query() q: any)  { return this.s.findAllAdmin(q); }
-  @Post()               @RequirePermission('library')    @HttpCode(201) create(@Body() dto: any, @Req() r: any) { return this.s.create(dto, r.admin.id); }
-  @Put(':id')           @RequirePermission('library')    update(@Param('id', ParseUUIDPipe) id: string, @Body() dto: any) { return this.s.update(id, dto); }
-  @Delete(':id')        @RequirePermission('library')    remove(@Param('id', ParseUUIDPipe) id: string) { return this.s.remove(id); }
+@ApiTags('Admin — Notifications') @ApiBearerAuth() @Public()
+@UseGuards(AdminJwtGuard, PermissionGuard) @Controller('admin/notifications')
+class AdminNotificationsController {
+  constructor(private s: NotificationService) {}
+  @Get() @RequirePermission('notifications') findAll(@Query() q: any) { return this.s.findAllAdmin(q); }
+  @Post('send') @RequirePermission('notifications') @HttpCode(200) send(@Body() dto: any, @Req() r: any) { return this.s.send(dto, r.admin.id); }
 }
 
 @Module({
-  controllers: [FlashcardsController, AdminFlashcardsController],
-  providers:   [FlashcardsService],
+  imports:   [ConfigModule],
+  controllers: [NotificationsController, AdminNotificationsController],
+  providers: [
+    NotificationService,
+    { provide: 'NOTIFICATION_SERVICE', useExisting: NotificationService },
+  ],
+  exports: [NotificationService, 'NOTIFICATION_SERVICE'],
 })
-export class FlashcardsModule {}
+export class NotificationsModule {}
+
+// ════════════════════════════════════════════════════════════
+// COINS MODULE
+// ════════════════════════════════════════════════════════════
+@Injectable()
+class CoinsService {
+  constructor(
+    @InjectDataSource() private readonly db: DataSource,
+    private readonly config: ConfigService,
+    @Inject(CACHE_MANAGER) private readonly cache: Cache,
+  ) {}
+
+  async getBalance(userId: string) {
+    const [balance, earned, spent] = await Promise.all([
+      this.db.query(`SELECT coins FROM users WHERE id=$1`, [userId]),
+      this.db.query(`SELECT COALESCE(SUM(amount),0) AS total FROM coin_transactions WHERE user_id=$1 AND type='earned'`, [userId]),
+      this.db.query(`SELECT COALESCE(SUM(amount),0) AS total FROM coin_transactions WHERE user_id=$1 AND type='spent'`, [userId]),
+    ]);
+    return successResponse({
+      balance:     parseInt(balance[0]?.coins || 0),
+      totalEarned: parseInt(earned[0].total),
+      totalSpent:  parseInt(spent[0].total),
+    });
+  }
+
+  async getHistory(userId: string, query: any) {
+    const { page=1, limit=20 } = query;
+    const offset = (page-1)*limit;
+    const [rows, countResult] = await Promise.all([
+      this.db.query(`SELECT id, type, amount, description, action, created_at, balance FROM coin_transactions WHERE user_id=$1 ORDER BY created_at DESC LIMIT $2 OFFSET $3`, [userId, limit, offset]),
+      this.db.query(`SELECT COUNT(*) FROM coin_transactions WHERE user_id=$1`, [userId]),
+    ]);
+    return successResponse({ history: rows }, 'Success', paginationMeta(parseInt(countResult[0].count), page, limit));
+  }
+
+  async getRules() {
+    const rules = await this.db.query(
+      `SELECT cr.*, (SELECT COALESCE(SUM(amount),0) FROM coin_transactions WHERE action=cr.action AND type='earned') AS total_awarded FROM coin_rules ORDER BY created_at`
+    );
+    return successResponse({ rules });
+  }
+
+  async createRule(data: any) {
+    const { action, description, coinsAwarded, maxPerDay, isActive } = data;
+    if (!action || !description) throw new BadRequestException('action and description are required');
+    const [existing] = await this.db.query(`SELECT id FROM coin_rules WHERE action=$1`, [action]);
+    if (existing) {
+      await this.db.query(
+        `UPDATE coin_rules SET description=$1, coins_awarded=$2, max_per_day=$3, is_active=$4, updated_at=NOW() WHERE action=$5`,
+        [description, coinsAwarded ?? 5, maxPerDay ?? 1, isActive !== false, action]
+      );
+      return successResponse(null, 'Coin rule updated');
+    }
+    const [row] = await this.db.query(
+      `INSERT INTO coin_rules (action, description, coins_awarded, max_per_day, is_active) VALUES ($1,$2,$3,$4,$5) RETURNING *`,
+      [action, description, coinsAwarded ?? 5, maxPerDay ?? 1, isActive !== false]
+    );
+    return successResponse({ rule: row }, 'Coin rule created ✅');
+  }
+
+  async updateRule(ruleId: string, data: any) {
+    const fields: string[] = [], vals: any[] = [];
+    let i = 1;
+    if (data.coinsAwarded !== undefined) { fields.push(`coins_awarded=$${i++}`); vals.push(data.coinsAwarded); }
+    if (data.maxPerDay    !== undefined) { fields.push(`max_per_day=$${i++}`);   vals.push(data.maxPerDay); }
+    if (data.isActive     !== undefined) { fields.push(`is_active=$${i++}`);     vals.push(data.isActive); }
+    if (fields.length) { fields.push('updated_at=NOW()'); await this.db.query(`UPDATE coin_rules SET ${fields.join(',')} WHERE id=$${i}`, [...vals, ruleId]); }
+    return successResponse(null, 'Coin rule updated — effective immediately ✅');
+  }
+
+  async deleteRule(ruleId: string) {
+    await this.db.query(`DELETE FROM coin_rules WHERE id=$1`, [ruleId]);
+    return successResponse(null, 'Coin rule deleted');
+  }
+
+  async getTopEarners() {
+    const result = await this.db.query(
+      `SELECT id, name, primary_exam, coins, streak, avatar_url FROM users WHERE status='active' ORDER BY coins DESC LIMIT 50`
+    );
+    return successResponse({ earners: result });
+  }
+}
+
+@ApiTags('Coins') @ApiBearerAuth() @UseGuards(JwtAuthGuard) @Controller('coins')
+class CoinsController {
+  constructor(private s: CoinsService) {}
+  @Get('balance') getBalance(@Req() r: any) { return this.s.getBalance(r.user.id); }
+  @Get('history') getHistory(@Query() q: any, @Req() r: any) { return this.s.getHistory(r.user.id, q); }
+}
+
+// NOTE: AdminCoinsController must be declared BEFORE the @Module that references it
+@ApiTags('Admin — Coins') @ApiBearerAuth() @Public()
+@UseGuards(AdminJwtGuard, PermissionGuard) @Controller('admin/coins')
+class AdminCoinsController {
+  constructor(private s: CoinsService) {}
+  @Get('rules')        @RequirePermission('coins') getRules()    { return this.s.getRules(); }
+  @Post('rules')       @RequirePermission('coins') @HttpCode(HttpStatus.CREATED)
+    createRule(@Body() dto: any) { return this.s.createRule(dto); }
+    @Put('rules/:id')
+    @RequirePermission('coins')
+    updateRule(
+      @Param('id') id: string,
+      @Body() dto: any
+    ) {
+      return this.s.updateRule(id, dto);
+    }
+  @Delete('rules/:id') @RequirePermission('coins') @HttpCode(HttpStatus.OK)
+  deleteRule(
+    @Param('id') id: string
+  ) { return this.s.deleteRule(id); }
+  @Get('top-earners')  @RequirePermission('coins') getTopEarners() { return this.s.getTopEarners(); }
+}
+
+// ⚠️ @Module MUST be directly above the class it decorates
+@Module({ imports: [ConfigModule], controllers: [CoinsController, AdminCoinsController], providers: [CoinsService] })
+export class CoinsModule {}
