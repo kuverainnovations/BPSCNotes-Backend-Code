@@ -198,7 +198,10 @@ export class TierRoomsService {
       },
     };
     const result = successResponse(data);
-    await this.cache.set(cacheKey, result, 120);
+    // Reduced from 120s — progressItems/isClaimReady can go stale relative
+    // to the live data claimPromotion checks, letting the UI show "Claim
+    // Now" for up to 2 minutes after it's no longer true.
+    await this.cache.set(cacheKey, result, 30);
     return result;
   }
 
@@ -207,21 +210,50 @@ export class TierRoomsService {
     const offset = (page - 1) * limit;
     const [members, countResult] = await Promise.all([
       this.db.query(`
+        WITH this_tier AS (SELECT id FROM room_tiers WHERE tier_key=$1)
         SELECT u.id, u.name, u.streak, u.quizzes_attempted, u.accuracy,
                u.coins, u.xp, u.xp_level, u.total_study_minutes,
                urt.promoted_at, urt.next_tier_progress,
-               EXISTS(SELECT 1 FROM study_sessions WHERE user_id=u.id AND ended_at IS NULL) AS is_studying_now
-        FROM user_room_tier urt
-        JOIN users u ON u.id = urt.user_id
-        JOIN room_tiers t ON t.id = urt.current_tier_id
-        WHERE t.tier_key=$1 AND u.status='active'
+               EXISTS(
+                 SELECT 1 FROM study_sessions ss
+                 WHERE ss.user_id=u.id AND ss.ended_at IS NULL
+                   AND COALESCE(ss.room_tier_id, ss.tier_id) = (SELECT id FROM this_tier)
+               ) AS is_studying_now
+        FROM users u
+        LEFT JOIN user_room_tier urt ON urt.user_id = u.id
+        WHERE u.status='active' AND (
+          -- Home-tier roster: users whose own tier is this room
+          EXISTS(
+            SELECT 1 FROM user_room_tier urt2
+            JOIN room_tiers t ON t.id = urt2.current_tier_id
+            WHERE urt2.user_id = u.id AND t.tier_key = $1
+          )
+          -- Plus anyone currently studying in this room, even if their
+          -- home tier is different (e.g. studying in a lower unlocked tier)
+          OR EXISTS(
+            SELECT 1 FROM study_sessions ss
+            WHERE ss.user_id = u.id AND ss.ended_at IS NULL
+              AND COALESCE(ss.room_tier_id, ss.tier_id) = (SELECT id FROM this_tier)
+          )
+        )
         ORDER BY u.xp DESC, u.streak DESC
         LIMIT $2 OFFSET $3
       `, [tierKey, limit, offset]),
-      this.db.query(
-        `SELECT COUNT(*) FROM user_room_tier urt
-         JOIN room_tiers t ON t.id=urt.current_tier_id WHERE t.tier_key=$1`, [tierKey]
-      ),
+      this.db.query(`
+        SELECT COUNT(*) FROM users u
+        WHERE u.status='active' AND (
+          EXISTS(
+            SELECT 1 FROM user_room_tier urt
+            JOIN room_tiers t ON t.id = urt.current_tier_id
+            WHERE urt.user_id = u.id AND t.tier_key = $1
+          )
+          OR EXISTS(
+            SELECT 1 FROM study_sessions ss
+            JOIN room_tiers t2 ON t2.id = COALESCE(ss.room_tier_id, ss.tier_id)
+            WHERE ss.user_id = u.id AND ss.ended_at IS NULL AND t2.tier_key = $1
+          )
+        )
+      `, [tierKey]),
     ]);
     return successResponse({ members }, 'Success', paginationMeta(+countResult[0].count, +page, +limit));
   }
@@ -880,7 +912,7 @@ export class StudySessionsService {
 
   async getActiveSession(userId: string) {
     const rows = await this.db.query(`
-      SELECT ss.*, t.name AS tier_name, t.icon_emoji, t.color_hex
+      SELECT ss.*, t.name AS tier_name, t.tier_key AS room_tier_key, t.icon_emoji, t.color_hex
       FROM study_sessions ss
       LEFT JOIN room_tiers t ON t.id = COALESCE(ss.room_tier_id, ss.tier_id)
       WHERE ss.user_id=$1 AND ss.ended_at IS NULL LIMIT 1
@@ -895,7 +927,7 @@ export class StudySessionsService {
         activeMinutes: s.active_minutes, coinsEarned: s.coins_earned, xpEarned: s.xp_earned,
         afkCount: s.afk_count, isAfkNow: gapSecs > this.AFK_THRESHOLD_S,
         lastHeartbeat: s.last_heartbeat,
-        tier: s.tier_name ? { name: s.tier_name, iconEmoji: s.icon_emoji, colorHex: s.color_hex } : null,
+        tier: s.tier_name ? { tierKey: s.room_tier_key, name: s.tier_name, iconEmoji: s.icon_emoji, colorHex: s.color_hex } : null,
       },
     });
   }
