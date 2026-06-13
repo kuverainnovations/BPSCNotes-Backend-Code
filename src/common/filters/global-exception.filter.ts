@@ -20,12 +20,22 @@ export class GlobalExceptionFilter implements ExceptionFilter {
     let status  = HttpStatus.INTERNAL_SERVER_ERROR;
     let message = 'Internal server error';
     let errors: any = null;
+    let extra: Record<string, any> | null = null;
 
     if (exception instanceof HttpException) {
       status  = exception.getStatus();
       const res = exception.getResponse();
       message = typeof res === 'string' ? res : (res as any).message || message;
       errors  = typeof res === 'object' ? (res as any).errors : null;
+
+      // Preserve any additional structured fields the handler attached
+      // (e.g. price, razorpayOrderId, razorpayKeyId for PAYMENT_REQUIRED
+      // responses) so the client can act on them. Strip the keys we
+      // already surface separately to avoid duplication.
+      if (typeof res === 'object' && res !== null) {
+        const { message: _m, errors: _e, statusCode: _s, error: _err, ...rest } = res as any;
+        if (Object.keys(rest).length > 0) extra = rest;
+      }
 
     } else if (exception instanceof QueryFailedError) {
       const pgError = exception as any;
@@ -51,6 +61,7 @@ export class GlobalExceptionFilter implements ExceptionFilter {
       success:   false,
       message:   Array.isArray(message) ? message[0] : message,
       ...(errors && { errors }),
+      ...(extra && { data: extra }),
       ...(process.env.NODE_ENV !== 'production' && status >= 500 && {
         debug: (exception as any)?.message,
       }),
