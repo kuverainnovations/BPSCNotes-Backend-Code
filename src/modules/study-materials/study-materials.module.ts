@@ -517,7 +517,7 @@ if (query.search)  { conditions.push(`(sm.title ILIKE $${pi} OR sm.subject ILIKE
          WHERE ${where} ORDER BY sm.created_at DESC LIMIT $${pi++} OFFSET $${pi++}`,
         [...params, limit, offset]
       ),
-      this.db.query(`SELECT COUNT(*) FROM study_materials sm WHERE ${where}`, params),
+      this.db.query(`SELECT COUNT(*) FROM study_materials sm LEFT JOIN users u ON u.id=sm.uploader_id WHERE ${where}`, params),
     ]);
     return successResponse({
       materials: rows.map((m: any) => ({ ...m, fileUrl: m.file_key ? this.fileUrl(m.file_key) : null })),
