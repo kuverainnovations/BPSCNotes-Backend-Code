@@ -68,6 +68,10 @@ class CreateCourseDto {
   @ApiPropertyOptional() @IsOptional() @IsEnum(['draft','published','review']) status?: string;
   @ApiPropertyOptional() @IsOptional() @IsArray() whatYouLearn?: string[];
   @ApiPropertyOptional() @IsOptional() @IsBoolean() hasCertificate?: boolean;
+  // Per-course override for how many coins a buyer may redeem as a
+  // discount on this course. Null/omitted -> falls back to the global
+  // app_settings.max_coins_per_purchase setting.
+  @ApiPropertyOptional() @IsOptional() @Type(() => Number) @IsNumber() maxCoinsRedeemable?: number;
 }
 
 class SubmitReviewDto {
@@ -152,6 +156,7 @@ export class CoursesRepository {
          c.instructor_students, c.instructor_courses,
          c.subject, c.price, c.original_price, c.is_paid, c.is_featured,
          c.is_limited_offer, c.offer_ends_at, c.thumbnail_url,
+         c.max_coins_redeemable,
          (
    SELECT COUNT(*)
    FROM course_lessons cl
@@ -199,7 +204,9 @@ export class CoursesRepository {
                      'duration_mins',  l.duration_mins,
                      'type',           l.type,
                      'is_free_preview',l.is_free_preview,
-                     'is_locked',      (l.is_locked AND c.is_paid),
+                     'is_locked',      (l.is_locked AND NOT ${userId
+                       ? `EXISTS (SELECT 1 FROM user_enrollments ue WHERE ue.user_id=$2 AND ue.course_id=c.id)`
+                       : 'FALSE'}),
                      'sort_order',     l.sort_order,
                      'is_completed',   ${userId
                        ? `(SELECT lp.is_completed FROM lesson_progress lp WHERE lp.user_id=$2 AND lp.lesson_id=l.id LIMIT 1)`
@@ -280,8 +287,8 @@ export class CoursesRepository {
         instructor_students, instructor_courses,
         subject, price, original_price, is_paid, is_featured, total_lessons, total_hours,
         bpsc_relevance, language, trial_lesson_title, exam_tags, status,
-        what_you_learn, has_certificate, created_by)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22) RETURNING *`,
+        what_you_learn, has_certificate, created_by, max_coins_redeemable)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23) RETURNING *`,
       [
         data.title, slug, data.description, data.instructor, data.instructorBio,
         data.instructorStudents || '0', data.instructorCourses || 1,
@@ -290,6 +297,7 @@ export class CoursesRepository {
         data.totalHours || 0, data.bpscRelevance || 0, data.language || 'Hindi + English',
         data.trialLessonTitle, data.examTags || [], data.status || 'draft',
         data.whatYouLearn || [], data.hasCertificate !== false, adminId,
+        data.maxCoinsRedeemable ?? null,
       ]
     );
     return result[0];
@@ -311,6 +319,7 @@ export class CoursesRepository {
       examTags: 'exam_tags', status: 'status',
       whatYouLearn: 'what_you_learn', hasCertificate: 'has_certificate',
       rejection_reason: 'rejection_reason',
+      maxCoinsRedeemable: 'max_coins_redeemable',
     };
 
     for (const [key, col] of Object.entries(map)) {
@@ -380,7 +389,7 @@ export class CoursesService {
   }
 
   async enroll(courseId: string, userId: string, coinsToApply = 0) {
-    const course = await this.db.query(`SELECT id, is_paid, price, title FROM courses WHERE id=$1 AND status='published'`, [courseId]);
+    const course = await this.db.query(`SELECT id, is_paid, price, title, max_coins_redeemable FROM courses WHERE id=$1 AND status='published'`, [courseId]);
     if (!course.length) throw new NotFoundException('Course not found');
 
     if (course[0].is_paid) {
@@ -410,16 +419,25 @@ export class CoursesService {
         await this.db.query(`ALTER TABLE course_purchases ADD COLUMN IF NOT EXISTS coin_discount_inr INTEGER NOT NULL DEFAULT 0`);
 
         const individualPurchase = await this.db.query(
-          `SELECT id FROM course_purchases WHERE user_id=$1 AND course_id=$2 AND status='completed'`,
+          `SELECT id, amount FROM course_purchases WHERE user_id=$1 AND course_id=$2 AND status='completed'`,
           [userId, courseId]
         );
-        if (!individualPurchase.length) {
-          const coursePrice = course[0].price || 0;
+        const coursePrice = course[0].price || 0;
+        // A "completed" purchase recorded at ₹0 for a course that now has a
+        // real price is a stale row from before the price-fetch bug was
+        // fixed — it doesn't represent a genuine payment. Treat it as if no
+        // purchase exists so the user is correctly asked to pay.
+        const hasValidPurchase = individualPurchase.length > 0 &&
+          !(coursePrice > 0 && Number(individualPurchase[0].amount) === 0);
 
+        if (!hasValidPurchase) {
           // ── Coin discount (1 coin = coin_to_inr_rate ₹, capped) ──
-          const maxCoins      = await this.getSettingNumber('max_coins_per_purchase', 50);
-          const coinToInrRate = await this.getSettingNumber('coin_to_inr_rate', 1);
-          const coinsApplied  = Math.max(0, Math.min(Math.floor(coinsToApply || 0), maxCoins));
+          // Per-course override (admin-set max_coins_redeemable) takes
+          // priority over the global app_settings default.
+          const globalMaxCoins = await this.getSettingNumber('max_coins_per_purchase', 50);
+          const maxCoins       = course[0].max_coins_redeemable ?? globalMaxCoins;
+          const coinToInrRate  = await this.getSettingNumber('coin_to_inr_rate', 1);
+          const coinsApplied   = Math.max(0, Math.min(Math.floor(coinsToApply || 0), maxCoins));
 
           if (coinsApplied > 0) {
             const [userRow] = await this.db.query(`SELECT coins FROM users WHERE id=$1`, [userId]);
@@ -815,21 +833,16 @@ export class CoursesService {
     if (!rows[0]) throw new NotFoundException('Lesson not found');
     const lesson = rows[0];
 
-    // ── FIX: enforce access control based on course type ─────────
+    // ── Access control: a locked lesson requires enrollment,
+    // regardless of whether the course itself is free or paid.
+    // Free preview lessons (is_locked=false) are always accessible.
     if (lesson.is_locked) {
-      const [course] = await this.db.query(`SELECT is_paid FROM courses WHERE id=$1`,[courseId]);
-      if (course?.is_paid) {
-        // Paid course — check enrollment
-        const [enroll] = await this.db.query(
-          `SELECT id FROM user_enrollments WHERE user_id=$1 AND course_id=$2`,[userId,courseId]
-        );
-        if (!enroll) throw new ForbiddenException('Enroll to access this lesson');
-        // Enrolled user → unlock
-        lesson.is_locked = false;
-      } else {
-        // Free course — never locked
-        lesson.is_locked = false;
-      }
+      const [enroll] = await this.db.query(
+        `SELECT id FROM user_enrollments WHERE user_id=$1 AND course_id=$2`,[userId,courseId]
+      );
+      if (!enroll) throw new ForbiddenException('Enroll to access this lesson');
+      // Enrolled user → unlock
+      lesson.is_locked = false;
     }
 
     return successResponse({ lesson });
