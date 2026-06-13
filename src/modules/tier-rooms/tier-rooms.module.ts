@@ -24,7 +24,7 @@ import { ActivityLogService, ACTIONS } from '../../common/activity/activity-log.
 import { successResponse, paginationMeta } from '../../common/utils/response.util';
 import { TierNotificationsService } from './tier-notifications.service';
 import { TierRoomsGateway }       from './tier-rooms.gateway';
-import { AntiCheatService }       from './anti-cheat.service';
+import { AntiCheatService, AntiCheatCheckResult } from './anti-cheat.service';
 import { JwtModule } from '@nestjs/jwt';
 
 // ============================================================
@@ -532,11 +532,27 @@ export class StudySessionsService {
     private readonly antiCheat: AntiCheatService,
   ) {}
 
+  // Converts an anti-cheat BLOCK result into a human-readable message
+  // for the error response, instead of raw internal reason codes like
+  // "session_velocity" which mean nothing to the end user.
+  private antiCheatMessage(result: AntiCheatCheckResult): string {
+    switch (result.reason) {
+      case 'session_velocity': {
+        const max = result.details?.max ?? 8;
+        return `You've reached today's limit of ${max} study sessions. Please try again tomorrow.`;
+      }
+      case 'concurrent_session':
+        return 'You already have an active session. End it before starting a new one.';
+      default:
+        return result.details?.message || 'Unable to start session right now. Please try again later.';
+    }
+  }
+
   async startSession(userId: string, roomId?: string, mode: string = 'study') {
-    // ── Anti-cheat: session start checks ──────────────────
+    // ── Anti-cheat: block session velocity + concurrent session abuse ──
     const startCheck = await this.antiCheat.checkSessionStart(userId);
     if (startCheck.result === 'BLOCK') {
-      throw new BadRequestException(startCheck.reason || 'Session blocked');
+      throw new BadRequestException(this.antiCheatMessage(startCheck));
     }
 
     const existing = await this.db.query(
@@ -552,12 +568,6 @@ export class StudySessionsService {
     const tierId = tierRow[0]?.tier_id || null;
     const validModes = ['study','pomodoro','silent'];
     const sessionMode = validModes.includes(mode) ? mode : 'study';
-
-    // ── Anti-cheat: block session velocity + concurrent session abuse ──
-    const acStart = await this.antiCheat.checkSessionStart(userId);
-    if (acStart.result === 'BLOCK') {
-      throw new BadRequestException(`Session blocked: ${acStart.reason}. ${acStart.details?.message || ''}`);
-    }
 
     const session = await this.db.query(`
       INSERT INTO study_sessions (user_id, room_id, tier_id, mode, last_heartbeat)
