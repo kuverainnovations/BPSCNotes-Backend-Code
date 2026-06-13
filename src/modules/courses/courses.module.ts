@@ -853,16 +853,18 @@ export class CoursesService {
     // ── Access control: a locked lesson requires enrollment,
     // regardless of whether the course itself is free or paid.
     // Free preview lessons (is_locked=false) are always accessible.
+    const [enroll] = await this.db.query(
+      `SELECT id FROM user_enrollments WHERE user_id=$1 AND course_id=$2`,[userId,courseId]
+    );
+    const isEnrolled = !!enroll;
+
     if (lesson.is_locked) {
-      const [enroll] = await this.db.query(
-        `SELECT id FROM user_enrollments WHERE user_id=$1 AND course_id=$2`,[userId,courseId]
-      );
-      if (!enroll) throw new ForbiddenException('Enroll to access this lesson');
+      if (!isEnrolled) throw new ForbiddenException('Enroll to access this lesson');
       // Enrolled user → unlock
       lesson.is_locked = false;
     }
 
-    return successResponse({ lesson });
+    return successResponse({ lesson, isEnrolled });
   }
 
   async submitReview(courseId: string, userId: string, dto: SubmitReviewDto) {
