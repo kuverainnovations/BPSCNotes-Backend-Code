@@ -509,7 +509,7 @@ export class StudyMaterialsService {
     let pi = 1;
    if (query.status)  { conditions.push(`sm.status=$${pi++}`);      params.push(query.status); }
 if (query.subject) { conditions.push(`sm.subject=$${pi++}`);     params.push(query.subject); }
-if (query.search)  { conditions.push(`sm.title ILIKE $${pi++}`); params.push(`%${query.search}%`); }
+if (query.search)  { conditions.push(`(sm.title ILIKE $${pi} OR sm.subject ILIKE $${pi} OR u.name ILIKE $${pi})`); params.push(`%${query.search}%`); pi++; }
     const where = conditions.join(' AND ');
     const [rows, [cnt]] = await Promise.all([
       this.db.query(
