@@ -129,7 +129,8 @@ export class CoursesRepository {
         `SELECT c.id, c.title, c.description, c.instructor, c.instructor_bio,
                 COALESCE(c.instructor_students, '0') AS instructor_students,
                 c.subject, c.price, c.original_price, c.is_paid,
-                c.is_featured, c.is_limited_offer, c.offer_ends_at, c.thumbnail_url, (
+                c.is_featured, c.is_limited_offer, c.offer_ends_at, c.thumbnail_url,
+                c.max_coins_redeemable, (
    SELECT COUNT(*)
    FROM course_lessons cl
    WHERE cl.course_id = c.id
@@ -377,6 +378,15 @@ export class CoursesService {
     if (cached) return cached;
 
     const { rows, total } = await this.repo.findAll(query, userId);
+
+    // Resolve each course's effective coin-redemption cap (per-course
+    // override, falling back to the global app_settings default) so the
+    // client never has to guess.
+    const globalMaxCoins = await this.getSettingNumber('max_coins_per_purchase', 50);
+    for (const row of rows) {
+      row.max_coins_redeemable = row.max_coins_redeemable ?? globalMaxCoins;
+    }
+
     const result = successResponse({ courses: rows }, 'Success', paginationMeta(total, query.page, query.limit));
     await this.cache.set(cacheKey, result, 120);
     return result;
@@ -385,6 +395,14 @@ export class CoursesService {
   async findOne(courseId: string, userId?: string) {
     const course = await this.repo.findOneById(courseId, userId);
     if (!course) throw new NotFoundException('Course not found');
+
+    // Resolve the effective coin-redemption cap for this course: a
+    // per-course override (max_coins_redeemable) takes priority over the
+    // global app_settings.max_coins_per_purchase default. The Android
+    // client uses this directly instead of guessing a static value.
+    const globalMaxCoins = await this.getSettingNumber('max_coins_per_purchase', 50);
+    course.max_coins_redeemable = course.max_coins_redeemable ?? globalMaxCoins;
+
     return successResponse({ course });
   }
 
@@ -760,12 +778,11 @@ export class CoursesService {
   }) {
     const [maxRow] = await this.db.query(`SELECT COALESCE(MAX(sort_order),0)+1 AS next FROM course_lessons WHERE chapter_id=$1`,[chapterId]);
 
-    // ── FIX: free courses → all lessons unlocked by default ──────
-    const [courseRow] = await this.db.query(`SELECT is_paid FROM courses WHERE id=$1`,[courseId]);
-    const courseIsPaid = courseRow?.is_paid ?? true;
-    // Paid course: respect admin's explicit isLocked setting (default true)
-    // Free course: always unlocked regardless of what was passed
-    const shouldLock = courseIsPaid ? (data.isLocked !== false) : false;
+    // Lock status is per-lesson and independent of whether the course
+    // itself is free or paid — a locked lesson always requires enrollment
+    // (free-enroll for free courses, paid-enroll for paid courses).
+    // Defaults to locked unless the admin explicitly marks it free preview.
+    const shouldLock = data.isFreePreview ? false : (data.isLocked !== false);
 
     const [row] = await this.db.query(
       `INSERT INTO course_lessons (chapter_id,course_id,title,duration_mins,type,video_url,notes_url,is_free_preview,is_locked,sort_order)
@@ -915,28 +932,6 @@ export class CoursesService {
     return successResponse({ courses: rows });
   }
 
-  // ── Admin: Fix free-course lesson locks ──────────────────────
-  async unlockAllLessonsForFreeCourse(courseId: string) {
-    const [course] = await this.db.query(`SELECT is_paid, title FROM courses WHERE id=$1`,[courseId]);
-    if (!course) throw new NotFoundException('Course not found');
-    if (course.is_paid) throw new BadRequestException('Course is paid — lessons remain locked by design');
-    const result = await this.db.query(
-      `UPDATE course_lessons SET is_locked=FALSE, is_free_preview=TRUE
-       WHERE course_id=$1 RETURNING id`,
-      [courseId]
-    );
-    return successResponse({ unlockedCount: result.length }, `Unlocked ${result.length} lessons in "${course.title}" ✅`);
-  }
-
-  async bulkUnlockFreeCourses() {
-    const result = await this.db.query(`
-      UPDATE course_lessons cl SET is_locked=FALSE, is_free_preview=TRUE
-      FROM courses c
-      WHERE cl.course_id=c.id AND c.is_paid=FALSE AND cl.is_locked=TRUE
-      RETURNING cl.id
-    `);
-    return successResponse({ unlockedCount: result.length }, `Fixed ${result.length} locked lessons across all free courses ✅`);
-  }
 
   // Admin
   async findAllAdmin(query: CourseQueryDto) {
@@ -1202,19 +1197,6 @@ export class AdminCoursesController {
   @RequirePermission('courses')
   @HttpCode(HttpStatus.OK)
   deleteLesson(@Param('lessonId', ParseUUIDPipe) lessonId: string) { return this.service.deleteLesson(lessonId); }
-
-  // ── Free-course lesson lock fix endpoints ────────────────────
-  /** POST /admin/courses/bulk-fix-free-locks — unlock lessons on ALL free courses */
-  @Post('bulk-fix-free-locks')
-  @RequirePermission('courses')
-  @HttpCode(200)
-  bulkFixFreeLocks() { return this.service.bulkUnlockFreeCourses(); }
-
-  /** POST /admin/courses/:id/unlock-free-lessons — unlock one specific free course */
-  @Post(':id/unlock-free-lessons')
-  @RequirePermission('courses')
-  @HttpCode(200)
-  unlockFreeLessons(@Param('id', ParseUUIDPipe) id: string) { return this.service.unlockAllLessonsForFreeCourse(id); }
 }
 
 // ── Module ────────────────────────────────────────────────────
