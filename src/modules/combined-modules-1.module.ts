@@ -926,6 +926,7 @@ console.log('sample token:', tokens[0]);
            COALESCE(un.title, n.title)               AS title,
            COALESCE(un.body, n.body)                 AS body,
            n.type,
+           n.data,
            COALESCE(un.is_read, FALSE)               AS is_read,
            COALESCE(un.created_at, n.created_at)     AS created_at
          FROM notifications n
