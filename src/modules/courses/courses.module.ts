@@ -142,7 +142,13 @@ export class CoursesRepository {
    FROM course_lessons cl
    WHERE cl.course_id = c.id
 ) AS total_lessons,
-                c.total_hours, c.rating, c.review_count, c.enrollment_count, c.bpsc_relevance,
+                c.total_hours, c.rating, c.review_count,
+                (
+   SELECT COUNT(*)
+   FROM user_enrollments ue2
+   WHERE ue2.course_id = c.id
+) AS enrollment_count,
+                c.bpsc_relevance,
                 c.exam_tags, c.language, c.status, c.created_at, c.trial_lesson_title,
                 c.what_you_learn, c.has_certificate${userSubQuery}
          FROM courses c
@@ -170,7 +176,11 @@ export class CoursesRepository {
    FROM course_lessons cl
    WHERE cl.course_id = c.id
 ) AS total_lessons, c.total_hours, c.rating, c.review_count,
-         c.enrollment_count, c.bpsc_relevance, c.syllabus_coverage,
+         (
+   SELECT COUNT(*)
+   FROM user_enrollments ue2
+   WHERE ue2.course_id = c.id
+) AS enrollment_count, c.bpsc_relevance, c.syllabus_coverage,
          c.language, c.trial_lesson_title, c.exam_tags, c.status,
          c.what_you_learn, c.has_certificate,
          c.created_at, c.updated_at,
