@@ -41,7 +41,16 @@ class QuizzesService {
 
     if (type)    { conditions.push(`q.type=$${params.length + 1}`);            params.push(type); }
     if (subject) { conditions.push(`q.subject=$${params.length + 1}`);         params.push(subject); }
-    if (exam)    { conditions.push(`$${params.length + 1}=ANY(q.exam_tags)`);  params.push(exam); }
+    if (exam)    {
+      // A quiz with an empty/null exam_tags array is a "general" quiz
+      // meant for everyone. Filtering with `$X = ANY(exam_tags)` alone
+      // evaluates to FALSE for an empty array in Postgres, which would
+      // silently hide every untagged quiz (e.g. the daily Sunday Quiz)
+      // as soon as a user has an exam selected. Match either: tagged
+      // for this exam, OR untagged (general).
+      conditions.push(`($${params.length + 1}=ANY(q.exam_tags) OR q.exam_tags IS NULL OR q.exam_tags = '{}')`);
+      params.push(exam);
+    }
 
     const where = conditions.join(' AND ');
 

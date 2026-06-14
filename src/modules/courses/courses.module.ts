@@ -95,7 +95,14 @@ export class CoursesRepository {
     const params: any[]        = [];
 
     if (subject) { conditions.push(`c.subject = $${params.length + 1}`); params.push(subject); }
-    if (exam)    { conditions.push(`$${params.length + 1} = ANY(c.exam_tags)`); params.push(exam); }
+    if (exam)    {
+      // A course with no exam_tags is "general" — relevant to everyone.
+      // `$X = ANY(exam_tags)` alone is FALSE for an empty array, which
+      // would silently hide every untagged course once a user has an
+      // exam selected. Match either: tagged for this exam, OR untagged.
+      conditions.push(`($${params.length + 1} = ANY(c.exam_tags) OR c.exam_tags IS NULL OR c.exam_tags = '{}')`);
+      params.push(exam);
+    }
     if (type === 'free') conditions.push(`c.is_paid = FALSE`);
     if (type === 'paid') conditions.push(`c.is_paid = TRUE`);
     if (search)  {
