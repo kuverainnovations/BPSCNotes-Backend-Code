@@ -40,14 +40,6 @@ export const jwtConfig = registerAs('jwt', () => ({
   adminExpiresIn:    process.env.ADMIN_JWT_EXPIRES_IN || '24h',
 }));
 
-export const otpConfig = registerAs('otp', () => ({
-  msg91AuthKey:    process.env.MSG91_AUTH_KEY,
-  msg91TemplateId: process.env.MSG91_TEMPLATE_ID,
-  msg91SenderId:   process.env.MSG91_SENDER_ID || 'BPSCNT',
-  expiryMinutes:   parseInt(process.env.OTP_EXPIRY_MINUTES, 10) || 10,
-  maxAttempts:     parseInt(process.env.OTP_MAX_ATTEMPTS, 10) || 3,
-}));
-
 export const cloudinaryConfig = registerAs('cloudinary', () => ({
   cloudName:  process.env.CLOUDINARY_CLOUD_NAME,
   apiKey:     process.env.CLOUDINARY_API_KEY,
@@ -77,6 +69,6 @@ export const businessConfig = registerAs('business', () => ({
 
 export const allConfigs = [
   appConfig, dbConfig, redisConfig, jwtConfig,
-  otpConfig, cloudinaryConfig, firebaseConfig,
+  cloudinaryConfig, firebaseConfig,
   throttleConfig, businessConfig,
 ];

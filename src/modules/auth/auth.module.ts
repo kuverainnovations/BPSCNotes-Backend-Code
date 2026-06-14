@@ -21,9 +21,10 @@ import { Inject } from '@nestjs/common';
 import { CACHE_MANAGER } from '@nestjs/cache-manager';
 import { Cache } from 'cache-manager';
 import * as bcrypt from 'bcryptjs';
-import * as axios from 'axios';
+import * as admin from 'firebase-admin';
+import { ensureFirebaseAdmin } from '../../common/firebase/firebase-admin';
 import {
-  IsString, IsOptional, IsEmail, Length, Matches,
+  IsString, IsOptional, IsEmail, Length,
   IsNotEmpty,
 } from 'class-validator';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
@@ -35,22 +36,28 @@ import { successResponse } from '../../common/utils/response.util';
 import { ActivityLogService, ACTIONS } from '../../common/activity/activity-log.service';
 
 // ── DTOs ──────────────────────────────────────────────────────
-class SendOtpDto {
-  @ApiProperty({ example: '+919876543210' })
+// FIX: Migrated from MSG91 SMS OTP to Firebase Phone Authentication.
+// The Android app now performs phone verification directly via the
+// Firebase Auth SDK (which sends/verifies the SMS OTP client-side)
+// and sends us the resulting Firebase ID token. We verify that token
+// server-side with firebase-admin and trust its `phone_number` claim.
+class FirebaseLoginDto {
+  @ApiProperty({ example: 'eyJhbGciOiJSUzI1NiIs...' })
   @IsString()
-  @Matches(/^\+?91[6-9]\d{9}$/, { message: 'Invalid Indian mobile number' })
-  mobile: string;
+  @IsNotEmpty()
+  idToken: string;
 }
 
-class VerifyOtpDto {
-  @ApiProperty({ example: '+919876543210' })
+class ResetMpinFirebaseDto {
+  @ApiProperty({ example: 'eyJhbGciOiJSUzI1NiIs...' })
   @IsString()
-  mobile: string;
+  @IsNotEmpty()
+  idToken: string;
 
-  @ApiProperty({ example: '123456' })
+  @ApiProperty({ example: '1234' })
   @IsString()
-  @Length(6, 6, { message: 'OTP must be 6 digits' })
-  otp: string;
+  @Length(4, 4, { message: 'MPIN must be 4 digits' })
+  newMpin: string;
 }
 
 class RegisterDto {
@@ -115,94 +122,6 @@ class FcmTokenDto {
   fcmToken: string;
 }
 
-// ── OTP Service ───────────────────────────────────────────────
-@Injectable()
-export class OtpService {
-  constructor(
-    @InjectDataSource() private readonly db: DataSource,
-    private readonly config: ConfigService,
-  ) {}
-
-  async send(mobile: string): Promise<{ success: boolean; otp?: string }> {
-    const otpConfig = this.config.get('otp');
-    const otp       = this.generateOtp();
-    const expiryMins = otpConfig.expiryMinutes;
-
-    // Invalidate previous OTPs for this mobile
-    await this.db.query(`DELETE FROM otps WHERE mobile = $1 AND is_used = FALSE`, [mobile]);
-
-    // Store hashed OTP
-    const hash = await bcrypt.hash(otp, 6);
-    await this.db.query(
-      `INSERT INTO otps (mobile, otp_hash, expires_at) VALUES ($1, $2, NOW() + $3::INTERVAL)`,
-      [mobile, hash, `${expiryMins} minutes`]
-    );
-
-
-    if (this.config.get('app.env') === 'development') {
-      console.log(`📱 DEV OTP for ${mobile}: ${otp}`);
-      return { success: true, otp };
-    }
-
-    // TEMP: log OTP while DLT registration is pending — remove before launch
-    console.log(`📱 [TEMP] OTP for ${mobile}: ${otp}`);
-
-    try {
-      const msg91Response = await axios.default.post(
-        'https://api.msg91.com/api/v5/otp',
-        null,
-        {
-          params: {
-            authkey:     otpConfig.msg91AuthKey,
-            mobile:      `91${mobile.replace('+91', '')}`,
-            template_id: otpConfig.msg91TemplateId,
-            otp,
-          },
-        }
-      );
-      console.log(`📱 MSG91 response for ${mobile}:`, JSON.stringify(msg91Response.data));
-      return { success: true };
-    } catch (err) {
-      console.error('MSG91 error:', err.response?.data || err.message);
-      console.error('MSG91 status:', err.response?.status);
-      console.error('MSG91 config used — authkey:', otpConfig.msg91AuthKey?.slice(0,8) + '...', 'template:', otpConfig.msg91TemplateId);
-      throw new BadRequestException('Failed to send OTP. Please try again.');
-    }
-  }
-
-  async verify(mobile: string, otp: string): Promise<void> {
-    const otpConfig = this.config.get('otp');
-    const result = await this.db.query(
-      `SELECT id, otp_hash, expires_at, attempts FROM otps WHERE mobile = $1 AND is_used = FALSE ORDER BY created_at DESC LIMIT 1`,
-      [mobile]
-    );
-    if (!result.length) throw new BadRequestException('OTP not found or already used');
-
-    const record = result[0];
-    if (new Date() > new Date(record.expires_at)) {
-      await this.db.query(`DELETE FROM otps WHERE id = $1`, [record.id]);
-      throw new BadRequestException('OTP has expired. Please request a new one.');
-    }
-    if (record.attempts >= otpConfig.maxAttempts) {
-      await this.db.query(`DELETE FROM otps WHERE id = $1`, [record.id]);
-      throw new BadRequestException('Too many wrong attempts. Please request a new OTP.');
-    }
-
-    const isValid = await bcrypt.compare(otp, record.otp_hash);
-    if (!isValid) {
-      await this.db.query(`UPDATE otps SET attempts = attempts + 1 WHERE id = $1`, [record.id]);
-      const remaining = otpConfig.maxAttempts - (record.attempts + 1);
-      throw new BadRequestException(`Incorrect OTP. ${remaining} attempt(s) remaining.`);
-    }
-
-    await this.db.query(`UPDATE otps SET is_used = TRUE WHERE id = $1`, [record.id]);
-  }
-
-  private generateOtp(): string {
-    return Math.floor(100000 + Math.random() * 900000).toString();
-  }
-}
-
 // ── Auth Service ──────────────────────────────────────────────
 @Injectable()
 export class AuthService {
@@ -210,14 +129,40 @@ export class AuthService {
     @InjectDataSource() private readonly db: DataSource,
     private readonly jwtService: JwtService,
     private readonly config: ConfigService,
-    private readonly otpService: OtpService,
     @Inject(CACHE_MANAGER) private readonly cache: Cache,
     private readonly activityLog: ActivityLogService,
   ) {
   }
-  private generateAdminToken(admin: any) {
+
+  // ── Firebase Phone Auth ──────────────────────────────────────
+  // FIX: Migrated from MSG91 (server-sent SMS OTP + otps table) to
+  // Firebase Phone Authentication. The Android app verifies the
+  // phone number directly with Firebase (which handles sending and
+  // checking the SMS OTP) and gets back a Firebase ID token. We
+  // verify that token here with firebase-admin and trust its
+  // `phone_number` claim as the proven mobile number — no OTP
+  // storage/verification logic needed on our side anymore.
+  private async verifyFirebaseIdToken(idToken: string): Promise<string> {
+    if (!ensureFirebaseAdmin()) {
+      throw new BadRequestException('OTP verification is temporarily unavailable. Please try again shortly.');
+    }
+    let decoded: admin.auth.DecodedIdToken;
+    try {
+      decoded = await admin.auth().verifyIdToken(idToken);
+    } catch (err: any) {
+      console.error('Firebase verifyIdToken error:', err.message);
+      throw new UnauthorizedException('Invalid or expired verification. Please try again.');
+    }
+    const mobile = decoded.phone_number;
+    if (!mobile) {
+      throw new UnauthorizedException('No verified phone number found for this sign-in.');
+    }
+    return mobile;
+  }
+
+  private generateAdminToken(adminUser: any) {
     return this.jwtService.sign(
-      { adminId: admin.id },
+      { adminId: adminUser.id },
       {
         secret: this.config.get('jwt.adminSecret'),
         expiresIn: '1d',
@@ -225,17 +170,12 @@ export class AuthService {
     )
   }
 
-  async sendOtp(mobile: string) {
-    const result = await this.db.query(
-      `SELECT id, name FROM users WHERE mobile = $1 AND deleted_at IS NULL`, [mobile]
-    );
-    const isNewUser = !result.length;
-    const resp = await this.otpService.send(mobile);
-    return { isNewUser, ...(resp.otp && { otp: resp.otp }) };
-  }
-
-  async verifyOtp(mobile: string, otp: string) {
-    await this.otpService.verify(mobile, otp);
+  // FIX: replaces both sendOtp() and verifyOtp(). The Android app has
+  // already verified the phone number with Firebase by this point —
+  // we just verify the resulting ID token and proceed exactly as the
+  // old verifyOtp() did once OTP was confirmed.
+  async firebaseLogin(idToken: string) {
+    const mobile = await this.verifyFirebaseIdToken(idToken);
 
     const result = await this.db.query(
       `SELECT id, name, email, mobile, role, status, coins, streak, primary_exam,
@@ -263,7 +203,7 @@ export class AuthService {
       [tokens.refreshToken, user.id]
     );
     await this.awardCoins(user.id, 'daily_login');
-    await this.activityLog.log(user.id, ACTIONS.USER_LOGIN_OTP, 'Login via OTP', { mobile });
+    await this.activityLog.log(user.id, ACTIONS.USER_LOGIN_OTP, 'Login via Firebase OTP', { mobile });
 
     return {
       isNewUser: false,
@@ -897,26 +837,16 @@ export class AuthService {
     return { mpinCreated: true };
   }
 
-  // ── POST /auth/forgot-mpin (public — sends OTP) ──────
-  async forgotMpin(mobile: string) {
-    const [user] = await this.db.query(
-      `SELECT id, mpin_hash FROM users WHERE mobile=$1 AND deleted_at IS NULL`,
-      [mobile]
-    );
-    // Don't reveal if mobile exists — always return success
-    if (!user || !user.mpin_hash) {
-      // User doesn't exist or has no MPIN — send OTP anyway (security: don't leak info)
-      // If no user, OTP just gets thrown away. Android handles navigation same way.
-    }
-    await this.otpService.send(mobile);
-    return { otpSent: true };
-  }
-
-  // ── POST /auth/reset-mpin (public — OTP in body) ─────
-  async resetMpin(mobile: string, otp: string, newMpin: string) {
+  // ── POST /auth/reset-mpin-firebase (public — Firebase ID token in body) ─────
+  // FIX: replaces forgotMpin() + resetMpin(). The old forgotMpin() only
+  // existed to trigger an MSG91 OTP send — with Firebase, the Android
+  // app triggers phone verification directly via the Firebase SDK, so
+  // there's no equivalent backend "send" step. This single method
+  // verifies the Firebase ID token (proving the user controls this
+  // phone number) and resets the MPIN for that mobile.
+  async resetMpinFirebase(idToken: string, newMpin: string) {
     this.validateMpinStrength(newMpin);
-    // Verify OTP — throws if invalid/expired
-    await this.otpService.verify(mobile, otp);
+    const mobile = await this.verifyFirebaseIdToken(idToken);
 
     const [user] = await this.db.query(
       `SELECT id, status FROM users WHERE mobile=$1 AND deleted_at IS NULL`,
@@ -939,6 +869,7 @@ export class AuthService {
       `UPDATE users SET refresh_token=$1, last_active_at=NOW() WHERE id=$2`,
       [tokens.refreshToken, user.id]
     );
+    await this.db.query(`UPDATE users SET mobile_verified = TRUE WHERE id=$1`, [user.id]);
     await this.cache.del(`user:${user.id}`);
 
     return { isNewUser: false, hasMpin: true, ...tokens };
@@ -1043,20 +974,13 @@ export class AuthController {
   constructor(private readonly authService: AuthService) {}
 
   @Public()
-  @Post('send-otp')
+  @Public()
+  @Post('firebase-login')
   @HttpCode(HttpStatus.OK)
   @Throttle({ default: { limit: 30, ttl: 900000 } })
-  async sendOtp(@Body() dto: SendOtpDto) {
-    const data = await this.authService.sendOtp(dto.mobile);
-    return successResponse(data, `OTP sent to ${dto.mobile}`);
-  }
-
-  @Public()
-  @Post('verify-otp')
-  @HttpCode(HttpStatus.OK)
-  async verifyOtp(@Body() dto: VerifyOtpDto) {
-    const data = await this.authService.verifyOtp(dto.mobile, dto.otp);
-    const msg  = data.isNewUser ? 'OTP verified. Please complete registration.' : 'Login successful';
+  async firebaseLogin(@Body() dto: FirebaseLoginDto) {
+    const data = await this.authService.firebaseLogin(dto.idToken);
+    const msg  = data.isNewUser ? 'Phone verified. Please complete registration.' : 'Login successful';
     return successResponse(data, msg);
   }
 
@@ -1140,25 +1064,12 @@ export class AuthController {
     return successResponse(data, 'MPIN created successfully! Use it to login next time \u{1F512}');
   }
 
-  /** POST /auth/forgot-mpin — public, triggers MSG91 OTP */
+  /** POST /auth/reset-mpin-firebase — public, Firebase ID token verified inside, returns JWT */
   @Public()
-  @Post('forgot-mpin')
+  @Post('reset-mpin-firebase')
   @HttpCode(HttpStatus.OK)
-  @Throttle({ default: { limit: 20, ttl: 900000 } })
-  async forgotMpin(@Body() dto: { mobile: string }) {
-    if (!dto.mobile) throw new BadRequestException('mobile required');
-    const data = await this.authService.forgotMpin(dto.mobile);
-    return successResponse(data, 'OTP sent. Enter it to reset your MPIN.');
-  }
-
-  /** POST /auth/reset-mpin — public, OTP verified inside, returns JWT */
-  @Public()
-  @Post('reset-mpin')
-  @HttpCode(HttpStatus.OK)
-  async resetMpin(@Body() dto: { mobile: string; otp: string; newMpin: string }) {
-    if (!dto.mobile || !dto.otp || !dto.newMpin)
-      throw new BadRequestException('mobile, otp, and newMpin required');
-    const data = await this.authService.resetMpin(dto.mobile, dto.otp, dto.newMpin);
+  async resetMpinFirebase(@Body() dto: ResetMpinFirebaseDto) {
+    const data = await this.authService.resetMpinFirebase(dto.idToken, dto.newMpin);
     return successResponse(data, 'MPIN reset successfully! You are now logged in.');
   }
 
@@ -1215,7 +1126,7 @@ export class AuthController {
     }),
   ],
   controllers: [AuthController],
-  providers:   [AuthService, OtpService, UserJwtStrategy, AdminJwtStrategy, ActivityLogService],
+  providers:   [AuthService, UserJwtStrategy, AdminJwtStrategy, ActivityLogService],
   exports:     [AuthService, UserJwtStrategy, AdminJwtStrategy, ActivityLogService],
 })
 export class AuthModule {}
