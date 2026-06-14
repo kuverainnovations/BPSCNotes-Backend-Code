@@ -72,3 +72,5 @@ export const allConfigs = [
   cloudinaryConfig, firebaseConfig,
   throttleConfig, businessConfig,
 ];
+
+// Test
