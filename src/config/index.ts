@@ -73,4 +73,3 @@ export const allConfigs = [
   throttleConfig, businessConfig,
 ];
 
-// Test
