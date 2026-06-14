@@ -840,7 +840,23 @@ class UsersService {
              AND ca.created_at >= NOW() - INTERVAL '28 days'
            GROUP BY DATE(ca.created_at)
          ),
-      
+
+         lesson_activity AS (
+           -- FIX: course lesson watch time (video/PDF lessons) was never
+           -- counted toward the study-time heatmap at all, even though
+           -- it's the main way most users spend their study time.
+           -- watch_time_secs is recorded per-lesson in lesson_progress
+           -- and completed_at is updated each time a lesson is marked
+           -- complete, so attribute that lesson's watch time to that day.
+           SELECT
+             DATE(lp.completed_at) AS date,
+             CEIL(SUM(lp.watch_time_secs)::numeric / 60)::int AS study_mins
+           FROM lesson_progress lp
+           WHERE lp.user_id = $1
+             AND lp.completed_at >= NOW() - INTERVAL '28 days'
+           GROUP BY DATE(lp.completed_at)
+         ),
+
          combined AS (
            SELECT
              date,
@@ -851,6 +867,8 @@ class UsersService {
              SELECT date, study_mins FROM session_activity
              UNION ALL
              SELECT date, study_mins FROM ca_reading_activity
+             UNION ALL
+             SELECT date, study_mins FROM lesson_activity
            ) src
            GROUP BY date
          )
@@ -1207,10 +1225,15 @@ class BannersService {
   }
 
   async create(data: any, adminId: string) {
+    // FIX: admin form sends the chosen color as bg_color / bgColor (hex
+    // from a color-picker input), not bgGradient. Previously this read
+    // data.bgGradient (always undefined), so bg_gradient was always
+    // stored as NULL and the app fell back to the default blue gradient.
+    const bgValue = data.bg_color ?? data.bgColor ?? data.bgGradient ?? null;
     const result = await this.db.query(
       `INSERT INTO banners (title, subtitle, image_url, action_link, type, target, bg_gradient, sort_order, created_by)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
-      [data.title, data.subtitle, data.imageUrl, data.actionLink, data.type||'promotion', data.target||'all', data.bgGradient, data.sortOrder||0, adminId]
+      [data.title, data.subtitle, data.imageUrl, data.actionLink ?? data.ctaRoute ?? null, data.type||'promotion', data.target||'all', bgValue, data.sortOrder||0, adminId]
     );
     await this.invalidateCache();
     return successResponse({ banner: result[0] }, 'Banner created — live in app ✅');
@@ -1222,6 +1245,15 @@ class BannersService {
     const map: any = { title:'title', subtitle:'subtitle', isActive:'is_active', sortOrder:'sort_order', actionLink:'action_link', imageUrl:'image_url' };
     for (const [key, col] of Object.entries(map)) {
       if (data[key] !== undefined) { fields.push(`${col}=$${i++}`); vals.push(data[key]); }
+    }
+    // FIX: color edits were silently dropped — the update field map never
+    // included a color/bg_gradient mapping at all, even though the admin
+    // form sends bg_color/bgColor on every save.
+    const bgValue = data.bg_color ?? data.bgColor ?? data.bgGradient;
+    if (bgValue !== undefined) { fields.push(`bg_gradient=$${i++}`); vals.push(bgValue); }
+    // FIX: admin form sends ctaRoute for the action link on edit too.
+    if (data.actionLink === undefined && data.ctaRoute !== undefined) {
+      fields.push(`action_link=$${i++}`); vals.push(data.ctaRoute);
     }
     if (fields.length) { fields.push('updated_at=NOW()'); await this.db.query(`UPDATE banners SET ${fields.join(',')} WHERE id=$${i}`, [...vals, bannerId]); }
     await this.invalidateCache();
@@ -1243,9 +1275,17 @@ class BannersService {
   }
 
   private async invalidateCache() {
-    // Delete all banner cache keys — in production use Redis SCAN
-    const patterns = ['banners:all', 'banners:BPSC 70th CCE', 'banners:Bihar Police SI'];
-    for (const key of patterns) await this.cache.del(key);
+    // FIX: previously used a hardcoded list of cache keys
+    // ('banners:all', 'banners:BPSC 70th CCE', 'banners:Bihar Police SI')
+    // that don't match this system's actual exam names — so after an
+    // admin edit, users whose exam wasn't one of those three hardcoded
+    // strings kept seeing the STALE cached banner list (old sort order /
+    // old color / missing image) for up to the 120s cache TTL.
+    // Now we invalidate 'banners:all' plus every distinct `target` value
+    // actually present in the banners table.
+    const targets = await this.db.query(`SELECT DISTINCT target FROM banners`);
+    const keys = ['banners:all', ...targets.map((t: any) => `banners:${t.target}`)];
+    for (const key of new Set(keys)) await this.cache.del(key);
   }
 }
 

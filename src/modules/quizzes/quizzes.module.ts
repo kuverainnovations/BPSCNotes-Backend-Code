@@ -308,6 +308,13 @@ if (q.scheduled_for) {
     // Invalidate quiz cache
     await this.cache.del(`quiz_meta:${quizId}`);
 
+    // FIX: quizzes_attempted/accuracy/total_study_minutes just changed
+    // above, but the Group Study "My Tier" stats (StatPills + Progress
+    // to next tier) are cached under user_tier:<userId> with no
+    // invalidation hook here — so they kept showing stale (often 0)
+    // values until that cache happened to expire on its own.
+    await this.cache.del(`user_tier:${userId}`);
+
     // ANTI-CHEAT: Only award coins on the FIRST passing attempt for this quiz
     let coinsEarned = 0;
     if (isFirstPass) {

@@ -207,6 +207,9 @@ class CurrentAffairsService {
       [durationMins, userId]
     );
     await this.cache.del(`user:${userId}`);
+    // Group Study tier stats (Study Hours requirement / StatPills) are
+    // cached and otherwise wouldn't reflect this change.
+    await this.cache.del(`user_tier:${userId}`);
 
     return successResponse({ logged: true, durationSecs: safeDuration });
   }

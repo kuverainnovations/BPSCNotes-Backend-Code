@@ -671,6 +671,21 @@ export class CoursesService {
   }
 
   async completeLesson(courseId: string, lessonId: string, userId: string, dto: CompleteLessonDto) {
+    // FIX: lesson watch time was recorded in lesson_progress but NEVER
+    // added to users.total_study_minutes — so course-lesson study time
+    // was invisible both to the Study Heatmap and to the Group Study
+    // tier system's "Study Hours" requirement. watch_time_secs only ever
+    // increases (kept as a running max), so compute the DELTA from the
+    // previous value and add just that to the global counter — avoids
+    // double-counting on repeat completions.
+    const prevRow = await this.db.query(
+      `SELECT watch_time_secs FROM lesson_progress WHERE user_id=$1 AND lesson_id=$2`,
+      [userId, lessonId]
+    );
+    const prevWatchSecs = prevRow[0]?.watch_time_secs || 0;
+    const newWatchSecs  = dto.watchTimeSecs || 0;
+    const deltaSecs     = Math.max(0, newWatchSecs - prevWatchSecs);
+
     await this.db.query(
       `
       INSERT INTO lesson_progress (
@@ -690,6 +705,16 @@ export class CoursesService {
       `,
       [userId, lessonId, dto.watchTimeSecs || 0]
     );
+
+    if (deltaSecs > 0) {
+      await this.db.query(
+        `UPDATE users SET total_study_minutes = total_study_minutes + $1 WHERE id=$2`,
+        [Math.ceil(deltaSecs / 60), userId]
+      );
+      // Group Study tier stats (Study Hours requirement / StatPills) are
+      // cached and otherwise wouldn't reflect this change.
+      await this.cache.del(`user_tier:${userId}`);
+    }
 
     const progress = await this.db.query(
       `SELECT COUNT(*) AS completed FROM lesson_progress lp
