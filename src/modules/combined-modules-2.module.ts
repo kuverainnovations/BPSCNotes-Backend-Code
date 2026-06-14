@@ -1209,7 +1209,7 @@ class BannersService {
     if (cached) return cached;
 
     const rows = await this.db.query(
-      `SELECT id, title, subtitle, image_url, action_link, type, bg_gradient, target
+      `SELECT id, title, subtitle, image_url, action_link, type, bg_gradient, target, cta_label
        FROM banners WHERE is_active=TRUE AND (target='all' OR target=$1)
        ORDER BY sort_order ASC, created_at DESC LIMIT 10`,
       [userExam || 'all']
@@ -1230,10 +1230,11 @@ class BannersService {
     // data.bgGradient (always undefined), so bg_gradient was always
     // stored as NULL and the app fell back to the default blue gradient.
     const bgValue = data.bg_color ?? data.bgColor ?? data.bgGradient ?? null;
+    const ctaLabel = data.ctaLabel ?? data.cta_label ?? null;
     const result = await this.db.query(
-      `INSERT INTO banners (title, subtitle, image_url, action_link, type, target, bg_gradient, sort_order, created_by)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
-      [data.title, data.subtitle, data.imageUrl, data.actionLink ?? data.ctaRoute ?? null, data.type||'promotion', data.target||'all', bgValue, data.sortOrder||0, adminId]
+      `INSERT INTO banners (title, subtitle, image_url, action_link, type, target, bg_gradient, sort_order, created_by, cta_label)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,
+      [data.title, data.subtitle, data.imageUrl, data.actionLink ?? data.ctaRoute ?? null, data.type||'promotion', data.target||'all', bgValue, data.sortOrder||0, adminId, ctaLabel]
     );
     await this.invalidateCache();
     return successResponse({ banner: result[0] }, 'Banner created — live in app ✅');
@@ -1242,7 +1243,7 @@ class BannersService {
   async update(bannerId: string, data: any) {
     const fields: string[] = [], vals: any[] = [];
     let i = 1;
-    const map: any = { title:'title', subtitle:'subtitle', isActive:'is_active', sortOrder:'sort_order', actionLink:'action_link', imageUrl:'image_url' };
+    const map: any = { title:'title', subtitle:'subtitle', isActive:'is_active', sortOrder:'sort_order', actionLink:'action_link', imageUrl:'image_url', ctaLabel:'cta_label' };
     for (const [key, col] of Object.entries(map)) {
       if (data[key] !== undefined) { fields.push(`${col}=$${i++}`); vals.push(data[key]); }
     }
