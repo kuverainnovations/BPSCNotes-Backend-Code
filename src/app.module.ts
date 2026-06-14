@@ -32,7 +32,7 @@ import { CoinsModule } from './modules/coins/coins.module';
 
 import {
   StudyRoomsModule, UsersModule, BannersModule, ExamsModule, DailyTargetsModule,
-  FlashcardsModule, AdminUploadModule,
+  FlashcardsModule, AdminUploadModule, DistrictsModule,
 } from './modules/combined-modules-2.module';
 import { TierRoomsModule }    from './modules/tier-rooms/tier-rooms.module';
 import { AchievementsModule } from './modules/achievements/achievements.module';
@@ -127,6 +127,7 @@ import { MarketplaceModule }   from './modules/marketplace.module';
     UsersModule,
     BannersModule,
     ExamsModule,
+    DistrictsModule,
     DailyTargetsModule,
     FlashcardsModule,
     AdminUploadModule,

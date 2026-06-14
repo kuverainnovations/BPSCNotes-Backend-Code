@@ -1344,6 +1344,101 @@ class AdminExamsController {
 export class ExamsModule {}
 
 // ════════════════════════════════════════════════════════════
+// DISTRICTS MODULE
+// GET   /api/v1/districts        — active districts for dropdowns (public)
+// GET   /admin/districts         — admin list (all, incl. inactive)
+// POST  /admin/districts         — create
+// PUT   /admin/districts/:id     — update (rename, reorder, activate/deactivate)
+// DELETE /admin/districts/:id    — remove
+// ════════════════════════════════════════════════════════════
+@Injectable()
+class DistrictsService {
+  constructor(
+    @InjectDataSource() private readonly db: DataSource,
+    @Inject(CACHE_MANAGER) private readonly cache: Cache,
+  ) {}
+
+  async findAll(state?: string) {
+    const cacheKey = `districts:active:${state || 'all'}`;
+    const cached   = await this.cache.get(cacheKey);
+    if (cached) return cached;
+
+    const params: any[] = [];
+    let where = 'is_active = TRUE';
+    if (state) { where += ` AND state = $1`; params.push(state); }
+
+    const rows = await this.db.query(
+      `SELECT id, name, state FROM districts WHERE ${where} ORDER BY sort_order, name`,
+      params
+    );
+    const result = successResponse({ districts: rows });
+    await this.cache.set(cacheKey, result, 600); // 10 min — districts change rarely
+    return result;
+  }
+
+  async findAllAdmin() {
+    const rows = await this.db.query(
+      `SELECT * FROM districts ORDER BY sort_order, name`
+    );
+    return successResponse({ districts: rows });
+  }
+
+  async create(data: any) {
+    if (!data.name) throw new BadRequestException('name is required');
+    const result = await this.db.query(
+      `INSERT INTO districts (name, state, sort_order) VALUES ($1,$2,$3) RETURNING *`,
+      [data.name, data.state || 'Bihar', data.sortOrder ?? 0]
+    );
+    await this.invalidateCache();
+    return successResponse({ district: result[0] }, 'District added ✅');
+  }
+
+  async update(id: string, data: any) {
+    const fields: string[] = [], vals: any[] = [];
+    let i = 1;
+    const map: any = { name: 'name', state: 'state', isActive: 'is_active', sortOrder: 'sort_order' };
+    for (const [key, col] of Object.entries(map)) {
+      if (data[key] !== undefined) { fields.push(`${col}=$${i++}`); vals.push(data[key]); }
+    }
+    if (!fields.length) throw new BadRequestException('No fields to update');
+    fields.push('updated_at=NOW()');
+    await this.db.query(`UPDATE districts SET ${fields.join(',')} WHERE id=$${i}`, [...vals, id]);
+    await this.invalidateCache();
+    return successResponse(null, 'District updated ✅');
+  }
+
+  async remove(id: string) {
+    await this.db.query(`DELETE FROM districts WHERE id=$1`, [id]);
+    await this.invalidateCache();
+    return successResponse(null, 'District removed ✅');
+  }
+
+  private async invalidateCache() {
+    await this.cache.del('districts:active:all');
+    await this.cache.del('districts:active:Bihar');
+  }
+}
+
+@ApiTags('Districts') @Public() @Controller('districts')
+class DistrictsController {
+  constructor(private s: DistrictsService) {}
+  @Get() findAll(@Query('state') state?: string) { return this.s.findAll(state); }
+}
+
+@ApiTags('Admin — Districts') @ApiBearerAuth() @Public()
+@UseGuards(AdminJwtGuard, PermissionGuard) @Controller('admin/districts')
+class AdminDistrictsController {
+  constructor(private s: DistrictsService) {}
+  @Get()      @RequirePermission('settings') findAll() { return this.s.findAllAdmin(); }
+  @Post()     @RequirePermission('settings') @HttpCode(201) create(@Body() dto: any) { return this.s.create(dto); }
+  @Put(':id') @RequirePermission('settings') update(@Param('id', ParseUUIDPipe) id: string, @Body() dto: any) { return this.s.update(id, dto); }
+  @Delete(':id') @RequirePermission('settings') remove(@Param('id', ParseUUIDPipe) id: string) { return this.s.remove(id); }
+}
+
+@Module({ controllers: [DistrictsController, AdminDistrictsController], providers: [DistrictsService] })
+export class DistrictsModule {}
+
+// ════════════════════════════════════════════════════════════
 // FLASHCARDS MODULE
 // GET  /api/v1/flashcards          — list for Active Recall screen
 // GET  /admin/flashcards           — admin list with full fields
