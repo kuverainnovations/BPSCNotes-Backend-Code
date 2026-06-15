@@ -11,99 +11,131 @@ import { Cache }                  from 'cache-manager';
 import { Inject }                 from '@nestjs/common';
 import { ApiTags, ApiBearerAuth } from '@nestjs/swagger';
 import { JwtAuthGuard, AdminJwtGuard } from '../../common/guards';
-import { AuthModule }             from '../auth/auth.module';
+import { AuthModule, AuthService } from '../auth/auth.module';
 import { successResponse }        from '../../common/utils/response.util';
 
 // ════════════════════════════════════════════════════════════
 // FILE: backend/src/modules/coins/coins.module.ts
 //
+// COIN ECONOMY — single source of truth is the `coin_rules` table
+// (see migration 1781700000000-UnifyCoinEconomy). Every coin-earning
+// action's amount/cap/active-state lives there and is fully editable
+// from the admin "Coins" page; AuthService.awardCoins() reads it for
+// every award across the whole app.
+//
 // Powers: CoinWalletScreen
 // Endpoints:
-//   GET  /coins/balance       — balance + streak + 7-day check-in grid
-//   GET  /coins/tasks         — earn tasks with completion status
-//   GET  /coins/transactions  — paginated history
-//   POST /coins/check-in      — daily check-in (idempotent)
-//   POST /coins/tasks/:id/claim — claim a task reward
+//   GET  /coins/balance        — balance + streak + 7-day check-in grid
+//   GET  /coins/tasks          — wallet "earn" cards, amounts from coin_rules
+//   GET  /coins/transactions   — paginated history
+//   GET  /coins/config         — full rules + economy config (single feed for the app)
+//   POST /coins/check-in       — daily check-in (idempotent, dynamic reward ladder)
+//   POST /coins/tasks/:id/claim — claim a task reward (only ad_watch / study_session
+//                                  actually award here; others are informational —
+//                                  they're auto-awarded by their real flows)
+//   POST /coins/ad-reward      — credit coins for a watched rewarded ad
+//   GET  /coins/ad-config      — coins-per-ad + min-ads-per-session
+//
+// Admin (admin.bpscnotes.in/coins):
+//   GET    /admin/coins/rules        — every coin-earning action, with category/icon/unit
+//   POST   /admin/coins/rules        — create a custom action
+//   PUT    /admin/coins/rules/:id    — edit coins/cap/active/description/etc
+//   DELETE /admin/coins/rules/:id    — delete (core actions can only be deactivated)
+//   GET/PUT /admin/coins/economy     — master switch, coin↔₹ rate, redemption caps,
+//                                       check-in reward ladder, ad settings
+//   GET/PUT /admin/coins/ad-config   — legacy alias, kept for the existing UI section
+//   GET    /admin/coins/stats        — circulating supply, txns today/this week
+//   GET    /admin/coins/top-earners  — leaderboard by total coins earned
 // ════════════════════════════════════════════════════════════
 
-// ── Task definitions (static catalogue, no separate table needed) ─
-// These are the earn tasks shown in CoinWalletScreen.
-// Completion is checked dynamically against user activity.
-const EARN_TASKS = [
+// ── Wallet "Earn Tasks" — DISPLAY metadata only (title/icon/colors/
+// navigation). The coin AMOUNT, daily cap and active state for each
+// of these always come live from coin_rules, so admin edits on the
+// Coins page are reflected immediately without a code change. ──────
+const WALLET_TASKS = [
   {
-    id:           'daily_quiz',
-    title:        'Complete Daily Quiz',
-    subtitle:     'Answer today\'s quiz correctly',
-    icon:         'quiz',
-    action:       'quiz_attempt',
-    coinsReward:  10,
-    actionLabel:  'Take Quiz',
-    actionBgHex:  '#1565C0',
-    iconBgHex:    '#E3F2FD',
-    iconTintHex:  '#1565C0',
-    actionTextColorHex: '#FFFFFF',
-    isAd:         false,
+    action: 'daily_quiz', title: "Complete Daily Quiz", subtitle: "Answer today's quiz correctly",
+    icon: 'quiz', actionLabel: 'Take Quiz',
+    actionBgHex: '#1565C0', iconBgHex: '#E3F2FD', iconTintHex: '#1565C0', isAd: false,
   },
   {
-    id:           'study_session',
-    title:        'Complete Study Session',
-    subtitle:     'Study for at least 30 minutes',
-    icon:         'study',
-    action:       'study_session',
-    coinsReward:  15,
-    actionLabel:  'Study Now',
-    actionBgHex:  '#2E7D32',
-    iconBgHex:    '#E8F5E9',
-    iconTintHex:  '#2E7D32',
-    actionTextColorHex: '#FFFFFF',
-    isAd:         false,
+    action: 'study_session', title: 'Complete Study Session', subtitle: 'Study for at least 30 minutes',
+    icon: 'study', actionLabel: 'Study Now',
+    actionBgHex: '#2E7D32', iconBgHex: '#E8F5E9', iconTintHex: '#2E7D32', isAd: false,
   },
   {
-    id:           'upload_note',
-    title:        'Upload Study Notes',
-    subtitle:     'Share notes with the community',
-    icon:         'study',
-    action:       'material_upload',
-    coinsReward:  25,
-    actionLabel:  'Upload',
-    actionBgHex:  '#FF8F00',
-    iconBgHex:    '#FFF3E0',
-    iconTintHex:  '#FF8F00',
-    actionTextColorHex: '#FFFFFF',
-    isAd:         false,
+    action: 'material_upload', title: 'Upload Study Notes', subtitle: 'Share notes with the community',
+    icon: 'study', actionLabel: 'Upload',
+    actionBgHex: '#FF8F00', iconBgHex: '#FFF3E0', iconTintHex: '#FF8F00', isAd: false,
   },
   {
-    id:           'referral',
-    title:        'Refer a Friend',
-    subtitle:     'Invite friends and earn coins',
-    icon:         'referral',
-    action:       'referral',
-    coinsReward:  75,
-    actionLabel:  'Invite',
-    actionBgHex:  '#7B1FA2',
-    iconBgHex:    '#F3E5F5',
-    iconTintHex:  '#7B1FA2',
-    actionTextColorHex: '#FFFFFF',
-    isAd:         false,
+    action: 'referral_signup', title: 'Refer a Friend', subtitle: 'Invite friends and earn coins',
+    icon: 'referral', actionLabel: 'Invite',
+    actionBgHex: '#7B1FA2', iconBgHex: '#F3E5F5', iconTintHex: '#7B1FA2', isAd: false,
   },
   {
-    id:           'watch_ad',
-    title:        'Watch a Short Ad',
-    subtitle:     'Watch a 30-second ad to earn',
-    icon:         'ad',
-    action:       'ad_watch',
-    coinsReward:  5,
-    actionLabel:  'Watch',
-    actionBgHex:  '#E74C3C',
-    iconBgHex:    '#FEE8E8',
-    iconTintHex:  '#E74C3C',
-    actionTextColorHex: '#FFFFFF',
-    isAd:         true,
+    action: 'ad_watch', title: 'Watch a Short Ad', subtitle: 'Watch a short ad to earn coins',
+    icon: 'ad', actionLabel: 'Watch',
+    actionBgHex: '#E74C3C', iconBgHex: '#FEE8E8', iconTintHex: '#E74C3C', isAd: true,
   },
-];
+] as const;
 
-// ── Daily check-in rewards per day (day 1–7) ──────────────────
-const CHECKIN_REWARDS = [5, 5, 10, 10, 15, 15, 25]; // day 1→5, 2→5, ... 7→25
+// Fallback only — used if app_settings.checkin_streak_rewards is
+// missing/invalid. Admin edits this ladder from the Coins page.
+const DEFAULT_CHECKIN_REWARDS = [5, 5, 10, 10, 15, 15, 25];
+
+interface EconomySettings {
+  enabled: boolean;
+  coinToInrRate: number;
+  maxCoinsPerPurchase: number;
+  maxCoinDiscountPctSubscription: number;
+  checkInRewards: number[];
+  adMinPerSession: number;
+}
+
+// Reads the consolidated "coin economy" app_settings block (cached
+// 5 min). Shared by CoinsService and AdminCoinsService so the wallet,
+// the unified /coins/config feed, and the admin Coins page always
+// agree on the same numbers.
+async function readEconomySettings(db: DataSource, cache: Cache): Promise<EconomySettings> {
+  const cached = await cache.get<EconomySettings>('coins:economy');
+  if (cached) return cached;
+
+  const rows = await db.query(`
+    SELECT key, value FROM app_settings WHERE key IN (
+      'coin_system_enabled','coin_to_inr_rate','max_coins_per_purchase',
+      'max_coin_discount_pct_subscription','checkin_streak_rewards','ad_min_per_session'
+    )
+  `).catch(() => []);
+  const map: Record<string, string> = {};
+  for (const r of rows) map[r.key] = r.value;
+
+  const parsedRewards = (map['checkin_streak_rewards'] ?? '')
+    .split(',').map(s => parseInt(s.trim(), 10)).filter(n => !isNaN(n) && n >= 0);
+
+  const settings: EconomySettings = {
+    enabled:                        map['coin_system_enabled'] !== 'false',
+    coinToInrRate:                  parseFloat(map['coin_to_inr_rate'] ?? '1') || 1,
+    maxCoinsPerPurchase:             parseInt(map['max_coins_per_purchase'] ?? '50', 10) || 50,
+    maxCoinDiscountPctSubscription:  parseInt(map['max_coin_discount_pct_subscription'] ?? '30', 10) || 30,
+    checkInRewards:                  parsedRewards.length === 7 ? parsedRewards : DEFAULT_CHECKIN_REWARDS,
+    adMinPerSession:                 parseInt(map['ad_min_per_session'] ?? '2', 10) || 2,
+  };
+  await cache.set('coins:economy', settings, 300);
+  return settings;
+}
+
+// Invalidates every cache entry derived from coin_rules / the economy
+// settings block. Called after ANY admin write so the wallet, the
+// /coins/config feed and /app-config pick up changes immediately.
+async function invalidateCoinsCache(cache: Cache): Promise<void> {
+  await Promise.all([
+    cache.del('coins:config'),
+    cache.del('coins:economy'),
+    cache.del('coin:system_enabled'),
+    cache.del('app:config'),
+  ]);
+}
 
 @Injectable()
 export class CoinsService implements OnModuleInit {
@@ -112,55 +144,43 @@ export class CoinsService implements OnModuleInit {
   constructor(
     @InjectDataSource() private readonly db: DataSource,
     @Inject(CACHE_MANAGER) private readonly cache: Cache,
+    private readonly authService: AuthService,
   ) {}
 
-  // ── GET /coins/balance ────────────────────────────────────────
-  // Returns: balance, totalEarned, totalSpent, checkInStreak,
-  //          checkedInToday, checkInDays (7-day array)
   async onModuleInit() {
     try {
       await this.db.query(`
         CREATE TABLE IF NOT EXISTS coin_rules (
-          id           UUID        DEFAULT gen_random_uuid() PRIMARY KEY,
-          action       TEXT        NOT NULL UNIQUE,
-          description  TEXT        NOT NULL,
-          coins_awarded INT        NOT NULL DEFAULT 5,
-          max_per_day  INT         NOT NULL DEFAULT 1,
-          is_active    BOOLEAN     NOT NULL DEFAULT TRUE,
-          created_at   TIMESTAMPTZ DEFAULT NOW(),
-          updated_at   TIMESTAMPTZ DEFAULT NOW()
+          id            UUID        DEFAULT gen_random_uuid() PRIMARY KEY,
+          action        TEXT        NOT NULL UNIQUE,
+          description   TEXT        NOT NULL,
+          coins_awarded INT         NOT NULL DEFAULT 5,
+          max_per_day   INT         NOT NULL DEFAULT 1,
+          is_active     BOOLEAN     NOT NULL DEFAULT TRUE,
+          category      VARCHAR(40),
+          icon          VARCHAR(10),
+          unit_label    VARCHAR(120),
+          is_core       BOOLEAN     NOT NULL DEFAULT FALSE,
+          created_at    TIMESTAMPTZ DEFAULT NOW(),
+          updated_at    TIMESTAMPTZ DEFAULT NOW()
         )
       `);
-      for (const task of EARN_TASKS) {
-        await this.db.query(`
-          INSERT INTO coin_rules (action, description, coins_awarded, max_per_day, is_active)
-          VALUES ($1, $2, $3, 1, TRUE)
-          ON CONFLICT (action) DO UPDATE
-            SET coins_awarded = EXCLUDED.coins_awarded,
-                description   = EXCLUDED.description,
-                updated_at    = NOW()
-        `, [task.action, task.title, task.coinsReward]);
-      }
-      // Ensure extra system rules (explicit mutable type to avoid readonly error)
-      const extraRules: Array<[string, string, number, number]> = [
-        ['daily_login',       'Daily login bonus',    5,  1],
-        ['referral',          'Refer a friend',       75, 5],
-        ['material_upload',   'Upload study notes',   25, 1],
-        ['subscription_bonus','Subscription bonus',   0,  1],
-      ];
-      for (const r of extraRules) {
-        await this.db.query(`
-          INSERT INTO coin_rules (action, description, coins_awarded, max_per_day, is_active)
-          VALUES ($1, $2, $3, $4, TRUE) ON CONFLICT (action) DO NOTHING
-        `, r);
-      }
-      this.logger.log('coin_rules seeded ✅');
+      // Defensive only — the UnifyCoinEconomy migration adds these
+      // columns + seeds the canonical rows. This keeps a fresh boot
+      // self-healing if migrations haven't run yet for some reason.
+      await this.db.query(`ALTER TABLE coin_rules ADD COLUMN IF NOT EXISTS category   VARCHAR(40)`);
+      await this.db.query(`ALTER TABLE coin_rules ADD COLUMN IF NOT EXISTS icon       VARCHAR(10)`);
+      await this.db.query(`ALTER TABLE coin_rules ADD COLUMN IF NOT EXISTS unit_label VARCHAR(120)`);
+      await this.db.query(`ALTER TABLE coin_rules ADD COLUMN IF NOT EXISTS is_core    BOOLEAN NOT NULL DEFAULT FALSE`);
+      this.logger.log('coin_rules ready ✅');
     } catch (err) {
-      this.logger.error('coin_rules seed failed:', err.message);
+      this.logger.error('coin_rules init failed:', err.message);
     }
   }
 
-
+  // ── GET /coins/balance ────────────────────────────────────────
+  // Returns: balance, totalEarned, totalSpent, checkInStreak,
+  //          checkedInToday, checkInDays (7-day array)
   async getBalance(userId: string) {
     const [user] = await this.db.query(`
       SELECT coins, total_coins_earned, last_active_at,
@@ -203,6 +223,8 @@ export class CoinsService implements OnModuleInit {
     `, [userId]);
     const checkedDays = new Set(txns.map((t: any) => t.day?.toISOString?.()?.slice(0, 10) ?? t.day));
 
+    const economy = await readEconomySettings(this.db, this.cache);
+
     const dayLabels = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
     const now       = new Date();
     const todayIdx  = (now.getDay() + 6) % 7; // 0=Mon … 6=Sun
@@ -217,7 +239,7 @@ export class CoinsService implements OnModuleInit {
         label,
         isDone:     checkedDays.has(dateStr),
         isToday:    i === todayIdx,
-        bonusLabel: i === 6 ? '+25 Bonus!' : '',
+        bonusLabel: i === 6 ? `+${economy.checkInRewards[6]} Bonus!` : '',
         isBonus:    i === 6,
       };
     });
@@ -235,46 +257,49 @@ export class CoinsService implements OnModuleInit {
   }
 
   // ── GET /coins/tasks ─────────────────────────────────────────
-  // Returns tasks with dynamic isCompleted based on today's activity
+  // Coin amounts, daily caps and active-state all come live from
+  // coin_rules — an admin edit on the Coins page is reflected the
+  // next time this loads, no app update or code change needed.
+  // isCompleted = the per-action daily cap has been reached today.
   async getEarnTasks(userId: string) {
-    const todayStart = new Date();
-    todayStart.setUTCHours(0, 0, 0, 0);
+    const actions = WALLET_TASKS.map(t => t.action);
 
-    // Check which actions were completed today
-    const todayTxns = await this.db.query(`
-      SELECT action FROM coin_transactions
-      WHERE user_id = $1 AND created_at >= $2
-    `, [userId, todayStart.toISOString()]);
+    const rules = await this.db.query(
+      `SELECT action, coins_awarded, max_per_day, is_active FROM coin_rules WHERE action = ANY($1)`,
+      [actions]
+    );
+    const ruleMap = new Map(rules.map((r: any) => [r.action, r]));
 
-    // Check if user uploaded material today
-    const uploaded = await this.db.query(`
-      SELECT 1 FROM study_materials
-      WHERE uploader_id = $1 AND created_at >= $2 LIMIT 1
-    `, [userId, todayStart.toISOString()]).catch(() => []);
+    const counts = await this.db.query(`
+      SELECT action, COUNT(*)::int AS cnt FROM coin_transactions
+      WHERE user_id = $1 AND action = ANY($2) AND created_at::date = CURRENT_DATE
+      GROUP BY action
+    `, [userId, actions]);
+    const countMap = new Map(counts.map((c: any) => [c.action, Number(c.cnt)]));
 
-    // Check if quiz was completed today
-    const quizDone = await this.db.query(`
-      SELECT 1 FROM quiz_attempts
-      WHERE user_id = $1 AND attempted_at >= $2 LIMIT 1
-    `, [userId, todayStart.toISOString()]).catch(() => []);
-
-    // Check study session today
-    const studiedToday = await this.db.query(`
-      SELECT 1 FROM study_sessions
-      WHERE user_id = $1 AND started_at >= $2
-        AND active_minutes >= 30 LIMIT 1
-    `, [userId, todayStart.toISOString()]).catch(() => []);
-
-    const completedActions = new Set(todayTxns.map((t: any) => t.action));
-
-    const tasks = EARN_TASKS.map(task => {
-      let isCompleted = completedActions.has(task.action);
-      // Override with direct activity checks
-      if (task.id === 'daily_quiz')   isCompleted = isCompleted || quizDone.length > 0;
-      if (task.id === 'study_session') isCompleted = isCompleted || studiedToday.length > 0;
-      if (task.id === 'upload_note')  isCompleted = isCompleted || uploaded.length > 0;
-      return { ...task, isCompleted };
-    });
+    const tasks = WALLET_TASKS
+      .map(t => {
+        const rule = ruleMap.get(t.action) as any;
+        if (!rule || !rule.is_active) return null; // admin turned this action off
+        const maxPerDay = Number(rule.max_per_day) || 1;
+        const done      = countMap.get(t.action) ?? 0;
+        return {
+          id:                 t.action,
+          title:              t.title,
+          subtitle:           t.subtitle,
+          coinsReward:        Number(rule.coins_awarded),
+          icon:               t.icon,
+          actionLabel:        t.actionLabel,
+          isCompleted:        done >= maxPerDay,
+          isAd:               t.isAd,
+          action:             t.action,
+          actionBgHex:        t.actionBgHex,
+          iconBgHex:          t.iconBgHex,
+          iconTintHex:        t.iconTintHex,
+          actionTextColorHex: '#FFFFFF',
+        };
+      })
+      .filter((t): t is NonNullable<typeof t> => t !== null);
 
     return successResponse({ tasks });
   }
@@ -287,24 +312,32 @@ export class CoinsService implements OnModuleInit {
         id,
         description          AS title,
         CASE action
-          WHEN 'daily_checkin'    THEN 'Daily streak bonus'
-          WHEN 'daily_quiz'       THEN 'Daily quiz completed'
-          WHEN 'mock_quiz'        THEN 'Mock test completed'
-          WHEN 'topic_quiz'       THEN 'Topic quiz completed'
-          WHEN 'quiz_attempt'     THEN 'Quiz completed'
-          WHEN 'study_session'    THEN 'Study session reward'
-          WHEN 'study_room'       THEN 'Study room session'
-          WHEN 'material_upload'  THEN 'Study material uploaded'
-          WHEN 'referral'         THEN 'Referral bonus'
-          WHEN 'ad_watch'         THEN 'Ad watched'
-          WHEN 'watch_ad'         THEN 'Ad watched'
-          WHEN 'target_complete'  THEN 'Daily target completed'
-          WHEN 'daily_login'      THEN 'Daily login bonus'
-          WHEN 'achievement'      THEN 'Achievement unlocked'
-          WHEN 'leaderboard_reward' THEN 'Leaderboard reward'
-          WHEN 'tier_promotion'   THEN 'Tier promotion bonus'
-          WHEN 'weekly_challenge' THEN 'Challenge completed'
-          WHEN 'subscription_bonus' THEN 'Subscription bonus'
+          WHEN 'daily_checkin'       THEN 'Daily streak bonus'
+          WHEN 'daily_quiz'          THEN 'Daily quiz completed'
+          WHEN 'mock_quiz'           THEN 'Mock test completed'
+          WHEN 'topic_quiz'          THEN 'Topic quiz completed'
+          WHEN 'quiz_attempt'        THEN 'Quiz completed'
+          WHEN 'study_session'       THEN 'Study session reward'
+          WHEN 'study_room'          THEN 'Study room session'
+          WHEN 'active_recall'       THEN 'Active recall session'
+          WHEN 'material_upload'     THEN 'Study material uploaded'
+          WHEN 'referral_signup'     THEN 'Friend signed up — referral bonus'
+          WHEN 'referral_joined'     THEN 'Welcome bonus — joined via referral'
+          WHEN 'referral_engagement' THEN 'Referral milestone — friend engaged'
+          WHEN 'referral_active'     THEN 'Referral milestone — friend active'
+          WHEN 'ad_watch'            THEN 'Ad watched'
+          WHEN 'watch_ad'            THEN 'Ad watched'
+          WHEN 'target_complete'     THEN 'Daily target completed'
+          WHEN 'daily_login'         THEN 'Daily login bonus'
+          WHEN 'profile_complete'    THEN 'Profile completed'
+          WHEN 'achievement'         THEN 'Achievement unlocked'
+          WHEN 'leaderboard_reward'  THEN 'Leaderboard reward'
+          WHEN 'tier_promotion'      THEN 'Tier promotion bonus'
+          WHEN 'weekly_challenge'    THEN 'Challenge completed'
+          WHEN 'streak_7'            THEN '7-day streak bonus'
+          WHEN 'streak_30'           THEN '30-day streak bonus'
+          WHEN 'mock_top10'          THEN 'Top 10 in mock test'
+          WHEN 'subscription_bonus'  THEN 'Subscription bonus'
           ELSE description
         END                  AS subtitle,
         amount               AS coins,
@@ -321,7 +354,9 @@ export class CoinsService implements OnModuleInit {
   }
 
   // ── POST /coins/check-in ─────────────────────────────────────
-  // Idempotent — safe to call multiple times per day
+  // Idempotent — safe to call multiple times per day. Reward ladder
+  // (days 1-7) is admin-editable via app_settings.checkin_streak_rewards
+  // (Coins page → Economy).
   async checkIn(userId: string) {
     const todayUTC = new Date().toISOString().slice(0, 10);
 
@@ -357,9 +392,10 @@ export class CoinsService implements OnModuleInit {
     const lastDate = user.lci ? new Date(user.lci).toISOString().slice(0, 10) : null;
     const newStreak = lastDate === yesterdayStr ? (user.streak ?? 0) + 1 : 1;
 
-    // Day 7 bonus or normal reward
+    // Day 7 bonus or normal reward — ladder is admin-editable
+    const economy   = await readEconomySettings(this.db, this.cache);
     const dayIndex  = Math.min(newStreak - 1, 6);
-    const coinsEarned = CHECKIN_REWARDS[dayIndex];
+    const coinsEarned = economy.checkInRewards[dayIndex] ?? DEFAULT_CHECKIN_REWARDS[dayIndex];
 
     // Award coins + update streak atomically
     // FIX: separate UPDATE then SELECT — RETURNING COALESCE returns NULL
@@ -398,100 +434,141 @@ export class CoinsService implements OnModuleInit {
     }, message);
   }
 
-  // ── POST /coins/tasks/:id/claim ───────────────────────────────
   // ── POST /coins/ad-reward ─────────────────────────────────────
-  // Credits coins for watching a rewarded ad.
-  // Reads coins_per_ad from app_settings (admin-configurable).
-  // Records a coin_transaction so it shows in history.
+  // Credits coins for watching a rewarded ad via the shared awardCoins
+  // helper (action='ad_watch') — respects the master switch, the
+  // admin-configured amount (coin_rules.ad_watch.coins_awarded) and
+  // its daily cap, and records a coin_transaction so it shows in history.
   async recordAdReward(userId: string, source: string = 'wallet') {
-    // Fetch admin-configured coins per ad (default 10)
-    const [setting] = await this.db.query(
-      `SELECT value FROM app_settings WHERE key='ad_reward_coins'`
-    ).catch(() => []);
-    const coinsPerAd = parseInt(setting?.value || '10', 10);
-
-    // Credit coins
-    await this.db.query(`
-      UPDATE users
-      SET coins              = COALESCE(coins, 0) + $1,
-          total_coins_earned = COALESCE(total_coins_earned, 0) + $1
-      WHERE id = $2
-    `, [coinsPerAd, userId]);
+    const coinsEarned = await this.authService.awardCoins(userId, 'ad_watch');
 
     const [updated] = await this.db.query(
       `SELECT coins, total_coins_earned FROM users WHERE id = $1`, [userId]
     );
     const balance = updated?.coins ?? 0;
 
-    // Insert transaction row → shows in history
-    await this.db.query(`
-      INSERT INTO coin_transactions (user_id, type, amount, description, action, balance)
-      VALUES ($1, 'earned', $2, $3, 'ad_watch', $4)
-    `, [userId, coinsPerAd, `Watched ad (+${coinsPerAd} coins)`, balance]);
+    if (coinsEarned <= 0) {
+      return successResponse({
+        balance, coinsEarned: 0, totalEarned: updated?.total_coins_earned ?? 0,
+      }, "Thanks for watching! You've reached today's ad-reward limit.");
+    }
 
     return successResponse({
       balance,
-      coinsEarned:   coinsPerAd,
-      totalEarned:   updated?.total_coins_earned ?? 0,
-    }, `+${coinsPerAd} coins earned! 🪙`);
+      coinsEarned,
+      totalEarned: updated?.total_coins_earned ?? 0,
+    }, `+${coinsEarned} coins earned! 🪙`);
   }
 
   // ── GET /coins/ad-config ──────────────────────────────────────
-  // Returns admin-configured ad reward settings for the mobile app.
+  // coinsPerAd now comes from coin_rules.ad_watch (the same number the
+  // admin edits on the Coins page); minAdsPerSession is a session-config
+  // setting in app_settings.
   async getAdConfig() {
-    const rows = await this.db.query(`
-      SELECT key, value FROM app_settings
-      WHERE key IN ('ad_reward_coins', 'ad_min_per_session')
-    `).catch(() => []);
-
-    const map: Record<string, string> = {};
-    for (const r of rows) map[r.key] = r.value;
-
+    const economy = await readEconomySettings(this.db, this.cache);
+    const [rule] = await this.db.query(
+      `SELECT coins_awarded FROM coin_rules WHERE action='ad_watch'`
+    ).catch(() => []);
     return successResponse({
-      coinsPerAd:       parseInt(map['ad_reward_coins']      || '10', 10),
-      minAdsPerSession: parseInt(map['ad_min_per_session']   || '2',  10),
+      coinsPerAd:       Number(rule?.coins_awarded ?? 5),
+      minAdsPerSession: economy.adMinPerSession,
     });
   }
 
-  async claimTask(taskId: string, userId: string) {
-    const task = EARN_TASKS.find(t => t.id === taskId);
-    if (!task) throw new NotFoundException(`Task '${taskId}' not found`);
+  // ── GET /coins/config ─────────────────────────────────────────
+  // Single feed the Android app reads on startup (and refreshes from
+  // the Wallet screen): every coin_rules row + economy settings +
+  // the check-in ladder. Cached 5 min, invalidated on any admin write.
+  async getConfig() {
+    const cacheKey = 'coins:config';
+    const cached = await this.cache.get<Record<string, any>>(cacheKey);
+    if (cached) return successResponse(cached);
 
-    // Idempotency — only once per day per task
-    const todayStart = new Date();
-    todayStart.setUTCHours(0, 0, 0, 0);
-    const existing = await this.db.query(`
-      SELECT 1 FROM coin_transactions
-      WHERE user_id=$1 AND action=$2 AND created_at >= $3
-    `, [userId, task.action, todayStart.toISOString()]);
-
-    if (existing.length > 0) {
-      const [u] = await this.db.query(`SELECT coins FROM users WHERE id=$1`, [userId]);
-      return successResponse({ balance: u.coins, alreadyClaimed: true }, 'Already claimed today!');
+    const rules = await this.db.query(`
+      SELECT action, coins_awarded, max_per_day, is_active, category, icon, unit_label
+      FROM coin_rules ORDER BY action
+    `);
+    const ruleMap: Record<string, any> = {};
+    for (const r of rules) {
+      ruleMap[r.action] = {
+        coins:     Number(r.coins_awarded),
+        maxPerDay: Number(r.max_per_day),
+        active:    r.is_active,
+        category:  r.category,
+        icon:      r.icon,
+        unitLabel: r.unit_label,
+      };
     }
 
-    // FIX: separate UPDATE then SELECT — same null bug as checkIn
-    await this.db.query(`
-      UPDATE users
-      SET coins              = COALESCE(coins, 0) + $1,
-          total_coins_earned = COALESCE(total_coins_earned, 0) + $1
-      WHERE id = $2
-    `, [task.coinsReward, userId]);
+    const economy = await readEconomySettings(this.db, this.cache);
+    const payload = {
+      enabled: economy.enabled,
+      rules:   ruleMap,
+      economy: {
+        coinToInrRate:                  economy.coinToInrRate,
+        maxCoinsPerPurchase:            economy.maxCoinsPerPurchase,
+        maxCoinDiscountPctSubscription: economy.maxCoinDiscountPctSubscription,
+      },
+      checkInRewards: economy.checkInRewards,
+    };
 
-    const [updated] = await this.db.query(
-      `SELECT coins FROM users WHERE id = $1`, [userId]
-    );
-    const balance = updated.coins ?? 0;
+    await this.cache.set(cacheKey, payload, 300);
+    return successResponse(payload);
+  }
 
-    await this.db.query(`
-      INSERT INTO coin_transactions (user_id, type, amount, description, action, balance)
-      VALUES ($1, 'earned', $2, $3, $4, $5)
-    `, [userId, task.coinsReward, task.title, task.action, balance]);
+  // ── POST /coins/tasks/:id/claim ───────────────────────────────
+  // ad_watch and study_session are the only actions genuinely
+  // "claimed" by tapping — the other three cards are awarded
+  // automatically by their real flows (quiz completion, material
+  // approval, referral signup), so claiming them never double-pays;
+  // it just reports today's status. This also closes a real exploit
+  // where tapping "Invite" used to grant a referral bonus with no
+  // friend ever having signed up.
+  async claimTask(taskId: string, userId: string) {
+    const task = WALLET_TASKS.find(t => t.action === taskId);
+    if (!task) throw new NotFoundException(`Task '${taskId}' not found`);
 
-    return successResponse({
-      balance,
-      coinsEarned: task.coinsReward,
-    }, `+${task.coinsReward} coins earned!`);
+    const [u] = await this.db.query(`SELECT coins FROM users WHERE id=$1`, [userId]);
+    const balance = u?.coins ?? 0;
+
+    if (taskId === 'ad_watch') {
+      const coinsEarned = await this.authService.awardCoins(userId, 'ad_watch');
+      if (coinsEarned <= 0) {
+        return successResponse({ balance, alreadyClaimed: true },
+          "You've reached today's ad-reward limit. Come back tomorrow!");
+      }
+      return successResponse({ balance: balance + coinsEarned, coinsEarned }, `+${coinsEarned} coins earned! 🪙`);
+    }
+
+    if (taskId === 'referral_signup') {
+      return successResponse({ balance, alreadyClaimed: true },
+        'Referral bonuses are credited automatically when your friend joins! 🤝');
+    }
+
+    if (taskId === 'study_session') {
+      const studied = await this.db.query(`
+        SELECT 1 FROM study_sessions
+        WHERE user_id=$1 AND started_at::date = CURRENT_DATE AND active_minutes >= 30 LIMIT 1
+      `, [userId]).catch(() => []);
+      if (!studied.length) {
+        return successResponse({ balance, alreadyClaimed: false },
+          'Study for 30+ minutes today to unlock this reward!');
+      }
+      const coinsEarned = await this.authService.awardCoins(userId, 'study_session');
+      if (coinsEarned <= 0) {
+        return successResponse({ balance, alreadyClaimed: true }, 'Already claimed today!');
+      }
+      return successResponse({ balance: balance + coinsEarned, coinsEarned }, `+${coinsEarned} coins earned!`);
+    }
+
+    // daily_quiz / material_upload — credited automatically the moment
+    // the real activity happens; never double-award from a tap here.
+    const [done] = await this.db.query(`
+      SELECT 1 FROM coin_transactions WHERE user_id=$1 AND action=$2 AND created_at::date = CURRENT_DATE LIMIT 1
+    `, [userId, taskId]);
+    return done
+      ? successResponse({ balance, alreadyClaimed: true }, 'Already earned today — nice work! 🎉')
+      : successResponse({ balance, alreadyClaimed: false }, 'This is awarded automatically once you complete it!');
   }
 }
 
@@ -521,6 +598,10 @@ export class CoinsController {
     @Query('page')  page  = 1
   ) { return this.svc.getTransactions(r.user.id, +limit, +page); }
 
+  /** GET /coins/config — full rules + economy config for the app */
+  @Get('config')
+  getConfig() { return this.svc.getConfig(); }
+
   /** POST /coins/check-in */
   @Post('check-in')
   @HttpCode(HttpStatus.OK)
@@ -548,56 +629,100 @@ export class CoinsController {
 }
 
 // ════════════════════════════════════════════════════════════
-// MODULE
+// ADMIN COINS — powers admin.bpscnotes.in/coins, the ONE page for
+// every coin-related setting in the app.
 // ════════════════════════════════════════════════════════════
-
-// ════════════════════════════════════════════════════════════
-// ADMIN COINS CONTROLLER
-// Powers: admin.bpscnotes.in/coins page
-//
-// Endpoints:
-//   GET  /admin/coins/stats        — total coins, circulating supply
-//   GET  /admin/coins/top-earners  — top 20 users by coins earned
-//   GET  /admin/coins/rules        — the EARN_TASKS catalogue
-//   POST /admin/coins/rules        — (future) add custom task
-// ════════════════════════════════════════════════════════════
-
 @Injectable()
 export class AdminCoinsService {
-  constructor(@InjectDataSource() private readonly db: DataSource) {}
+  constructor(
+    @InjectDataSource() private readonly db: DataSource,
+    @Inject(CACHE_MANAGER) private readonly cache: Cache,
+  ) {}
 
-  /** GET /admin/coins/ad-config — read admin-configured ad reward settings */
+  /** GET /admin/coins/ad-config — legacy alias of the ad fields in economy */
   async getAdConfig() {
-    const rows = await this.db.query(`
-      SELECT key, value FROM app_settings
-      WHERE key IN ('ad_reward_coins', 'ad_min_per_session')
-    `).catch(() => []);
-    const map: Record<string, string> = {};
-    for (const r of rows) map[r.key] = r.value;
+    const economy = await readEconomySettings(this.db, this.cache);
+    const [rule] = await this.db.query(
+      `SELECT coins_awarded FROM coin_rules WHERE action='ad_watch'`
+    ).catch(() => []);
     return successResponse({
-      coinsPerAd:       parseInt(map['ad_reward_coins']    || '10', 10),
-      minAdsPerSession: parseInt(map['ad_min_per_session'] || '2',  10),
+      coinsPerAd:       Number(rule?.coins_awarded ?? 5),
+      minAdsPerSession: economy.adMinPerSession,
     });
   }
 
-  /** PUT /admin/coins/ad-config — update ad reward settings */
+  /** PUT /admin/coins/ad-config — legacy alias; writes the same fields
+   *  the unified Economy panel does (coin_rules.ad_watch + app_settings) */
   async updateAdConfig(dto: { coinsPerAd?: number; minAdsPerSession?: number }) {
-    await this.db.query(`
-      CREATE TABLE IF NOT EXISTS app_settings (
-        key VARCHAR(100) PRIMARY KEY,
-        value TEXT,
-        updated_at TIMESTAMPTZ DEFAULT NOW()
-      )
-    `).catch(() => {});
+    if (dto.coinsPerAd !== undefined) {
+      await this.db.query(`UPDATE coin_rules SET coins_awarded=$1, updated_at=NOW() WHERE action='ad_watch'`, [dto.coinsPerAd]);
+    }
+    if (dto.minAdsPerSession !== undefined) {
+      await this.db.query(`
+        INSERT INTO app_settings (key, value, updated_at) VALUES ('ad_min_per_session',$1,NOW())
+        ON CONFLICT (key) DO UPDATE SET value=$1, updated_at=NOW()
+      `, [String(dto.minAdsPerSession)]);
+    }
+    await invalidateCoinsCache(this.cache);
+    return this.getAdConfig();
+  }
+
+  /** GET /admin/coins/economy — the master switch + every economy-wide
+   *  number that isn't a per-action rule */
+  async getEconomy() {
+    const economy = await readEconomySettings(this.db, this.cache);
+    return successResponse({ economy });
+  }
+
+  /** PUT /admin/coins/economy */
+  async updateEconomy(dto: {
+    enabled?: boolean;
+    coinToInrRate?: number;
+    maxCoinsPerPurchase?: number;
+    maxCoinDiscountPctSubscription?: number;
+    adMinPerSession?: number;
+    checkInRewards?: number[];
+  }) {
     const upsert = async (key: string, value: string) => {
       await this.db.query(`
-        INSERT INTO app_settings (key, value, updated_at) VALUES ($1, $2, NOW())
+        INSERT INTO app_settings (key, value, updated_at) VALUES ($1,$2,NOW())
         ON CONFLICT (key) DO UPDATE SET value=$2, updated_at=NOW()
       `, [key, value]);
     };
-    if (dto.coinsPerAd !== undefined)       await upsert('ad_reward_coins', String(dto.coinsPerAd));
-    if (dto.minAdsPerSession !== undefined) await upsert('ad_min_per_session', String(dto.minAdsPerSession));
-    return this.getAdConfig();
+
+    if (dto.enabled !== undefined) {
+      await upsert('coin_system_enabled', dto.enabled ? 'true' : 'false');
+    }
+    if (dto.coinToInrRate !== undefined) {
+      const v = Number(dto.coinToInrRate);
+      if (!isFinite(v) || v < 0) throw new BadRequestException('coinToInrRate must be a non-negative number');
+      await upsert('coin_to_inr_rate', String(v));
+    }
+    if (dto.maxCoinsPerPurchase !== undefined) {
+      const v = Math.round(Number(dto.maxCoinsPerPurchase));
+      if (!isFinite(v) || v < 0) throw new BadRequestException('maxCoinsPerPurchase must be a non-negative number');
+      await upsert('max_coins_per_purchase', String(v));
+    }
+    if (dto.maxCoinDiscountPctSubscription !== undefined) {
+      const v = Math.round(Number(dto.maxCoinDiscountPctSubscription));
+      if (!isFinite(v) || v < 0 || v > 100) throw new BadRequestException('maxCoinDiscountPctSubscription must be between 0 and 100');
+      await upsert('max_coin_discount_pct_subscription', String(v));
+    }
+    if (dto.adMinPerSession !== undefined) {
+      const v = Math.round(Number(dto.adMinPerSession));
+      if (!isFinite(v) || v < 0) throw new BadRequestException('adMinPerSession must be a non-negative number');
+      await upsert('ad_min_per_session', String(v));
+    }
+    if (dto.checkInRewards !== undefined) {
+      const arr = dto.checkInRewards;
+      if (!Array.isArray(arr) || arr.length !== 7 || arr.some(n => typeof n !== 'number' || !isFinite(n) || n < 0)) {
+        throw new BadRequestException('checkInRewards must be an array of 7 non-negative numbers (days 1-7)');
+      }
+      await upsert('checkin_streak_rewards', arr.map(n => Math.round(n)).join(','));
+    }
+
+    await invalidateCoinsCache(this.cache);
+    return this.getEconomy();
   }
 
   async getStats() {
@@ -615,7 +740,8 @@ export class AdminCoinsService {
       FROM users
       WHERE coins > 0
     `);
-    return successResponse({ stats: row });
+    const economy = await readEconomySettings(this.db, this.cache);
+    return successResponse({ stats: { ...row, coin_system_enabled: economy.enabled } });
   }
 
   async getTopEarners(limit = 20) {
@@ -642,48 +768,72 @@ export class AdminCoinsService {
     return successResponse({ earners: rows });
   }
 
+  /** GET /admin/coins/rules — every coin-earning action, with category/
+   *  icon/unit metadata so the admin UI needs no separate dictionary. */
   async getRules() {
     const dbRules = await this.db.query(`
-      SELECT cr.*, (SELECT COALESCE(SUM(amount),0)::int FROM coin_transactions WHERE action=cr.action AND type='earned' AND created_at>=NOW()-INTERVAL '7 days') AS coins_7d,
+      SELECT cr.*,
+             (SELECT COALESCE(SUM(amount),0)::int FROM coin_transactions WHERE action=cr.action AND type='earned' AND created_at>=NOW()-INTERVAL '7 days') AS coins_7d,
              (SELECT COUNT(*)::int FROM coin_transactions WHERE action=cr.action AND created_at>=NOW()-INTERVAL '7 days') AS claims_7d
-      FROM coin_rules cr ORDER BY created_at
+      FROM coin_rules cr
+      ORDER BY cr.is_core DESC, cr.category ASC, cr.action ASC
     `);
     return successResponse({ rules: dbRules });
   }
 
   async createRule(data: any) {
-    const { action, description, coinsAwarded, maxPerDay, isActive } = data;
+    const { action, description, coinsAwarded, maxPerDay, isActive, category, icon, unitLabel } = data;
     if (!action || !description) throw new BadRequestException('action and description are required');
-    const [existing] = await this.db.query(`SELECT id FROM coin_rules WHERE action=$1`, [action]);
+    if (!/^[a-z][a-z0-9_]{1,49}$/.test(action)) {
+      throw new BadRequestException('Action key must be lowercase snake_case, 2-50 characters (letters, numbers, underscores)');
+    }
+    const [existing] = await this.db.query(`SELECT id, is_core FROM coin_rules WHERE action=$1`, [action]);
     if (existing) {
+      if (existing.is_core) {
+        throw new BadRequestException(`'${action}' is a built-in action — edit it in the list instead of recreating it.`);
+      }
       await this.db.query(
-        `UPDATE coin_rules SET description=$1, coins_awarded=$2, max_per_day=$3, is_active=$4, updated_at=NOW() WHERE action=$5`,
-        [description, coinsAwarded ?? 5, maxPerDay ?? 1, isActive !== false, action]
+        `UPDATE coin_rules SET description=$1, coins_awarded=$2, max_per_day=$3, is_active=$4,
+           category=COALESCE($5,category), icon=COALESCE($6,icon), unit_label=COALESCE($7,unit_label), updated_at=NOW()
+         WHERE action=$8`,
+        [description, coinsAwarded ?? 5, maxPerDay ?? 1, isActive !== false, category || null, icon || null, unitLabel || null, action]
       );
     } else {
       await this.db.query(
-        `INSERT INTO coin_rules (action, description, coins_awarded, max_per_day, is_active) VALUES ($1,$2,$3,$4,$5)`,
-        [action, description, coinsAwarded ?? 5, maxPerDay ?? 1, isActive !== false]
+        `INSERT INTO coin_rules (action, description, coins_awarded, max_per_day, is_active, category, icon, unit_label, is_core)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,FALSE)`,
+        [action, description, coinsAwarded ?? 5, maxPerDay ?? 1, isActive !== false, category || 'custom', icon || '⚡', unitLabel || 'Custom rule']
       );
     }
+    await invalidateCoinsCache(this.cache);
     return successResponse(null, 'Rule saved ✅');
   }
 
   async updateRule(ruleId: string, data: any) {
     const fields: string[] = []; const vals: any[] = []; let i = 1;
-    if (data.description   !== undefined) { fields.push(`description=$${i++}`);   vals.push(data.description); }
-    if (data.coinsAwarded  !== undefined) { fields.push(`coins_awarded=$${i++}`); vals.push(data.coinsAwarded); }
-    if (data.maxPerDay     !== undefined) { fields.push(`max_per_day=$${i++}`);   vals.push(data.maxPerDay); }
-    if (data.isActive      !== undefined) { fields.push(`is_active=$${i++}`);     vals.push(data.isActive); }
+    if (data.description  !== undefined) { fields.push(`description=$${i++}`);   vals.push(data.description); }
+    if (data.coinsAwarded !== undefined) { fields.push(`coins_awarded=$${i++}`); vals.push(data.coinsAwarded); }
+    if (data.maxPerDay    !== undefined) { fields.push(`max_per_day=$${i++}`);   vals.push(data.maxPerDay); }
+    if (data.isActive     !== undefined) { fields.push(`is_active=$${i++}`);     vals.push(data.isActive); }
+    if (data.category     !== undefined) { fields.push(`category=$${i++}`);     vals.push(data.category); }
+    if (data.icon         !== undefined) { fields.push(`icon=$${i++}`);         vals.push(data.icon); }
+    if (data.unitLabel    !== undefined) { fields.push(`unit_label=$${i++}`);   vals.push(data.unitLabel); }
     if (fields.length) {
       fields.push('updated_at=NOW()');
       await this.db.query(`UPDATE coin_rules SET ${fields.join(',')} WHERE id=$${i}`, [...vals, ruleId]);
+      await invalidateCoinsCache(this.cache);
     }
     return successResponse(null, 'Rule updated ✅');
   }
 
   async deleteRule(ruleId: string) {
+    const [row] = await this.db.query(`SELECT action, is_core FROM coin_rules WHERE id=$1`, [ruleId]);
+    if (!row) throw new NotFoundException('Rule not found');
+    if (row.is_core) {
+      throw new BadRequestException(`'${row.action}' is a built-in action and can't be deleted — turn off its toggle to deactivate it instead.`);
+    }
     await this.db.query(`DELETE FROM coin_rules WHERE id=$1`, [ruleId]);
+    await invalidateCoinsCache(this.cache);
     return successResponse(null, 'Rule deleted');
   }
 }
@@ -702,12 +852,6 @@ export class AdminCoinsController {
   @Get('rules')
   getRules() { return this.svc.getRules(); }
 
-  @Get('ad-config')
-  getAdConfig() { return this.svc.getAdConfig(); }
-
-  @Put('ad-config')
-  updateAdConfig(@Body() dto: any) { return this.svc.updateAdConfig(dto); }
-
   @Post('rules')
   @HttpCode(HttpStatus.CREATED)
   createRule(@Body() dto: any) { return this.svc.createRule(dto); }
@@ -718,6 +862,21 @@ export class AdminCoinsController {
   @Delete('rules/:id')
   @HttpCode(HttpStatus.OK)
   deleteRule(@Param('id') id: string) { return this.svc.deleteRule(id); }
+
+  /** GET/PUT /admin/coins/economy — master switch, coin↔₹ rate,
+   *  redemption caps, check-in ladder, ad settings — everything that
+   *  isn't a per-action rule, in one place. */
+  @Get('economy')
+  getEconomy() { return this.svc.getEconomy(); }
+
+  @Put('economy')
+  updateEconomy(@Body() dto: any) { return this.svc.updateEconomy(dto); }
+
+  @Get('ad-config')
+  getAdConfig() { return this.svc.getAdConfig(); }
+
+  @Put('ad-config')
+  updateAdConfig(@Body() dto: any) { return this.svc.updateAdConfig(dto); }
 }
 
 @Module({

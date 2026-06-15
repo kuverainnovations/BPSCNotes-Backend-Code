@@ -326,46 +326,30 @@ export class AuthService {
         )
       `).catch(() => {});
 
-      // Milestone 1 — signup: award 50 coins to referrer
-      const M1_COINS = 50;
+      // Milestone 1 — signup: award the referrer via the shared
+      // awardCoins helper (action='referral_signup', admin-editable on
+      // the Coins page, daily cap enforced). referral_milestones still
+      // records the per-referee breakdown shown in the wallet's
+      // referral tab.
       const existing = await this.db.query(
         `SELECT id FROM referral_milestones
          WHERE referrer_id=$1 AND referee_id=$2 AND milestone='signup'`,
         [referrerId, newUser.id]
       );
       if (!existing.length) {
-        await this.db.query(
-          `INSERT INTO referral_milestones (referrer_id, referee_id, milestone, coins)
-           VALUES ($1,$2,'signup',$3)`,
-          [referrerId, newUser.id, M1_COINS]
-        );
-        await this.db.query(
-          `UPDATE users SET coins = coins + $1, total_coins_earned = total_coins_earned + $1
-           WHERE id = $2`,
-          [M1_COINS, referrerId]
-        );
-        const bal = (await this.db.query(`SELECT coins FROM users WHERE id=$1`, [referrerId]))[0].coins;
-        await this.db.query(
-          `INSERT INTO coin_transactions (user_id, type, amount, description, action, ref_id, balance)
-           VALUES ($1,'earned',$2,'Friend signed up — referral bonus (1/3)','referral_signup',$3,$4)`,
-          [referrerId, M1_COINS, newUser.id, bal]
-        );
-        await this.cache.del(`user:${referrerId}`);
+        const signupCoins = await this.awardCoins(referrerId, 'referral_signup', newUser.id);
+        if (signupCoins > 0) {
+          await this.db.query(
+            `INSERT INTO referral_milestones (referrer_id, referee_id, milestone, coins)
+             VALUES ($1,$2,'signup',$3)`,
+            [referrerId, newUser.id, signupCoins]
+          );
+        }
       }
 
-      // Bonus coins to the new user for signing up via referral
-      const REFEREE_BONUS = 25;
-      await this.db.query(
-        `UPDATE users SET coins = coins + $1, total_coins_earned = total_coins_earned + $1
-         WHERE id = $2`,
-        [REFEREE_BONUS, newUser.id]
-      );
-      const refBal = (await this.db.query(`SELECT coins FROM users WHERE id=$1`, [newUser.id]))[0].coins;
-      await this.db.query(
-        `INSERT INTO coin_transactions (user_id, type, amount, description, action, balance)
-         VALUES ($1,'earned',$2,'Joined via referral — welcome bonus','referral_joined',$3)`,
-        [newUser.id, REFEREE_BONUS, refBal]
-      );
+      // Welcome bonus to the new user for signing up via referral
+      // (action='referral_joined', admin-editable on the Coins page).
+      await this.awardCoins(newUser.id, 'referral_joined');
     }
 
     await this.activityLog.log(newUser.id, ACTIONS.USER_REGISTERED, `New user registered: ${dto.name}`, { mobile, referralCode: dto.referralCode || null });
@@ -413,6 +397,24 @@ export class AuthService {
     await this.cache.del(`user:${userId}`);
     await this.cache.del(`profile:${userId}`);
     await this.activityLog.log(userId, ACTIONS.USER_PROFILE_UPDATED, 'Profile updated', dto);
+
+    // One-time "complete your profile" bonus (action='profile_complete',
+    // admin-editable on the Coins page). Checked via coin_transactions
+    // (not coin_rules.max_per_day) so it fires exactly once per user,
+    // however many times they edit their profile afterwards.
+    const [freshUser] = await this.db.query(
+      `SELECT name, email, district, state, target_year, prep_level FROM users WHERE id=$1`,
+      [userId]
+    );
+    const profileIsComplete = !!(freshUser?.name && freshUser?.email && freshUser?.district
+      && freshUser?.state && freshUser?.target_year && freshUser?.prep_level);
+    if (profileIsComplete) {
+      const [already] = await this.db.query(
+        `SELECT 1 FROM coin_transactions WHERE user_id=$1 AND action='profile_complete' LIMIT 1`,
+        [userId]
+      );
+      if (!already) await this.awardCoins(userId, 'profile_complete');
+    }
 
     // Return fresh user data
     const user = await this.getMe(userId);
@@ -573,6 +575,8 @@ export class AuthService {
   // ─────────────────────────────────────────────────────────────
   async awardReferralMilestone(refereeId: string, milestone: 'engagement' | 'active') {
     try {
+      if (!(await this.isCoinSystemEnabled())) return;
+
       // Find who referred this user
       const rows = await this.db.query(
         `SELECT referred_by FROM users WHERE id=$1`, [refereeId]
@@ -580,11 +584,14 @@ export class AuthService {
       if (!rows.length || !rows[0].referred_by) return;
       const referrerId = rows[0].referred_by;
 
-      const MILESTONE_COINS: Record<string, number> = {
-        engagement: 50,  // friend enrolled in course or uploaded material
-        active:     50,  // friend completed 5 quizzes
-      };
-      const coins = MILESTONE_COINS[milestone] ?? 0;
+      // Coin amount is admin-controlled via the Coins page
+      // (action='referral_engagement' / 'referral_active'), falling
+      // back to 50 if that rule is missing or deactivated.
+      const action = `referral_${milestone}`;
+      const [rule] = await this.db.query(
+        `SELECT coins_awarded FROM coin_rules WHERE action=$1 AND is_active=TRUE`, [action]
+      );
+      const coins = Number(rule?.coins_awarded ?? 50);
       if (coins <= 0) return;
 
       // Check if already awarded (UNIQUE constraint prevents duplicates but check first for clarity)
@@ -691,8 +698,28 @@ export class AuthService {
     };
   }
 
+  // Shared master switch — admin can disable the entire coin economy
+  // from the Coins page (Economy settings). Cached 60s so this very
+  // hot path (called on every quiz/session/award) stays cheap. Shares
+  // the 'coin:system_enabled' cache key with SubscriptionsService.
+  private async isCoinSystemEnabled(): Promise<boolean> {
+    let v = await this.cache.get<string>('coin:system_enabled');
+    if (v === undefined || v === null) {
+      const [row] = await this.db.query(
+        `SELECT value FROM app_settings WHERE key='coin_system_enabled'`
+      ).catch(() => []);
+      v = row?.value ?? 'true';
+      await this.cache.set('coin:system_enabled', v, 60);
+    }
+    return v !== 'false';
+  }
+
   async awardCoins(userId: string, action: string, refId?: string, coinsOverride?: number): Promise<number> {
     try {
+      // Master switch — admin can disable the entire coin economy from
+      // the Coins page (Economy settings).
+      if (!(await this.isCoinSystemEnabled())) return 0;
+
       // Try DB first — admin can override amounts via admin panel
       const dbRules = await this.db.query(
         `SELECT coins_awarded, max_per_day FROM coin_rules WHERE action = $1 AND is_active = TRUE`,

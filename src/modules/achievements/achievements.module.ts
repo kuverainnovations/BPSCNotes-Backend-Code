@@ -185,9 +185,10 @@ export class AchievementsService {
         ON CONFLICT DO NOTHING
       `, [userId, ach.id]);
 
-      if (ach.coins_reward > 0) {
-        await this.authService.awardCoins(userId, 'achievement', ach.id);
-      }
+      // Pass this achievement's own coins_reward as the override —
+      // coin_rules.achievement (Coins page) is only used as the
+      // fallback for achievement types with no reward of their own.
+      await this.authService.awardCoins(userId, 'achievement', ach.id, ach.coins_reward);
       if (ach.xp_reward > 0) {
         await this.db.query(
           `UPDATE users SET xp = xp + $1 WHERE id = $2`, [ach.xp_reward, userId]
@@ -352,9 +353,10 @@ export class WeeklyChallengesService {
       `UPDATE user_challenge_progress SET reward_claimed=TRUE WHERE user_id=$1 AND challenge_id=$2`,
       [userId, challengeId]
     );
-    if (ch.coins_reward > 0) {
-      await this.authService.awardCoins(userId, 'weekly_challenge', challengeId);
-    }
+    // Pass this challenge's own coins_reward as the override —
+    // coin_rules.weekly_challenge (Coins page) is only used as the
+    // fallback for challenges with no reward of their own.
+    await this.authService.awardCoins(userId, 'weekly_challenge', challengeId, ch.coins_reward);
     if (ch.xp_reward > 0) {
       await this.db.query(`UPDATE users SET xp=xp+$1 WHERE id=$2`, [ch.xp_reward, userId]);
     }

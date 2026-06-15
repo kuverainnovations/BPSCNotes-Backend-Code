@@ -324,22 +324,20 @@ export class AdminSettingsService {
     const result = await this.db.query(`
       SELECT key, value FROM app_settings
       WHERE key IN ('maintenance_mode','force_update','app_version','min_app_version',
-                    'coin_value_inr','new_registrations','android_store_url','support_email',
-                    'daily_quiz_limit','coins_per_correct','coins_per_streak_day',
-                    'coins_per_study_hour','leaderboard_enabled','ads_enabled',
+                    'new_registrations','android_store_url','support_email',
+                    'daily_quiz_limit','leaderboard_enabled','ads_enabled',
+                    'coin_system_enabled','coin_to_inr_rate',
                     'rank_tier_0','rank_tier_1','rank_tier_2','rank_tier_3',
                     'rank_tier_4','rank_tier_5')
     `);
     const rawConfig = Object.fromEntries(result.map(r => [r.key, r.value]));
     // Provide defaults for keys not yet set by admin
     const defaults: Record<string, string> = {
-      coin_value_inr:        '0.1',
       daily_quiz_limit:      '5',
-      coins_per_correct:     '2',
-      coins_per_streak_day:  '10',
-      coins_per_study_hour:  '15',
       leaderboard_enabled:   'true',
       ads_enabled:           'true',
+      coin_system_enabled:   'true',
+      coin_to_inr_rate:      '1',
       rank_tier_0:           '500',   // Beginner threshold
       rank_tier_1:           '1500',  // Explorer threshold
       rank_tier_2:           '3000',  // Achiever threshold
@@ -347,7 +345,14 @@ export class AdminSettingsService {
       rank_tier_4:           '12000', // Champion threshold
       rank_tier_5:           '20000', // Legend threshold
     };
-    const config = { ...defaults, ...rawConfig };
+    const config: Record<string, string> = { ...defaults, ...rawConfig };
+    // Back/forward-compat aliases:
+    //  - coins_enabled mirrors coin_system_enabled (Coins page master switch)
+    //  - coin_value_inr is now just an alias of coin_to_inr_rate — both keys
+    //    are sent so older app builds that read coin_value_inr keep working,
+    //    while the Coins page only has ONE rate to configure.
+    config.coins_enabled  = config.coin_system_enabled;
+    config.coin_value_inr = config.coin_to_inr_rate;
     await this.cache.set(cacheKey, config, 300);
     return config;
   }

@@ -473,16 +473,43 @@ class SubscriptionsService {
     },
   ) {}
 
+  // Reads a value from app_settings (coin_to_inr_rate,
+  // max_coin_discount_pct_subscription, coin_system_enabled), falling
+  // back to a default if unset. Mirrors CoursesModule's helper so
+  // subscriptions and course/material purchases share one source of
+  // truth for the coin economy (admin "Coins" page).
+  private async getSetting(key: string, fallback: string): Promise<string> {
+    const [row] = await this.db.query(
+      `SELECT value FROM app_settings WHERE key=$1 LIMIT 1`, [key]
+    ).catch(() => []);
+    return row?.value ?? fallback;
+  }
+
+  // Shares the 'coin:system_enabled' cache key with AuthService.awardCoins
+  // so the master switch (Coins page → Economy) is checked consistently
+  // and cheaply across both earning and spending paths.
+  private async isCoinSystemEnabled(): Promise<boolean> {
+    let v = await this.cache.get<string>('coin:system_enabled');
+    if (v === undefined || v === null) {
+      v = await this.getSetting('coin_system_enabled', 'true');
+      await this.cache.set('coin:system_enabled', v, 60);
+    }
+    return v !== 'false';
+  }
+
   async getPlans() {
+    const coinToInrRate        = parseFloat(await this.getSetting('coin_to_inr_rate', '1'));
+    const maxCoinDiscountSub    = parseInt(await this.getSetting('max_coin_discount_pct_subscription', '30'), 10);
+    const maxCoinDiscountCourse = parseInt(await this.getSetting('max_coins_per_purchase', '50'), 10);
     return successResponse({
       plans: [
         { id:'monthly',   name:'Monthly',   price:199, originalPrice:299,  duration:'1 Month',   billingCycle:'Billed monthly',  bonusCoins:20,  savings:100 },
         { id:'quarterly', name:'Quarterly', price:499, originalPrice:899,  duration:'3 Months',  billingCycle:'₹166/month',      bonusCoins:60,  savings:400, isPopular:true },
         { id:'annual',    name:'Annual',    price:1499,originalPrice:2999, duration:'12 Months', billingCycle:'₹125/month',      bonusCoins:200, savings:1500 },
       ],
-      coinValueInr:        parseFloat(this.config.get('business.coinValueInr')),
-      maxCoinDiscountSub:  this.config.get('business.maxCoinDiscountSub'),
-      maxCoinDiscountCourse: this.config.get('business.maxCoinDiscountCourse'),
+      coinValueInr:        coinToInrRate,
+      maxCoinDiscountSub:  maxCoinDiscountSub,
+      maxCoinDiscountCourse: maxCoinDiscountCourse,
     });
   }
 
@@ -490,11 +517,14 @@ class SubscriptionsService {
     const plan = this.PLANS[data.plan];
     if (!plan) throw new BadRequestException('Invalid plan');
     const { price } = plan;
-    const coinValue    = parseFloat(this.config.get('business.coinValueInr'));
-    const maxCoinPct   = parseInt(this.config.get('business.maxCoinDiscountSub'));
+    const coinSystemEnabled = (await this.getSetting('coin_system_enabled', 'true')) !== 'false';
+    const coinValue    = parseFloat(await this.getSetting('coin_to_inr_rate', '1'));
+    const maxCoinPct   = parseInt(await this.getSetting('max_coin_discount_pct_subscription', '30'), 10);
     const userCoins    = (await this.db.query(`SELECT coins FROM users WHERE id=$1`, [userId]))[0]?.coins || 0;
     const maxCoinDisc  = Math.floor(price * maxCoinPct / 100);
-    const coinsToUse   = Math.min(data.coinsToUse || 0, userCoins, Math.floor(maxCoinDisc / coinValue));
+    const coinsToUse   = coinSystemEnabled
+      ? Math.min(data.coinsToUse || 0, userCoins, Math.floor(maxCoinDisc / coinValue))
+      : 0;
     const coinDiscount = Math.floor(coinsToUse * coinValue);
 
     let couponDiscount = 0, validCoupon: any = null;
@@ -625,10 +655,13 @@ class SubscriptionsService {
     // Update coupon usage
     if (sub.coupon_code) await this.db.query(`UPDATE coupons SET used_count=used_count+1 WHERE code=$1`, [sub.coupon_code]);
 
-    // Award bonus coins
-    await this.db.query(`UPDATE users SET coins=coins+$1 WHERE id=$2`, [plan.bonusCoins, userId]);
-    const newBal = (await this.db.query(`SELECT coins FROM users WHERE id=$1`, [userId]))[0].coins;
-    await this.db.query(`INSERT INTO coin_transactions (user_id,type,amount,description,action,balance) VALUES ($1,'earned',$2,'Subscription bonus coins','subscription_bonus',$3)`, [userId, plan.bonusCoins, newBal]);
+    // Award bonus coins (skipped entirely if the coin economy is
+    // disabled via the Coins page master switch)
+    if (plan.bonusCoins > 0 && await this.isCoinSystemEnabled()) {
+      await this.db.query(`UPDATE users SET coins=coins+$1 WHERE id=$2`, [plan.bonusCoins, userId]);
+      const newBal = (await this.db.query(`SELECT coins FROM users WHERE id=$1`, [userId]))[0].coins;
+      await this.db.query(`INSERT INTO coin_transactions (user_id,type,amount,description,action,balance) VALUES ($1,'earned',$2,'Subscription bonus coins','subscription_bonus',$3)`, [userId, plan.bonusCoins, newBal]);
+    }
 
     await this.cache.del(`user:${userId}`);
 
@@ -704,8 +737,9 @@ class SubscriptionsService {
         [payment.method || 'upi', payment.vpa || null, payment.id, endsAt, sub.id]
       );
 
-      // Bonus coins
-      if (plan?.bonusCoins > 0) {
+      // Bonus coins (skipped entirely if the coin economy is disabled
+      // via the Coins page master switch)
+      if (plan?.bonusCoins > 0 && await this.isCoinSystemEnabled()) {
         await this.db.query(`UPDATE users SET coins=coins+$1 WHERE id=$2`, [plan.bonusCoins, sub.user_id]);
         const [bal] = await this.db.query(`SELECT coins FROM users WHERE id=$1`, [sub.user_id]);
         await this.db.query(
