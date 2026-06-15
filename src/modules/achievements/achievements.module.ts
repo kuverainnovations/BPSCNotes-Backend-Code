@@ -58,13 +58,46 @@ export class AchievementsService {
         at.coins_reward, at.xp_reward,
         at.sort_order, at.is_active,
         ua.earned_at,
-        (ua.id IS NOT NULL) AS is_earned
+        (ua.id IS NOT NULL) AS is_earned,
+        u.total_study_minutes, u.streak, u.quizzes_attempted
       FROM achievement_types at
       LEFT JOIN user_achievements ua
         ON ua.achievement_type_id = at.id AND ua.user_id = $1
+      CROSS JOIN (
+        SELECT total_study_minutes, streak, quizzes_attempted FROM users WHERE id=$1
+      ) u
       WHERE at.is_active = TRUE
       ORDER BY at.category ASC, at.sort_order ASC
     `, [userId]);
+
+    // Fill in progress (current_value/goal_target) from the user's stats
+    // based on each achievement's condition type. Without this, the app's
+    // "in progress" cards always showed 0% for anything not yet earned.
+    for (const row of rows) {
+      const cond = row.condition || {};
+      switch (cond.type) {
+        case 'study_hours':
+          row.goal_target   = cond.threshold ?? null;
+          row.current_value = Math.floor((row.total_study_minutes || 0) / 60);
+          break;
+        case 'streak_days':
+          row.goal_target   = cond.threshold ?? null;
+          row.current_value = row.streak || 0;
+          break;
+        case 'quizzes':
+          row.goal_target   = cond.threshold ?? null;
+          row.current_value = row.quizzes_attempted || 0;
+          break;
+        default:
+          // tier_reach and any future condition types: no numeric
+          // progress bar (earned/not-earned status still shown).
+          row.goal_target   = null;
+          row.current_value = null;
+      }
+      delete row.total_study_minutes;
+      delete row.streak;
+      delete row.quizzes_attempted;
+    }
 
     const grouped = rows.reduce((acc: any, row: any) => {
       const cat = row.category;

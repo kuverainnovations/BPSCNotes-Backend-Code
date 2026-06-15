@@ -334,7 +334,7 @@ export class TierRoomsService {
 
   async assignDefaultTier(userId: string) {
     const starter = await this.db.query(
-      `SELECT id FROM room_tiers WHERE tier_key='starter' AND is_active=TRUE LIMIT 1`
+      `SELECT id FROM room_tiers WHERE tier_key='silver' AND is_active=TRUE LIMIT 1`
     );
     if (!starter.length) throw new NotFoundException('Silver tier not found. Run migration.');
     await this.db.query(

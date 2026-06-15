@@ -412,6 +412,21 @@ class DailyTargetsService {
     const target     = rows[0];
     const nowComplete = !target.is_completed;
 
+    // Anti-farming guard: a target can't be marked complete the instant
+    // it's created - it must have existed for at least its own
+    // estimated_minutes (default 25). Doesn't apply to uncompleting,
+    // since that grants no reward.
+    if (nowComplete) {
+      const elapsedMs  = Date.now() - new Date(target.created_at).getTime();
+      const requiredMs = (target.estimated_minutes ?? 25) * 60 * 1000;
+      if (elapsedMs < requiredMs) {
+        const remainingMin = Math.max(1, Math.ceil((requiredMs - elapsedMs) / 60000));
+        throw new BadRequestException(
+          `Spend a bit more time on this topic first — about ${remainingMin} more minute${remainingMin === 1 ? '' : 's'}.`
+        );
+      }
+    }
+
     await this.db.query(
       `UPDATE daily_targets
        SET is_completed=$1, completed_at=$2, attempted_questions=$3, updated_at=NOW()
@@ -463,6 +478,16 @@ class DailyTargetsService {
     await this.cache.del(`user:${userId}`);
     await this.cache.del(`profile:${userId}`);
 
+    // 🔔 Target complete push
+    if (nowComplete && coinsEarned > 0) {
+      this.notifService?.pushToUser(
+        userId,
+        '✅ Daily Target Done!',
+        `Keep it up! You earned 🪙 +${coinsEarned} coins.`,
+        { type: 'target_complete', screen: 'daily_targets' }
+      )?.catch(() => {});
+    }
+
     return successResponse(
       {
         id:          targetId,
@@ -471,16 +496,6 @@ class DailyTargetsService {
       },
       nowComplete ? `Target completed! +${coinsEarned} coins 🎉` : 'Target marked as incomplete'
     );
-
-    // 🔔 Target complete push
-    if (nowComplete && coinsEarned > 0) {
-      this.notifService.pushToUser(
-        userId,
-        '✅ Daily Target Done!',
-        `Keep it up! You earned 🪙 +${coinsEarned} coins.`,
-        { type: 'target_complete', screen: 'daily_targets' }
-      ).catch(() => {});
-    }
   }
 
   // ── DELETE /users/daily-targets/:id ──────────────────────
@@ -980,11 +995,26 @@ class UsersService {
     return successResponse({ certificates: rows });
   }
 
-  async getLiveClasses(userId: string) {
+  async getLiveClasses(userId: string, limit = 10, status?: string) {
+    const params: any[] = [userId];
+    let statusFilter: string;
+    if (status) {
+      params.push(status);
+      statusFilter = `lc.status = $${params.length}`;
+    } else {
+      // "My Schedule": only currently-live or upcoming classes. Without this,
+      // classes that already ended (any time in the past) stayed in the
+      // result forever, ordered oldest-first, burying upcoming classes.
+      statusFilter = `lc.status IN ('live','scheduled')`;
+    }
+    params.push(limit);
     const rows = await this.db.query(
       `SELECT lc.*, (SELECT TRUE FROM live_class_registrations WHERE live_class_id=lc.id AND user_id=$1) AS is_registered
-       FROM live_classes lc WHERE lc.status!='cancelled' ORDER BY lc.scheduled_at ASC`,
-      [userId]
+       FROM live_classes lc
+       WHERE ${statusFilter}
+       ORDER BY (lc.status='live') DESC, lc.scheduled_at ASC
+       LIMIT $${params.length}`,
+      params
     );
     return successResponse({ liveClasses: rows });
   }
@@ -1087,7 +1117,7 @@ class UsersController {
   @Get('enrollments') getEnrollments(@Req() r: any) { return this.s.getMyEnrollments(r.user.id); }
   @Get('downloads')   getDownloads(@Req() r: any) { return this.s.getDownloads(r.user.id); }
   @Get('certificates') getCertificates(@Req() r: any) { return this.s.getCertificates(r.user.id); }
-  @Get('live-classes') getLiveClasses(@Req() r: any) { return this.s.getLiveClasses(r.user.id); }
+  @Get('live-classes') getLiveClasses(@Req() r: any, @Query() q: any) { return this.s.getLiveClasses(r.user.id, q.limit ? parseInt(q.limit, 10) : 10, q.status); }
   @Post('live-classes/:id/register') @HttpCode(200) registerLiveClass(@Param('id', ParseUUIDPipe) id: string, @Req() r: any) { return this.s.registerLiveClass(id, r.user.id); }
   @Put('notification-settings') updateNotifSettings(@Req() r: any, @Body() b: any) { return this.s.updateNotificationSettings(r.user.id, b.enabled); }
 }
@@ -1658,21 +1688,28 @@ class FlashcardsService {
 
   /** POST /flashcards/progress — upsert card rating for user */
   async saveProgress(userId: string, dto: { flashcardId: string; rating: 'mastered' | 'weak' | 'skipped'; streak?: number }) {
-    const { flashcardId, rating, streak = 0 } = dto;
+    const { flashcardId, rating } = dto;
     if (rating === 'skipped') return successResponse({ saved: false });
 
+    // SRS streak is per-card and computed server-side from this card's own
+    // history — NOT trusted from the client. The Android app's "streak"
+    // field is a session-local "cards mastered in a row" counter shared
+    // across every card in the session, so using it directly here would
+    // give later cards in a session an inflated next_review interval based
+    // on unrelated cards rated before them.
     await this.db.query(
       `INSERT INTO user_flashcard_progress
          (user_id, flashcard_id, status, streak, repetitions, last_reviewed, next_review)
-       VALUES ($1, $2, $3, $4, 1, NOW(),
-         CURRENT_DATE + INTERVAL '1 day' * CASE WHEN $3='mastered' THEN GREATEST(1, $4) ELSE 1 END)
+       VALUES ($1, $2, $3, CASE WHEN $3='mastered' THEN 1 ELSE 0 END, 1, NOW(),
+         CURRENT_DATE + INTERVAL '1 day')
        ON CONFLICT (user_id, flashcard_id) DO UPDATE SET
          status       = EXCLUDED.status,
-         streak       = EXCLUDED.streak,
+         streak       = CASE WHEN EXCLUDED.status='mastered' THEN user_flashcard_progress.streak + 1 ELSE 0 END,
          repetitions  = user_flashcard_progress.repetitions + 1,
          last_reviewed = NOW(),
-         next_review  = CURRENT_DATE + INTERVAL '1 day' * CASE WHEN EXCLUDED.status='mastered' THEN GREATEST(1, EXCLUDED.streak) ELSE 1 END`,
-      [userId, flashcardId, rating, streak]
+         next_review  = CURRENT_DATE + INTERVAL '1 day' * CASE WHEN EXCLUDED.status='mastered'
+                           THEN GREATEST(1, user_flashcard_progress.streak + 1) ELSE 1 END`,
+      [userId, flashcardId, rating]
     ).catch(async (e: any) => {
       // Table may not have status/streak columns — add them gracefully
       await this.db.query(`
