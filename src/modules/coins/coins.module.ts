@@ -275,7 +275,7 @@ export class CoinsService implements OnModuleInit {
       WHERE user_id = $1 AND action = ANY($2) AND created_at::date = CURRENT_DATE
       GROUP BY action
     `, [userId, actions]);
-    const countMap = new Map(counts.map((c: any) => [c.action, Number(c.cnt)]));
+    const countMap = new Map<string, number>(counts.map((c: any) => [c.action, Number(c.cnt)]));
 
     const tasks = WALLET_TASKS
       .map(t => {
