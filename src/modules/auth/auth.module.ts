@@ -161,12 +161,14 @@ export class OtpService {
         }
       );
       console.log(`📱 MSG91 response for ${mobile}:`, JSON.stringify(msg91Response.data));
-      return { success: true };
+      // TEMP: return OTP in response while DLT registration is pending — remove once SMS delivery is confirmed working
+      return { success: true, otp };
     } catch (err) {
       console.error('MSG91 error:', err.response?.data || err.message);
       console.error('MSG91 status:', err.response?.status);
       console.error('MSG91 config used — authkey:', otpConfig.msg91AuthKey?.slice(0,8) + '...', 'template:', otpConfig.msg91TemplateId);
-      throw new BadRequestException('Failed to send OTP. Please try again.');
+      // TEMP: don't block login on MSG91/DLT failures — OTP is already stored, just wasn't delivered via SMS. Remove once DLT template is approved.
+      return { success: true, otp };
     }
   }
 
