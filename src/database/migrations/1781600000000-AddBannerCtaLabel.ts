@@ -21,4 +21,3 @@ export class AddBannerCtaLabel1781600000000 implements MigrationInterface {
     await queryRunner.query(`ALTER TABLE banners DROP COLUMN cta_label`);
   }
 }
-//Test
