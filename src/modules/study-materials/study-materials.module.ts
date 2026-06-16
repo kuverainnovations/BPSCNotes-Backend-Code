@@ -1246,6 +1246,68 @@ if (query.search)  { conditions.push(`(sm.title ILIKE $${pi} OR sm.subject ILIKE
     });
   }
 
+  // ── POST: request withdrawal ──────────────────────────────
+  // Deducts amount from seller balance immediately, creates a
+  // 'pending' withdrawal transaction. Admin processes the actual
+  // UPI/bank transfer and marks it 'disbursed' from the admin panel.
+  async requestWithdrawal(userId: string, amount: number, upiId?: string) {
+    if (!amount || amount < 100) throw new BadRequestException('Minimum withdrawal amount is ₹100');
+
+    return this.db.transaction(async (em: any) => {
+      const db = em.getRepository ? em : { query: em.query.bind(em) };
+
+      // Lock seller_wallets row for update
+      const [wallet] = await this.db.query(
+        `SELECT balance FROM seller_wallets WHERE user_id=$1 FOR UPDATE`, [userId]
+      );
+      if (!wallet) throw new BadRequestException('No wallet found');
+      if (wallet.balance < amount) {
+        throw new BadRequestException(`Insufficient balance. Available: ₹${wallet.balance}`);
+      }
+
+      const newBalance = wallet.balance - amount;
+
+      // Deduct balance
+      await this.db.query(
+        `UPDATE seller_wallets SET balance=$1 WHERE user_id=$2`,
+        [newBalance, userId]
+      );
+
+      // Create withdrawal transaction record
+      await this.db.query(
+        `INSERT INTO wallet_transactions
+           (user_id, type, amount, status, description, balance_after)
+         VALUES ($1,'withdrawal',$2,'pending',$3,$4)`,
+        [
+          userId,
+          amount,
+          upiId ? `Withdrawal to UPI: ${upiId}` : 'Withdrawal requested',
+          newBalance
+        ]
+      );
+
+      return successResponse({ newBalance }, `Withdrawal of ₹${amount} requested. You'll receive it within 2-3 business days.`);
+    }).catch(async (err: any) => {
+      // Fallback: run outside transaction if DataSource doesn't support .transaction()
+      if (err.message?.includes('transaction')) {
+        const [wallet] = await this.db.query(
+          `SELECT balance FROM seller_wallets WHERE user_id=$1`, [userId]
+        );
+        if (!wallet || wallet.balance < amount) {
+          throw new BadRequestException(`Insufficient balance`);
+        }
+        const newBalance = wallet.balance - amount;
+        await this.db.query(`UPDATE seller_wallets SET balance=$1 WHERE user_id=$2`, [newBalance, userId]);
+        await this.db.query(
+          `INSERT INTO wallet_transactions (user_id, type, amount, status, description, balance_after) VALUES ($1,'withdrawal',$2,'pending',$3,$4)`,
+          [userId, amount, upiId ? `Withdrawal to UPI: ${upiId}` : 'Withdrawal requested', newBalance]
+        );
+        return successResponse({ newBalance }, `Withdrawal of ₹${amount} requested.`);
+      }
+      throw err;
+    });
+  }
+
   // ── GET: preview (free pages URL — for locked content) ───
   // In production, you'd generate a page-limited PDF.
   // For now, return same URL with a free_pages hint.
@@ -1666,6 +1728,12 @@ export class StudyMaterialsController {
   @Get('wallet')
   getWallet(@Query('page') page = 1, @Query('limit') limit = 30, @Req() r: any) {
     return this.svc.getWallet(r.user.id, +page, +limit);
+  }
+
+  @Post('wallet/withdraw')
+  @HttpCode(HttpStatus.OK)
+  requestWithdrawal(@Body() body: { amount: number; upiId?: string }, @Req() r: any) {
+    return this.svc.requestWithdrawal(r.user.id, body.amount, body.upiId);
   }
 
   @Get(':id/preview')
