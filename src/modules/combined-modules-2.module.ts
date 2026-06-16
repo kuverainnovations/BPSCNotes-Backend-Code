@@ -317,6 +317,30 @@ class DailyTargetsService {
     });
   }
 
+  // ── GET /users/daily-targets/history ──────────────────────
+  // Returns per-day summary for the last N days (default 30, max 90).
+  // Each row: { date, total, completed, completion_pct }
+  async getHistory(userId: string, days: number) {
+    const rows = await this.db.query(
+      `SELECT
+         target_date::text                                          AS date,
+         COUNT(*)                                                   AS total,
+         COUNT(*) FILTER (WHERE is_completed = TRUE)               AS completed,
+         ROUND(
+           100.0 * COUNT(*) FILTER (WHERE is_completed = TRUE)
+           / NULLIF(COUNT(*), 0)
+         )::int                                                     AS completion_pct
+       FROM daily_targets
+       WHERE user_id = $1
+         AND target_date >= CURRENT_DATE - ($2 || ' days')::INTERVAL
+         AND target_date <= CURRENT_DATE
+       GROUP BY target_date
+       ORDER BY target_date DESC`,
+      [userId, days]
+    );
+    return successResponse(rows, 'History loaded');
+  }
+
   // ── POST /users/daily-targets ─────────────────────────────
   // Create one or more custom targets for today.
   // Body: { titles: string[] }  OR  { title: string, subject?, ... }
@@ -603,6 +627,12 @@ class DailyTargetsController {
   @Get()
   getTargets(@Req() r: any) {
     return this.s.getTargets(r.user.id);
+  }
+
+  /** GET /api/v1/users/daily-targets/history?days=30 — past completion history */
+  @Get('history')
+  getHistory(@Req() r: any, @Query('days') days?: string) {
+    return this.s.getHistory(r.user.id, Math.min(parseInt(days || '30', 10) || 30, 90));
   }
 
   /**
