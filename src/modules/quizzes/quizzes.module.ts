@@ -489,25 +489,49 @@ return successResponse({
 
     await this.db.query('BEGIN');
     try {
-      const [quiz] = await this.db.query(
-        `INSERT INTO quizzes (title, description, subject, type, total_questions, duration_mins, passing_score, coins_reward, status, created_by)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,
-        [quizMeta.title.trim(), quizMeta.description?.trim() || null, quizMeta.subject.trim(),
-         quizMeta.type || 'topic', normalised.length, quizMeta.durationMins || 15,
-         quizMeta.passingScore || 60, quizMeta.coinsReward || 10,
-         quizMeta.status || 'published', adminId]
+      // Upsert: find existing quiz by title+subject+type, or create new one
+      let quiz: any;
+      const existing = await this.db.query(
+        `SELECT id, title, total_questions FROM quizzes WHERE title=$1 AND subject=$2 AND type=$3 AND status!='deleted' ORDER BY created_at DESC LIMIT 1`,
+        [quizMeta.title.trim(), quizMeta.subject.trim(), quizMeta.type || 'topic']
       );
+      if (existing.length) {
+        // Append to existing quiz — don't overwrite
+        quiz = existing[0];
+      } else {
+        // Create new quiz
+        const [created] = await this.db.query(
+          `INSERT INTO quizzes (title, description, subject, type, total_questions, duration_mins, passing_score, coins_reward, status, created_by)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,
+          [quizMeta.title.trim(), quizMeta.description?.trim() || null, quizMeta.subject.trim(),
+           quizMeta.type || 'topic', normalised.length, quizMeta.durationMins || 15,
+           quizMeta.passingScore || 60, quizMeta.coinsReward || 10,
+           quizMeta.status || 'published', adminId]
+        );
+        quiz = created;
+      }
+
+      // Get current max sort_order for this quiz to avoid collisions
+      const [maxRow] = await this.db.query(
+        `SELECT COALESCE(MAX(sort_order), -1) AS max FROM quiz_questions WHERE quiz_id=$1`, [quiz.id]
+      );
+      let sortBase = (maxRow?.max ?? -1) + 1;
       for (let i = 0; i < normalised.length; i++) {
         const q = normalised[i];
         await this.db.query(
           `INSERT INTO quiz_questions (quiz_id, question_text, option_a, option_b, option_c, option_d, correct_option, explanation, subject, sort_order)
            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
-          [quiz.id, q.questionText, q.optionA, q.optionB, q.optionC, q.optionD, q.correctOption, q.explanation, q.subject, i]
+          [quiz.id, q.questionText, q.optionA, q.optionB, q.optionC, q.optionD, q.correctOption, q.explanation, q.subject, sortBase + i]
         );
       }
+      // Update total_questions count
+      await this.db.query(
+        `UPDATE quizzes SET total_questions=(SELECT COUNT(*) FROM quiz_questions WHERE quiz_id=$1), updated_at=NOW() WHERE id=$1`,
+        [quiz.id]
+      );
       await this.db.query('COMMIT');
       return successResponse({ quizId: quiz.id, title: quiz.title, questionsInserted: normalised.length },
-        `✅ Imported ${normalised.length} questions into "${quiz.title}"`);
+        `✅ ${existing.length ? 'Appended' : 'Imported'} ${normalised.length} questions into "${quiz.title}"`);
     } catch (e) {
       await this.db.query('ROLLBACK');
       throw e;

@@ -1430,7 +1430,9 @@ class ExamsService {
       if (data[key] !== undefined) { fields.push(`${col}=$${i++}`); vals.push(data[key]); }
     }
     if (fields.length) { fields.push('updated_at=NOW()'); await this.db.query(`UPDATE exams SET ${fields.join(',')} WHERE id=$${i}`, [...vals, examId]); }
+    // Clear ALL exam cache keys so Android app sees the new sort order immediately
     await this.cache.del('exams:active');
+    await this.cache.reset().catch(() => {}); // broad clear for safety
     return successResponse(null, 'Exam updated ✅');
   }
 }

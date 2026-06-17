@@ -1013,6 +1013,8 @@ export class CoursesService {
   }
 
   async adminUpdate(courseId: string, dto: Partial<CreateCourseDto>) {
+    // Ensure rejection_reason column exists (migration-safe — matches library_notes pattern)
+    await this.db.query(`ALTER TABLE courses ADD COLUMN IF NOT EXISTS rejection_reason TEXT`).catch(() => {});
     await this.repo.update(courseId, dto);
     await this.invalidateCache();
     return successResponse(null, 'Course updated — changes are live in mobile app ✅');

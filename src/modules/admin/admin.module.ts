@@ -646,7 +646,7 @@ export class AdminUsersController {
   @RequirePermission('users')
   async findAll(@Query() query: any) {
     const { rows, total } = await this.service.findAll(query);
-    return successResponse({ users: rows }, 'Success', paginationMeta(query.page || 1, query.page || 1, query.limit || 20));
+    return successResponse({ users: rows }, 'Success', paginationMeta(total, Number(query.page || 1), Number(query.limit || 20)));
   }
 
   @Get(':id')
@@ -678,7 +678,7 @@ export class AdminUsersController {
   }
 
   @Post('award-coins')
-  @RequirePermission('coins')
+  @RequirePermission('users')
   async awardCoins(@Body() dto: AwardCoinsDto, @Req() req: any) {
     const data = await this.service.awardCoins(dto, req.admin.id);
     return successResponse(data, `${dto.amount} coins awarded ✅`);
@@ -1002,6 +1002,7 @@ class CategoriesController {
     AdminUsersController,
     AppConfigController,
     CategoriesController,
+    AdminPaymentSettingsController,
   ],
   providers: [
     AdminAuthService,
