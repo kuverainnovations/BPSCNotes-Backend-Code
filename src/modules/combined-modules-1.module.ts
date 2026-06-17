@@ -639,28 +639,49 @@ class SubscriptionsService {
     if (sub.plan === 'quarterly') endsAt.setMonth(endsAt.getMonth() + 3);
     if (sub.plan === 'annual')    endsAt.setFullYear(endsAt.getFullYear() + 1);
 
-    await this.db.query(
-      `UPDATE subscriptions SET payment_status='success', status='active', payment_method=$1, upi_id=$2,
-       razorpay_payment_id=$3, starts_at=NOW(), ends_at=$4, updated_at=NOW() WHERE id=$5`,
-      [data.paymentMethod||'upi', data.upiId||null, data.transactionId, endsAt, subId]
-    );
+    // ── Atomic activation: all-or-nothing ───────────────────────
+    // Using raw SQL transaction so the subscription status, coin deduction,
+    // coupon increment, and bonus award all commit together or all roll back.
+    const coinSystemEnabled = plan.bonusCoins > 0 && await this.isCoinSystemEnabled();
 
-    // Deduct coins
-    if (sub.coins_used > 0) {
-      await this.db.query(`UPDATE users SET coins=coins-$1 WHERE id=$2`, [sub.coins_used, userId]);
-      const bal = (await this.db.query(`SELECT coins FROM users WHERE id=$1`, [userId]))[0].coins;
-      await this.db.query(`INSERT INTO coin_transactions (user_id,type,amount,description,action,balance) VALUES ($1,'spent',$2,'Subscription payment discount','subscription_payment',$3)`, [userId, sub.coins_used, bal]);
-    }
+    await this.db.query('BEGIN');
+    try {
+      // 1. Activate subscription
+      await this.db.query(
+        `UPDATE subscriptions SET payment_status='success', status='active', payment_method=$1, upi_id=$2,
+         razorpay_payment_id=$3, starts_at=NOW(), ends_at=$4, updated_at=NOW() WHERE id=$5`,
+        [data.paymentMethod||'upi', data.upiId||null, data.transactionId, endsAt, subId]
+      );
 
-    // Update coupon usage
-    if (sub.coupon_code) await this.db.query(`UPDATE coupons SET used_count=used_count+1 WHERE code=$1`, [sub.coupon_code]);
+      // 2. Deduct coins used toward discount
+      if (sub.coins_used > 0) {
+        await this.db.query(`UPDATE users SET coins=coins-$1 WHERE id=$2`, [sub.coins_used, userId]);
+        const bal = (await this.db.query(`SELECT coins FROM users WHERE id=$1`, [userId]))[0].coins;
+        await this.db.query(
+          `INSERT INTO coin_transactions (user_id,type,amount,description,action,balance) VALUES ($1,'spent',$2,'Subscription payment discount','subscription_payment',$3)`,
+          [userId, sub.coins_used, bal]
+        );
+      }
 
-    // Award bonus coins (skipped entirely if the coin economy is
-    // disabled via the Coins page master switch)
-    if (plan.bonusCoins > 0 && await this.isCoinSystemEnabled()) {
-      await this.db.query(`UPDATE users SET coins=coins+$1 WHERE id=$2`, [plan.bonusCoins, userId]);
-      const newBal = (await this.db.query(`SELECT coins FROM users WHERE id=$1`, [userId]))[0].coins;
-      await this.db.query(`INSERT INTO coin_transactions (user_id,type,amount,description,action,balance) VALUES ($1,'earned',$2,'Subscription bonus coins','subscription_bonus',$3)`, [userId, plan.bonusCoins, newBal]);
+      // 3. Increment coupon usage
+      if (sub.coupon_code) {
+        await this.db.query(`UPDATE coupons SET used_count=used_count+1 WHERE code=$1`, [sub.coupon_code]);
+      }
+
+      // 4. Award bonus coins
+      if (coinSystemEnabled) {
+        await this.db.query(`UPDATE users SET coins=coins+$1 WHERE id=$2`, [plan.bonusCoins, userId]);
+        const newBal = (await this.db.query(`SELECT coins FROM users WHERE id=$1`, [userId]))[0].coins;
+        await this.db.query(
+          `INSERT INTO coin_transactions (user_id,type,amount,description,action,balance) VALUES ($1,'earned',$2,'Subscription bonus coins','subscription_bonus',$3)`,
+          [userId, plan.bonusCoins, newBal]
+        );
+      }
+
+      await this.db.query('COMMIT');
+    } catch (err) {
+      await this.db.query('ROLLBACK');
+      throw err;
     }
 
     await this.cache.del(`user:${userId}`);
@@ -728,25 +749,32 @@ class SubscriptionsService {
       if (sub.plan === 'quarterly') endsAt.setMonth(endsAt.getMonth() + 3);
       if (sub.plan === 'annual')    endsAt.setFullYear(endsAt.getFullYear() + 1);
 
-      await this.db.query(
-        `UPDATE subscriptions
-         SET payment_status='success', status='active',
-             payment_method=$1, upi_id=$2,
-             razorpay_payment_id=$3, starts_at=NOW(), ends_at=$4, updated_at=NOW()
-         WHERE id=$5`,
-        [payment.method || 'upi', payment.vpa || null, payment.id, endsAt, sub.id]
-      );
-
-      // Bonus coins (skipped entirely if the coin economy is disabled
-      // via the Coins page master switch)
-      if (plan?.bonusCoins > 0 && await this.isCoinSystemEnabled()) {
-        await this.db.query(`UPDATE users SET coins=coins+$1 WHERE id=$2`, [plan.bonusCoins, sub.user_id]);
-        const [bal] = await this.db.query(`SELECT coins FROM users WHERE id=$1`, [sub.user_id]);
+      await this.db.query('BEGIN');
+      try {
         await this.db.query(
-          `INSERT INTO coin_transactions (user_id,type,amount,description,action,balance)
-           VALUES ($1,'earned',$2,'Subscription bonus coins','subscription_bonus',$3)`,
-          [sub.user_id, plan.bonusCoins, bal.coins]
+          `UPDATE subscriptions
+           SET payment_status='success', status='active',
+               payment_method=$1, upi_id=$2,
+               razorpay_payment_id=$3, starts_at=NOW(), ends_at=$4, updated_at=NOW()
+           WHERE id=$5`,
+          [payment.method || 'upi', payment.vpa || null, payment.id, endsAt, sub.id]
         );
+
+        if (plan?.bonusCoins > 0 && await this.isCoinSystemEnabled()) {
+          await this.db.query(`UPDATE users SET coins=coins+$1 WHERE id=$2`, [plan.bonusCoins, sub.user_id]);
+          const [bal] = await this.db.query(`SELECT coins FROM users WHERE id=$1`, [sub.user_id]);
+          await this.db.query(
+            `INSERT INTO coin_transactions (user_id,type,amount,description,action,balance)
+             VALUES ($1,'earned',$2,'Subscription bonus coins','subscription_bonus',$3)`,
+            [sub.user_id, plan.bonusCoins, bal.coins]
+          );
+        }
+
+        await this.db.query('COMMIT');
+      } catch (err) {
+        await this.db.query('ROLLBACK');
+        console.error(`Webhook: transaction rollback for sub ${sub.id}:`, err);
+        return { status: 'error' };
       }
 
       await this.cache.del(`user:${sub.user_id}`);
@@ -1108,10 +1136,20 @@ console.log('sample token:', tokens[0]);
   }
 
   async findAllAdmin(query: any) {
-    const result = await this.db.query(
-      `SELECT n.*, a.name AS created_by_name FROM notifications n LEFT JOIN admin_users a ON n.created_by=a.id ORDER BY n.created_at DESC LIMIT 50`
-    );
-    return successResponse({ notifications: result });
+    const [result, stats] = await Promise.all([
+      this.db.query(
+        `SELECT n.*, a.name AS created_by_name FROM notifications n LEFT JOIN admin_users a ON n.created_by=a.id ORDER BY n.created_at DESC LIMIT 50`
+      ),
+      this.db.query(
+        `SELECT
+           COALESCE(SUM(total_sent),0)::int    AS total_sent,
+           COALESCE(SUM(total_opened),0)::int  AS total_opened,
+           COUNT(*) FILTER (WHERE status='scheduled')::int AS scheduled,
+           COUNT(*)::int                       AS total_records
+         FROM notifications`
+      ),
+    ]);
+    return successResponse({ notifications: result, stats: stats[0] });
   }
 }
 

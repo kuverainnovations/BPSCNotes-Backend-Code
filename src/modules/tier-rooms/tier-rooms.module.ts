@@ -423,8 +423,10 @@ export class TierRoomsService {
 
   async getLiveSessions() {
     // Sessions are started by tier (not a specific room_id).
-    // Count active study_sessions grouped by their tier_id.
-    // A session is "active" if ended_at IS NULL AND last_heartbeat is within 3 minutes.
+    // Count active study_sessions grouped by their room_tier_id
+    // (the tier room the user is actually sitting in).
+    // room_tier_id may differ from tier_id when a user joins a
+    // lower tier's room — use COALESCE to fall back to tier_id.
     const rows = await this.db.query(`
       SELECT
         rt.id,
@@ -437,7 +439,7 @@ export class TierRoomsService {
         MIN(ss.started_at)                                       AS started_at
       FROM room_tiers rt
       LEFT JOIN study_sessions ss
-             ON ss.tier_id    = rt.id
+             ON COALESCE(ss.room_tier_id, ss.tier_id) = rt.id
             AND ss.ended_at   IS NULL
             AND ss.last_heartbeat > NOW() - INTERVAL '3 minutes'
       WHERE rt.is_active = TRUE
