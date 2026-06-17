@@ -398,7 +398,9 @@ export class AuthService {
     // Invalidate user cache so next /auth/me returns updated data
     await this.cache.del(`user:${userId}`);
     await this.cache.del(`profile:${userId}`);
-    await this.activityLog.log(userId, ACTIONS.USER_PROFILE_UPDATED, 'Profile updated', dto);
+    // Log only which fields changed, not raw values (bio can be huge / contain sensitive text)
+    const changedFields = Object.keys(dto).filter(k => dto[k as keyof typeof dto] !== undefined);
+    await this.activityLog.log(userId, ACTIONS.USER_PROFILE_UPDATED, 'Profile updated', { fields: changedFields });
 
     // One-time "complete your profile" bonus (action='profile_complete',
     // admin-editable on the Coins page). Checked via coin_transactions

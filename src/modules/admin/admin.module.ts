@@ -441,7 +441,7 @@ export class AdminUsersService {
   async awardCoins(dto: AwardCoinsDto, adminId: string) {
     if (dto.amount <= 0) throw new BadRequestException('Amount must be positive');
     const balResult = await this.db.query(
-      `UPDATE users SET coins = COALESCE(coins, 0) + $1, total_coins_earned = COALESCE(total_coins_earned, 0) + $1 WHERE id = $2 RETURNING coins`,
+      `UPDATE users SET coins = COALESCE(coins, 0) + $1, total_coins_earned = COALESCE(total_coins_earned, 0) + $1 WHERE id = $2 RETURNING COALESCE(coins, 0)::int AS coins`,
       [dto.amount, dto.userId]
     );
     if (!balResult.length) throw new NotFoundException('User not found');
@@ -580,8 +580,27 @@ export class AdminDashboardController {
     let pi = 1;
 
     if (q.action) {
-      conditions.push(`l.action ILIKE $${pi++}`);
-      params.push(`%${q.action}%`);
+      // Map frontend tab group → actual action strings stored in user_activity_log
+      const GROUP_MAP: Record<string, string[]> = {
+        auth:         ['user_login_otp','user_login_mpin','user_registered','user_logout',
+                       'user_mpin_created','user_mpin_changed','user_mpin_reset',
+                       'user_profile_updated','user_avatar_uploaded','user_account_deleted'],
+        course:       ['course_enrolled','course_review_submitted','lesson_completed'],
+        quiz:         ['quiz_started','quiz_submitted'],
+        material:     ['material_uploaded','material_downloaded','material_purchased','material_bookmarked'],
+        study_session:['study_session_started','study_session_ended','tier_promoted','live_class_registered'],
+        subscription: ['subscription_started','coins_awarded','referral_used','job_saved'],
+      };
+      const actions = GROUP_MAP[q.action];
+      if (actions && actions.length) {
+        const placeholders = actions.map(() => `$${pi++}`).join(', ');
+        conditions.push(`l.action IN (${placeholders})`);
+        params.push(...actions);
+      } else {
+        // Unknown group — fall back to direct ILIKE match (allows searching specific action)
+        conditions.push(`l.action ILIKE $${pi++}`);
+        params.push(`%${q.action}%`);
+      }
     }
     if (q.search) {
       conditions.push(`(u.name ILIKE $${pi} OR u.mobile ILIKE $${pi} OR l.description ILIKE $${pi})`);
