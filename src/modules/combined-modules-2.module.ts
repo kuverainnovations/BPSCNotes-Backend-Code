@@ -918,11 +918,20 @@ class UsersService {
            GROUP BY date
          )
       
+         -- Return total + per-source breakdown for the activity detail sheet
          SELECT
-           d.day AS date,
-           COALESCE(c.study_mins, 0) AS activity
+           d.day                                                            AS date,
+           COALESCE(c.study_mins, 0)                                       AS activity,
+           COALESCE(q.study_mins, 0)                                       AS quiz_mins,
+           COALESCE(s.study_mins, 0)                                       AS room_mins,
+           COALESCE(ca.study_mins, 0)                                      AS ca_mins,
+           COALESCE(lp.study_mins, 0)                                      AS lesson_mins
          FROM days d
-         LEFT JOIN combined c ON c.date = d.day
+         LEFT JOIN combined      c  ON c.date  = d.day
+         LEFT JOIN quiz_activity q  ON q.date  = d.day
+         LEFT JOIN session_activity s ON s.date = d.day
+         LEFT JOIN ca_reading_activity ca ON ca.date = d.day
+         LEFT JOIN lesson_activity lp ON lp.date = d.day
          ORDER BY d.day ASC`,
         [userId]
       ),
