@@ -389,6 +389,7 @@ export class AdminUsersService {
         `SELECT u.id, u.name, u.email, u.mobile, u.role, u.status, u.primary_exam,
                 u.prep_level, u.streak, u.coins, u.rank, u.accuracy, u.total_study_minutes,
                 u.is_verified, u.created_at, u.last_active_at, u.district,
+                u.quizzes_attempted,
                 (SELECT plan FROM subscriptions WHERE user_id=u.id AND status='active' AND ends_at>NOW() LIMIT 1) AS subscription,
                 (SELECT COUNT(*) FROM user_enrollments WHERE user_id=u.id) AS courses_enrolled
          FROM users u WHERE ${where}
