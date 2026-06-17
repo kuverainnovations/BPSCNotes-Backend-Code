@@ -441,7 +441,7 @@ export class AdminUsersService {
   async awardCoins(dto: AwardCoinsDto, adminId: string) {
     if (dto.amount <= 0) throw new BadRequestException('Amount must be positive');
     const balResult = await this.db.query(
-      `UPDATE users SET coins = coins + $1, total_coins_earned = total_coins_earned + $1 WHERE id = $2 RETURNING coins`,
+      `UPDATE users SET coins = COALESCE(coins, 0) + $1, total_coins_earned = COALESCE(total_coins_earned, 0) + $1 WHERE id = $2 RETURNING coins`,
       [dto.amount, dto.userId]
     );
     if (!balResult.length) throw new NotFoundException('User not found');
