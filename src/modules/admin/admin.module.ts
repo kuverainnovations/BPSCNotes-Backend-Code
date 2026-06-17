@@ -1009,6 +1009,7 @@ class CategoriesController {
     AdminDashboardService,
     AdminSettingsService,
     AdminUsersService,
+    PaymentSettingsService,
   ],
   exports: [AdminSettingsService, AdminAuthService],
 })
