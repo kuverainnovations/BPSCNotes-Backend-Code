@@ -492,7 +492,7 @@ return successResponse({
       // Upsert: find existing quiz by title+subject+type, or create new one
       let quiz: any;
       const existing = await this.db.query(
-        `SELECT id, title, total_questions FROM quizzes WHERE title=$1 AND subject=$2 AND type=$3 AND status!='deleted' ORDER BY created_at DESC LIMIT 1`,
+        `SELECT id, title, total_questions FROM quizzes WHERE title=$1 AND subject=$2 AND type=$3 AND status IN ('draft','review','published') ORDER BY created_at DESC LIMIT 1`,
         [quizMeta.title.trim(), quizMeta.subject.trim(), quizMeta.type || 'topic']
       );
       if (existing.length) {
