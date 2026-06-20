@@ -2,8 +2,9 @@ import {
   Module, Injectable, Controller, Get, Post, Put, Delete,
   Body, Param, Query, Req, HttpCode, HttpStatus,
   NotFoundException, BadRequestException, ConflictException,
-  UseGuards, ParseUUIDPipe, OnModuleInit,
+  UseGuards, ParseUUIDPipe, OnModuleInit, UseInterceptors, UploadedFile,
 } from '@nestjs/common';
+import { FileInterceptor } from '@nestjs/platform-express';
 import { InjectDataSource } from '@nestjs/typeorm';
 import { DataSource } from 'typeorm';
 import { CACHE_MANAGER } from '@nestjs/cache-manager';
@@ -12,12 +13,55 @@ import { Inject , Optional } from '@nestjs/common';
 import { ApiTags, ApiBearerAuth } from '@nestjs/swagger';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import * as admin from 'firebase-admin';
+import * as fs from 'fs';
+import * as crypto from 'crypto';
+import { extname, join } from 'path';
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const sanitizeHtml = require('sanitize-html');
 
 import { JwtAuthGuard, AdminJwtGuard, PermissionGuard, RequirePermission, Public } from '../common/guards';
 import { PaginationDto } from '../common/dtos/pagination.dto';
 import { successResponse, paginationMeta } from '../common/utils/response.util';
 import { AuthService } from './auth/auth.module';
 import { ensureFirebaseAdmin } from '../common/firebase/firebase-admin';
+
+// Allowed HTML for Current Affairs rich content — matches what the admin
+// TipTap editor can produce. Anything else (script, iframe, on* handlers,
+// style tags, etc.) is stripped before it ever reaches the DB, since this
+// HTML is later rendered inside a WebView on Android.
+const CA_SANITIZE_OPTIONS = {
+  allowedTags: [
+    'p','br','strong','em','u','s','span','a','ul','ol','li',
+    'h1','h2','h3','blockquote','img','table','thead','tbody','tr','th','td',
+  ],
+  allowedAttributes: {
+    a:     ['href','target','rel'],
+    img:   ['src','alt','style'],
+    span:  ['style'],
+    p:     ['style'],
+    h1: ['style'], h2: ['style'], h3: ['style'],
+    table: ['style'], td: ['style'], th: ['style'],
+  },
+  allowedStyles: {
+    '*': {
+      color: [/^#[0-9a-fA-F]{3,6}$/, /^rgb\(/],
+      'background-color': [/^#[0-9a-fA-F]{3,6}$/, /^rgb\(/],
+      'text-align': [/^left$|^center$|^right$/],
+      width: [/^\d+(%|px)$/],
+      display: [/^block$|^inline-block$/],
+      margin: [/^[\d\sa-z%]+$/],
+    },
+  },
+  allowedSchemes: ['http', 'https'],
+  transformTags: {
+    a: sanitizeHtml.simpleTransform('a', { rel: 'noopener noreferrer nofollow', target: '_blank' }),
+  },
+};
+
+function sanitizeCaContent(html: string | undefined | null): string {
+  if (!html) return '';
+  return sanitizeHtml(html, CA_SANITIZE_OPTIONS);
+}
 
 // ════════════════════════════════════════════════════════════
 // CURRENT AFFAIRS MODULE
@@ -137,7 +181,7 @@ class CurrentAffairsService {
     const result = await this.db.query(
       `INSERT INTO current_affairs (title, summary, full_content, category, source, date, is_important, exam_tags, tags, status, author, read_time, created_by)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *`,
-      [data.title, data.summary, data.fullContent, data.category, data.source, data.date||new Date().toISOString().split('T')[0], data.isImportant||false, mergedTags, data.tags||[], data.status||'draft', data.author, data.readTime||1, adminId]
+      [data.title, data.summary, sanitizeCaContent(data.fullContent), data.category, data.source, data.date||new Date().toISOString().split('T')[0], data.isImportant||false, mergedTags, data.tags||[], data.status||'draft', data.author, data.readTime||1, adminId]
     );
     return successResponse({ affair: result[0] }, 'Article created — live in app ✅');
   }
@@ -147,7 +191,10 @@ class CurrentAffairsService {
     let i = 1;
     const map: any = { title:'title', summary:'summary', fullContent:'full_content', category:'category', source:'source', date:'date', isImportant:'is_important', status:'status', readTime:'read_time' };
     for (const [key, col] of Object.entries(map)) {
-      if (data[key] !== undefined) { fields.push(`${col}=$${i++}`); vals.push(data[key]); }
+      if (data[key] !== undefined) {
+        const val = key === 'fullContent' ? sanitizeCaContent(data[key]) : data[key];
+        fields.push(`${col}=$${i++}`); vals.push(val);
+      }
     }
     // Merge type into exam_tags so it persists
     const examTagsToSave = data.examTags !== undefined ? data.examTags : undefined;
@@ -265,6 +312,28 @@ class CurrentAffairsService {
     await this.db.query(`DELETE FROM ca_mcqs WHERE id=$1`, [mcqId]);
     return successResponse(null, 'MCQ deleted');
   }
+
+  // ── Inline content image upload (for the rich text editor) ─────────────
+  // Local disk storage, same pattern as CoursesService.uploadLessonFile —
+  // no Cloudinary transform needed here since these are inline article
+  // images, not a fixed-size thumbnail.
+  async uploadContentImage(file: Express.Multer.File, baseUrl: string) {
+    const uploadDir = './uploads';
+    const now = new Date();
+    const subDir = `${now.getFullYear()}/${String(now.getMonth() + 1).padStart(2, '0')}`;
+    const dest = join(uploadDir, 'current-affairs', subDir);
+    fs.mkdirSync(dest, { recursive: true });
+
+    const uniqueId = crypto.randomUUID().replace(/-/g, '').slice(0, 16);
+    const safeExt  = extname(file.originalname).toLowerCase().replace(/[^a-z0-9.]/g, '') || '.jpg';
+    const fileName = `${Date.now()}_${uniqueId}${safeExt}`;
+    const fullPath = join(dest, fileName);
+
+    fs.writeFileSync(fullPath, file.buffer);
+
+    const relativePath = `uploads/current-affairs/${subDir}/${fileName}`;
+    return successResponse({ url: `${baseUrl}/${relativePath}` });
+  }
 }
 
 @ApiTags('Current Affairs') @ApiBearerAuth() @UseGuards(JwtAuthGuard) @Controller('current-affairs')
@@ -282,9 +351,30 @@ class CurrentAffairsController {
 @ApiTags('Admin — Current Affairs') @ApiBearerAuth() @Public()
 @UseGuards(AdminJwtGuard, PermissionGuard) @Controller('admin/current-affairs')
 class AdminCurrentAffairsController {
-  constructor(private s: CurrentAffairsService) {}
+  constructor(private s: CurrentAffairsService, private config: ConfigService) {}
   @Get() @RequirePermission('current-affairs') findAll(@Query() q: any) { return this.s.findAllAdmin(q); }
   @Post() @RequirePermission('current-affairs') @HttpCode(201) create(@Body() dto: any, @Req() r: any) { return this.s.adminCreate(dto, r.admin.id); }
+  // Inline image upload for the rich text editor (paste/insert) — must stay
+  // a literal route; NestJS matches top-down and a later `:id` PUT/DELETE
+  // wouldn't conflict here since the HTTP methods differ, but kept up top
+  // next to `create` to match this controller's existing literal-before-
+  // dynamic convention.
+  @Post('upload-image')
+  @RequirePermission('current-affairs')
+  @UseInterceptors(FileInterceptor('image', {
+    storage: require('multer').memoryStorage(),
+    limits: { fileSize: 10 * 1024 * 1024 }, // 10 MB cap
+    fileFilter: (_req: any, file: any, cb: any) => {
+      const ALLOWED = ['image/jpeg', 'image/png', 'image/webp', 'image/gif'];
+      if (ALLOWED.includes(file.mimetype)) return cb(null, true);
+      cb(new BadRequestException(`File type not allowed: ${file.mimetype}`), false);
+    },
+  }))
+  uploadImage(@UploadedFile() file: Express.Multer.File) {
+    if (!file) throw new BadRequestException('No image provided');
+    const baseUrl = this.config.get<string>('BASE_URL') ?? 'https://api.bpscnotes.in';
+    return this.s.uploadContentImage(file, baseUrl);
+  }
   @Put(':id') @RequirePermission('current-affairs') update(@Param('id', ParseUUIDPipe) id: string, @Body() dto: any) { return this.s.adminUpdate(id, dto); }
   @Delete(':id') @RequirePermission('current-affairs') remove(@Param('id', ParseUUIDPipe) id: string) { return this.s.adminDelete(id); }
   // MCQ management
