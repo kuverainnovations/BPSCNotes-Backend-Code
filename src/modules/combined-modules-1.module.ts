@@ -1,6 +1,6 @@
 import {
   Module, Injectable, Controller, Get, Post, Put, Delete,
-  Body, Param, Query, Req, HttpCode, HttpStatus,
+  Body, Param, Query, Req, Res, HttpCode, HttpStatus,
   NotFoundException, BadRequestException, ConflictException,
   UseGuards, ParseUUIDPipe, OnModuleInit, UseInterceptors, UploadedFile,
 } from '@nestjs/common';
@@ -16,12 +16,14 @@ import * as admin from 'firebase-admin';
 import * as fs from 'fs';
 import * as crypto from 'crypto';
 import { extname, join } from 'path';
+import type { Response } from 'express';
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const sanitizeHtml = require('sanitize-html');
 
 import { JwtAuthGuard, AdminJwtGuard, PermissionGuard, RequirePermission, Public } from '../common/guards';
 import { PaginationDto } from '../common/dtos/pagination.dto';
 import { successResponse, paginationMeta } from '../common/utils/response.util';
+import { streamArticlePdf } from '../common/utils/article-pdf-generator.util';
 import { AuthService } from './auth/auth.module';
 import { ensureFirebaseAdmin } from '../common/firebase/firebase-admin';
 
@@ -31,13 +33,14 @@ import { ensureFirebaseAdmin } from '../common/firebase/firebase-admin';
 // HTML is later rendered inside a WebView on Android.
 const CA_SANITIZE_OPTIONS = {
   allowedTags: [
-    'p','br','strong','em','u','s','span','a','ul','ol','li',
+    'p','br','strong','em','u','s','span','a','ul','ol','li','mark',
     'h1','h2','h3','blockquote','img','table','thead','tbody','tr','th','td',
   ],
   allowedAttributes: {
     a:     ['href','target','rel'],
     img:   ['src','alt','style'],
     span:  ['style'],
+    mark:  ['style'],
     p:     ['style'],
     h1: ['style'], h2: ['style'], h3: ['style'],
     table: ['style'], td: ['style'], th: ['style'],
@@ -313,6 +316,25 @@ class CurrentAffairsService {
     return successResponse(null, 'MCQ deleted');
   }
 
+  // ── PDF export ───────────────────────────────────────────────
+  async streamPdf(affairId: string, res: Response, uploadDir: string) {
+    const result = await this.db.query(
+      `SELECT title, category, date, source, tags, full_content FROM current_affairs
+       WHERE id=$1 AND status='published'`,
+      [affairId]
+    );
+    if (!result.length) throw new NotFoundException('Article not found');
+    const row = result[0];
+    await streamArticlePdf(res, {
+      title: row.title,
+      category: row.category,
+      date: row.date,
+      source: row.source,
+      tags: row.tags || [],
+      fullContentHtml: row.full_content || '',
+    }, uploadDir);
+  }
+
   // ── Inline content image upload (for the rich text editor) ─────────────
   // Local disk storage, same pattern as CoursesService.uploadLessonFile —
   // no Cloudinary transform needed here since these are inline article
@@ -343,6 +365,13 @@ class CurrentAffairsController {
   @Get(':id') findOne(@Param('id', ParseUUIDPipe) id: string, @Req() r: any) { return this.s.findOne(id, r.user.id); }
   @Post(':id/bookmark') @HttpCode(200) toggleBookmark(@Param('id', ParseUUIDPipe) id: string, @Req() r: any) { return this.s.toggleBookmark(id, r.user.id); }
   @Get(':id/mcqs') getMcqs(@Param('id', ParseUUIDPipe) id: string) { return this.s.getMcqs(id); }
+  // @Res({ passthrough: false }) hands the response fully to us, bypassing
+  // the global TransformInterceptor (which would otherwise wrap the PDF
+  // bytes in the standard {success,message,data} JSON envelope).
+  @Get(':id/pdf')
+  async downloadPdf(@Param('id', ParseUUIDPipe) id: string, @Res({ passthrough: false }) res: Response) {
+    await this.s.streamPdf(id, res, './uploads');
+  }
   @Post('log-activity') @HttpCode(200) logActivity(@Body() body: any, @Req() r: any) {
     return this.s.logActivity(r.user.id, body.activityType, body.durationSecs);
   }
