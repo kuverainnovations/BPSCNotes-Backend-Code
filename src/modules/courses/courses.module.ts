@@ -874,6 +874,41 @@ export class CoursesService {
     return successResponse({ chapters });
   }
 
+  // ── Admin: all student reviews/ratings for a course ─────────
+  async getCourseReviewsAdmin(courseId: string) {
+    const [course] = await this.db.query(
+      `SELECT id, title, rating, review_count FROM courses WHERE id=$1`, [courseId]
+    );
+    if (!course) throw new NotFoundException('Course not found');
+
+    const reviews = await this.db.query(
+      `SELECT cr.id, cr.rating, cr.comment, cr.is_verified, cr.created_at,
+              u.name AS reviewer_name, u.avatar_url, u.id AS user_id
+       FROM course_reviews cr
+       JOIN users u ON u.id = cr.user_id
+       WHERE cr.course_id = $1
+       ORDER BY cr.created_at DESC`,
+      [courseId]
+    );
+
+    const [distribution] = await this.db.query(
+      `SELECT
+         COUNT(*) FILTER (WHERE rating = 5) AS "5",
+         COUNT(*) FILTER (WHERE rating = 4) AS "4",
+         COUNT(*) FILTER (WHERE rating = 3) AS "3",
+         COUNT(*) FILTER (WHERE rating = 2) AS "2",
+         COUNT(*) FILTER (WHERE rating = 1) AS "1"
+       FROM course_reviews WHERE course_id = $1`,
+      [courseId]
+    );
+
+    return successResponse({
+      course: { id: course.id, title: course.title, rating: course.rating, reviewCount: course.review_count },
+      reviews,
+      ratingDistribution: distribution,
+    });
+  }
+
   async getLessonDetail(courseId: string, lessonId: string, userId: string) {
     // Update last activity
     await this.db.query(
@@ -1185,6 +1220,11 @@ export class AdminCoursesController {
   @Get(':id/chapters')
   @RequirePermission('courses')
   getChapters(@Param('id', ParseUUIDPipe) id: string) { return this.service.getChapters(id); }
+
+  // ── Student reviews/ratings for a course — admin view ───────
+  @Get(':id/reviews')
+  @RequirePermission('courses')
+  getReviews(@Param('id', ParseUUIDPipe) id: string) { return this.service.getCourseReviewsAdmin(id); }
 
   @Post(':id/chapters')
   @RequirePermission('courses')

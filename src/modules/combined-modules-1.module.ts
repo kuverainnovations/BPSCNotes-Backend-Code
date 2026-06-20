@@ -35,7 +35,15 @@ class CurrentAffairsService {
     const conditions = [`ca.status='published'`], params: any[] = [];
     if (date)      { conditions.push(`ca.date=$${params.length+1}`); params.push(date); }
     if (category)  { conditions.push(`ca.category=$${params.length+1}`); params.push(category); }
-    if (exam)      { conditions.push(`$${params.length+1}=ANY(ca.exam_tags)`); params.push(exam); }
+    if (exam) {
+      if (exam === 'prelims' || exam === 'mains') {
+        conditions.push(`($${params.length+1}=ANY(ca.exam_tags) OR 'both'=ANY(ca.exam_tags))`);
+        params.push(exam);
+      } else {
+        conditions.push(`$${params.length+1}=ANY(ca.exam_tags)`);
+        params.push(exam);
+      }
+    }
     if (important === 'true') conditions.push(`ca.is_important=TRUE`);
     const where = conditions.join(' AND ');
 
@@ -92,7 +100,15 @@ class CurrentAffairsService {
     if (date)     { conditions.push(`ca.date=$${params.length+1}`);        params.push(date); }
     if (category) { conditions.push(`ca.category=$${params.length+1}`);    params.push(category); }
     if (search)   { conditions.push(`ca.title ILIKE $${params.length+1}`); params.push(`%${search}%`); }
-    if (exam)     { conditions.push(`$${params.length+1}=ANY(ca.exam_tags)`); params.push(exam); }
+    if (exam) {
+      if (exam === 'prelims' || exam === 'mains') {
+        conditions.push(`($${params.length+1}=ANY(ca.exam_tags) OR 'both'=ANY(ca.exam_tags))`);
+        params.push(exam);
+      } else {
+        conditions.push(`$${params.length+1}=ANY(ca.exam_tags)`);
+        params.push(exam);
+      }
+    }
     const where = conditions.join(' AND ');
     const [rows, countResult] = await Promise.all([
       this.db.query(

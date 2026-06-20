@@ -115,6 +115,45 @@ export class StudyMaterialsService {
     return absolutePath.replace(this.uploadDir + '/', '').replace(/\\/g, '/');
   }
 
+  // ── GET: all pinned/featured materials, unpaginated ────────
+  // Used by the dedicated /pinned endpoint so the app's Pinned section
+  // always shows every featured item, regardless of where it would
+  // rank in the main downloads-sorted, 20-item-paginated list.
+  async listPinned(userId?: string) {
+    const bookmarkSubq = userId
+      ? `(SELECT TRUE FROM material_bookmarks mb WHERE mb.material_id=sm.id AND mb.user_id='${userId}') AS is_bookmarked,`
+      : `FALSE AS is_bookmarked,`;
+    const purchaseSubq = userId
+      ? `EXISTS (SELECT 1 FROM material_purchases mp WHERE mp.material_id=sm.id AND mp.user_id='${userId}') AS is_purchased,`
+      : `FALSE AS is_purchased,`;
+
+    const rows = await this.db.query(
+      `SELECT sm.id, sm.title, sm.description, sm.subject, sm.material_type,
+              sm.author, sm.tags, sm.file_key, sm.file_size_bytes, sm.page_count,
+              sm.download_count, sm.is_featured, sm.is_trending,
+              sm.created_at, sm.uploader_id, sm.thumbnail_key,
+              COALESCE(sm.language, 'English') AS language,
+              COALESCE(sm.price, 0)          AS price,
+              COALESCE(sm.free_pages, 3)     AS free_pages,
+              COALESCE(sm.is_premium, false) AS is_premium,
+              ${bookmarkSubq}
+              ${purchaseSubq}
+              sm.status
+       FROM study_materials sm
+       WHERE sm.status='approved' AND sm.is_featured=TRUE
+       ORDER BY sm.created_at DESC`
+    );
+
+    const materials = rows.map((m: any) => ({
+      ...m,
+      fileUrl: m.file_key ? this.fileUrl(m.file_key) : null,
+    }));
+    return successResponse({
+      materials,
+      meta: paginationMeta(materials.length, 1, Math.max(materials.length, 1)),
+    });
+  }
+
   // ── GET: list approved materials ──────────────────────────
   async listApproved(query: {
     type?: string; subject?: string; search?: string;
@@ -172,6 +211,7 @@ export class StudyMaterialsService {
                 sm.author, sm.tags, sm.file_key, sm.file_size_bytes, sm.page_count,
                 sm.download_count, sm.is_featured, sm.is_trending,
                 sm.created_at, sm.uploader_id, sm.thumbnail_key,
+                COALESCE(sm.language, 'English') AS language,
                 -- Marketplace / locking fields (COALESCE guards missing columns)
                 COALESCE(sm.price, 0)          AS price,
                 COALESCE(sm.free_pages, 3)     AS free_pages,
@@ -301,6 +341,7 @@ export class StudyMaterialsService {
       isPremium?: string | boolean;   // "true"/"false" from multipart form
       freePages?: string | number;    // how many pages visible before paywall
       price?: string | number;        // coins required (0 = free)
+      language?: string;              // e.g. "Hindi", "English", "Hindi + English"
     }
   ) {
     if (!file) throw new BadRequestException('File is required');
@@ -318,6 +359,7 @@ export class StudyMaterialsService {
     const isPremium  = dto.isPremium  === true || dto.isPremium  === 'true';
     const freePages  = Math.max(1, parseInt(String(dto.freePages  ?? '3'), 10)  || 3);
     const price      = Math.max(0, parseInt(String(dto.price      ?? '0'), 10)  || 0);
+    const language   = (dto.language?.trim()) || 'English';
 
     // Auto-count PDF pages from the uploaded file
     let pageCount = parseInt(String(dto.pageCount ?? '0'), 10) || 0;
@@ -347,8 +389,8 @@ export class StudyMaterialsService {
       INSERT INTO study_materials
         (title, description, subject, material_type, author, tags,
          file_key, file_size_bytes, page_count, uploader_id, status,
-         is_premium, free_pages, price)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'pending',$11,$12,$13)
+         is_premium, free_pages, price, language)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'pending',$11,$12,$13,$14)
       RETURNING id, title, status, created_at, page_count
     `, [
       dto.title.trim(),
@@ -364,6 +406,7 @@ export class StudyMaterialsService {
       isPremium,
       freePages,
       price,
+      language,
     ]);
 
     this.logger.log(`📤 Material uploaded: ${result.id} by user ${userId} — file: ${fileKey} — pages: ${pageCount}`);
@@ -377,6 +420,7 @@ export class StudyMaterialsService {
       isPremium,
       freePages,
       price,
+      language,
     }, '📤 Uploaded! Will be published after admin review.');
   }
 
@@ -513,7 +557,10 @@ if (query.search)  { conditions.push(`(sm.title ILIKE $${pi} OR sm.subject ILIKE
     const where = conditions.join(' AND ');
     const [rows, [cnt]] = await Promise.all([
       this.db.query(
-        `SELECT sm.*, sm.is_featured AS "isFeatured", sm.is_trending AS "isTrending", u.name AS uploader_name
+        `SELECT sm.*, sm.is_featured AS "isFeatured", sm.is_trending AS "isTrending", u.name AS uploader_name,
+                (SELECT mn.message FROM material_negotiations mn
+                 WHERE mn.material_id = sm.id AND mn.offered_by = 'user' AND mn.message IS NOT NULL
+                 ORDER BY mn.created_at DESC LIMIT 1) AS student_negotiation_message
          FROM study_materials sm LEFT JOIN users u ON u.id=sm.uploader_id
          WHERE ${where} ORDER BY sm.created_at DESC LIMIT $${pi++} OFFSET $${pi++}`,
         [...params, limit, offset]
@@ -1587,6 +1634,14 @@ export class StudyMaterialsController {
 
   @Get('subjects')
   getSubjects() { return this.svc.getSubjects(); }
+
+  // FIX: pinned/featured materials must NOT depend on the main list's
+  // pagination (limit=20, sorted by downloads). A pinned item with low
+  // downloads could sit on page 3+ and never appear in the client-side
+  // `.filter { it.isFeatured }` — making it "only findable via search".
+  // This dedicated endpoint returns ALL approved featured materials.
+  @Get('pinned')
+  getPinned(@Req() r: any) { return this.svc.listPinned(r.user?.id); }
 
   @Get()
   list(@Query() q: any, @Req() r: any) {
