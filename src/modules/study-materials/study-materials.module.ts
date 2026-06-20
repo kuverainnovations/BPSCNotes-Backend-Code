@@ -557,7 +557,8 @@ if (query.search)  { conditions.push(`(sm.title ILIKE $${pi} OR sm.subject ILIKE
     const where = conditions.join(' AND ');
     const [rows, [cnt]] = await Promise.all([
       this.db.query(
-        `SELECT sm.*, sm.is_featured AS "isFeatured", sm.is_trending AS "isTrending", u.name AS uploader_name,
+        `SELECT sm.*, sm.is_featured AS "isFeatured", sm.is_trending AS "isTrending",
+                sm.is_premium AS "isPremium", u.name AS uploader_name,
                 (SELECT mn.message FROM material_negotiations mn
                  WHERE mn.material_id = sm.id AND mn.offered_by = 'user' AND mn.message IS NOT NULL
                  ORDER BY mn.created_at DESC LIMIT 1) AS student_negotiation_message
