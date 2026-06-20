@@ -60,6 +60,7 @@ class QuizzesService {
            q.id, q.title, q.description, q.subject, q.type,
            q.total_questions, q.duration_mins, q.passing_score, q.coins_reward,
            q.exam_tags, q.scheduled_for, q.attempt_count, q.avg_score, q.status,
+           q.negative_marking_enabled, q.marks_per_correct, q.marks_per_wrong,
            -- is_attempted: true/false boolean (not a JSON object)
            (SELECT TRUE FROM quiz_attempts qa WHERE qa.user_id=$${params.length + 1} AND qa.quiz_id=q.id LIMIT 1) AS is_attempted,
            (SELECT qa.score FROM quiz_attempts qa WHERE qa.user_id=$${params.length + 1} AND qa.quiz_id=q.id ORDER BY qa.attempted_at DESC LIMIT 1) AS my_last_score
@@ -99,7 +100,8 @@ class QuizzesService {
     const quiz = await this.db.query(
       `SELECT id, title, description, subject, type,
               total_questions, duration_mins, passing_score, coins_reward,
-              exam_tags, scheduled_for, attempt_count, avg_score, status
+              exam_tags, scheduled_for, attempt_count, avg_score, status,
+              negative_marking_enabled, marks_per_correct, marks_per_wrong
        FROM quizzes WHERE id=$1 AND status='published'`,
       [quizId]
     );
@@ -187,6 +189,13 @@ if (q.scheduled_for) {
     const durationMins = parseInt(q.duration_mins, 10) || 15;
     const passingScore = parseInt(q.passing_score, 10) || 60;
     const coinsReward  = parseInt(q.coins_reward,  10) || 0;
+
+    // ── Negative marking config (admin-configurable per quiz) ────
+    // Extracted here (not inline below) because a later .filter((q:any)=>…)
+    // shadows this outer `q` — these consts capture the values first.
+    const negativeMarkingEnabled = q.negative_marking_enabled === true;
+    const marksPerCorrect = parseFloat(q.marks_per_correct) || 1;
+    const marksPerWrong   = negativeMarkingEnabled ? (parseFloat(q.marks_per_wrong) || 0) : 0;
     // Prevents direct API submit without loading questions first
     const startedAttempt = await this.db.query(
       `SELECT id, attempted_at FROM quiz_attempts
@@ -235,8 +244,16 @@ if (q.scheduled_for) {
         isCorrect,
         correctAnswer: info?.correct     ?? '',
         explanation:   info?.explanation ?? '',
+        // Marks this specific question contributed — shown in the
+        // Review Answers screen so each question's +/- is visible
+        marks:         isCorrect ? marksPerCorrect : -marksPerWrong,
       };
     });
+    // Attempted-but-incorrect count — distinct from skipped/unanswered.
+    // (Previously this was computed as `total - correct`, which silently
+    // counted skipped questions as "wrong" too — wrong for negative
+    // marking, since unanswered questions must NOT be penalised.)
+    const wrongAnswered = evaluated.length - correct;
 
     // Include skipped questions in the result so Android can show correct answers for ALL
     // questions in the review screen, not just submitted ones
@@ -249,8 +266,10 @@ if (q.scheduled_for) {
         isCorrect:     false,
         correctAnswer: qMap[q.id]?.correct ?? '',
         explanation:   qMap[q.id]?.explanation ?? '',
+        marks:         0,        // unanswered — never penalised
       }));
     const allAnswers = [...evaluated, ...skippedResults];
+    const unanswered = skippedResults.length;
 
     // ANTI-CHEAT: Calculate time server-side — don't trust client timeTakenSecs
     // Use attempted_at from the start record vs NOW()
@@ -266,12 +285,23 @@ if (q.scheduled_for) {
     const accuracy = score;
     const isPassed = score >= passingScore;
 
+    // ── Marks-based scoring (negative marking) ───────────────────
+    // marksObtained only counts correct answers; negativeMarks only
+    // applies to attempted-but-wrong answers — unanswered questions
+    // are never penalised, matching standard competitive-exam rules.
+    const round2 = (n: number) => Math.round(n * 100) / 100;
+    const marksObtained = round2(correct * marksPerCorrect);
+    const negativeMarks = round2(wrongAnswered * marksPerWrong);
+    const finalScore    = round2(marksObtained - negativeMarks);
+
     const attempt = await this.db.query(
       `INSERT INTO quiz_attempts
-         (user_id, quiz_id, score, total_questions, correct_answers, time_taken_secs, coins_earned, answers, is_passed, submitted_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW())
+         (user_id, quiz_id, score, total_questions, correct_answers, time_taken_secs, coins_earned, answers, is_passed,
+          wrong_answers, unanswered_questions, marks_obtained, negative_marks, final_score, submitted_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,NOW())
        RETURNING id, attempted_at`,
-      [userId, quizId, score, total, correct, timeTakenSecs, isPassed ? coinsReward : 0, JSON.stringify(allAnswers), isPassed]
+      [userId, quizId, score, total, correct, timeTakenSecs, isPassed ? coinsReward : 0, JSON.stringify(allAnswers), isPassed,
+       wrongAnswered, unanswered, marksObtained, negativeMarks, finalScore]
     );
 
     // Update quiz stats
@@ -349,12 +379,16 @@ const totalAttemptsResult = await this.db.query(
 const totalAttempts = totalAttemptsResult[0]?.count || 1;
 
 // Number of users who scored higher
+// Ranked by final_score (marks after negative-marking deduction), not the
+// percentage `score` — two attempts can tie on percentage (e.g. both
+// "80% correct") while differing in how many wrong answers they risked,
+// which final_score correctly distinguishes.
 const higherScoresResult = await this.db.query(
   `SELECT COUNT(*)::int AS count
    FROM quiz_attempts
    WHERE quiz_id=$1
-   AND score > $2`,
-  [quizId, score]
+   AND final_score > $2`,
+  [quizId, finalScore]
 );
 
 const higherScores = higherScoresResult[0]?.count || 0;
@@ -391,7 +425,8 @@ return successResponse({
   score,
   correct,
   total,
-  wrong: total - correct,
+  wrong: wrongAnswered,
+  unanswered,
   accuracy,
   isPassed,
   coinsEarned,
@@ -399,6 +434,15 @@ return successResponse({
 
   rank,
   percentile,
+
+  // ── Negative marking breakdown ──────────────────────────────
+  negativeMarkingEnabled,
+  marksPerCorrect,
+  marksPerWrong,
+  totalMarks: round2(total * marksPerCorrect),
+  marksObtained,
+  negativeMarks,
+  finalScore,
 
   answers: allAnswers,
 });
@@ -433,11 +477,17 @@ return successResponse({
 
   async create(data: any, adminId: string) {
     if (!data.title || !data.subject) throw new BadRequestException('Title and subject required');
+    // Negative marking is admin-configurable per quiz; defaults preserve
+    // existing behaviour (disabled, 1 mark/correct, 0 for wrong).
+    const negativeMarkingEnabled = data.negativeMarkingEnabled === true;
+    const marksPerCorrect = Number.isFinite(+data.marksPerCorrect) && +data.marksPerCorrect > 0 ? +data.marksPerCorrect : 1;
+    const marksPerWrong   = Number.isFinite(+data.marksPerWrong)   && +data.marksPerWrong   >= 0 ? +data.marksPerWrong   : 0;
     const result = await this.db.query(
       `INSERT INTO quizzes
          (title, description, subject, type, total_questions,
-          duration_mins, passing_score, coins_reward, exam_tags, scheduled_for, status, created_by)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+          duration_mins, passing_score, coins_reward, exam_tags, scheduled_for, status, created_by,
+          negative_marking_enabled, marks_per_correct, marks_per_wrong)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
        RETURNING *`,
       [
         data.title, data.description || null, data.subject,
@@ -448,6 +498,7 @@ return successResponse({
         data.scheduledFor || null,
         data.status || 'draft',
         adminId,
+        negativeMarkingEnabled, marksPerCorrect, marksPerWrong,
       ]
     );
     return successResponse({ quiz: result[0] }, 'Quiz created. Add questions next.');
@@ -500,13 +551,18 @@ return successResponse({
         quiz = existing[0];
       } else {
         // Create new quiz
+        const negativeMarkingEnabled = quizMeta.negativeMarkingEnabled === true;
+        const marksPerCorrect = Number.isFinite(+quizMeta.marksPerCorrect) && +quizMeta.marksPerCorrect > 0 ? +quizMeta.marksPerCorrect : 1;
+        const marksPerWrong   = Number.isFinite(+quizMeta.marksPerWrong)   && +quizMeta.marksPerWrong   >= 0 ? +quizMeta.marksPerWrong   : 0;
         const [created] = await this.db.query(
-          `INSERT INTO quizzes (title, description, subject, type, total_questions, duration_mins, passing_score, coins_reward, status, created_by)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,
+          `INSERT INTO quizzes (title, description, subject, type, total_questions, duration_mins, passing_score, coins_reward, status, created_by,
+                                 negative_marking_enabled, marks_per_correct, marks_per_wrong)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *`,
           [quizMeta.title.trim(), quizMeta.description?.trim() || null, quizMeta.subject.trim(),
            quizMeta.type || 'topic', normalised.length, quizMeta.durationMins || 15,
            quizMeta.passingScore || 60, quizMeta.coinsReward || 10,
-           quizMeta.status || 'published', adminId]
+           quizMeta.status || 'published', adminId,
+           negativeMarkingEnabled, marksPerCorrect, marksPerWrong]
         );
         quiz = created;
       }
@@ -563,9 +619,21 @@ return successResponse({
       type: 'type', durationMins: 'duration_mins',
       passingScore: 'passing_score', coinsReward: 'coins_reward',
       status: 'status', scheduledFor: 'scheduled_for', examTags: 'exam_tags',
+      negativeMarkingEnabled: 'negative_marking_enabled',
+      marksPerCorrect: 'marks_per_correct',
+      marksPerWrong: 'marks_per_wrong',
     };
     for (const [key, col] of Object.entries(map)) {
-      if (data[key] !== undefined) { fields.push(`${col}=$${i++}`); vals.push(data[key]); }
+      if (data[key] !== undefined) {
+        let val = data[key];
+        // Guard against bad numeric input — keep marks non-negative and
+        // marksPerCorrect > 0 so a misconfigured test can't silently
+        // award/deduct nothing or go negative on a "correct" answer.
+        if (key === 'marksPerCorrect') val = Number.isFinite(+val) && +val > 0 ? +val : 1;
+        if (key === 'marksPerWrong')   val = Number.isFinite(+val) && +val >= 0 ? +val : 0;
+        if (key === 'negativeMarkingEnabled') val = val === true || val === 'true';
+        fields.push(`${col}=$${i++}`); vals.push(val);
+      }
     }
     if (!fields.length) throw new BadRequestException('No fields to update');
     fields.push('updated_at=NOW()');
@@ -770,38 +838,52 @@ return successResponse({
            qa.user_id,
            qa.score,
            qa.correct_answers,
+           qa.wrong_answers,
+           qa.unanswered_questions,
+           qa.negative_marks,
+           qa.final_score,
            qa.total_questions,
            qa.time_taken_secs
          FROM quiz_attempts qa
          WHERE qa.quiz_id     = $1
            AND qa.total_questions > 0
            AND qa.score        > 0
-         ORDER BY qa.user_id, qa.score DESC, qa.time_taken_secs ASC
+         -- Best attempt per user = highest final_score (marks after
+         -- negative-marking deduction), not raw percentage.
+         ORDER BY qa.user_id, qa.final_score DESC, qa.time_taken_secs ASC
        )
        SELECT
-         RANK() OVER (ORDER BY ba.score DESC, ba.time_taken_secs ASC) AS rank_position,
+         RANK() OVER (ORDER BY ba.final_score DESC, ba.time_taken_secs ASC) AS rank_position,
          u.id   AS user_id,
          u.name AS user_name,
          ba.score,
          ba.correct_answers,
+         ba.wrong_answers,
+         ba.unanswered_questions,
+         ba.negative_marks,
+         ba.final_score,
          ba.total_questions,
          ba.time_taken_secs,
          (u.id = $2) AS is_current_user
        FROM best_attempts ba
        JOIN users u ON u.id = ba.user_id
-       ORDER BY ba.score DESC, ba.time_taken_secs ASC
+       ORDER BY ba.final_score DESC, ba.time_taken_secs ASC
        LIMIT 50`,
       [quizId, currentUserId]
     );
     const leaderboard = rows.map((r: any) => ({
-      rank_position:   parseInt(r.rank_position),
-      user_id:         r.user_id,
-      user_name:       r.user_name,
-      score:           parseFloat(r.score),
-      correct_answers: parseInt(r.correct_answers),
-      total_questions: parseInt(r.total_questions),
-      time_taken_secs: parseInt(r.time_taken_secs),
-      is_current_user: r.user_id === currentUserId,
+      rank_position:        parseInt(r.rank_position),
+      user_id:               r.user_id,
+      user_name:              r.user_name,
+      score:                  parseFloat(r.score),
+      correct_answers:        parseInt(r.correct_answers),
+      wrong_answers:          parseInt(r.wrong_answers) || 0,
+      unanswered_questions:   parseInt(r.unanswered_questions) || 0,
+      negative_marks:         parseFloat(r.negative_marks) || 0,
+      final_score:            parseFloat(r.final_score) || 0,
+      total_questions:        parseInt(r.total_questions),
+      time_taken_secs:        parseInt(r.time_taken_secs),
+      is_current_user:        r.user_id === currentUserId,
     }));
     return successResponse({ leaderboard });
   }

@@ -335,6 +335,65 @@ class CurrentAffairsService {
     }, uploadDir);
   }
 
+  // ── Negative marking config for Current Affairs / Practice MCQs ────────
+  // Current Affairs MCQs (ca_mcqs) are lightweight practice questions
+  // attached to an article — they don't go through the per-test
+  // create/edit flow that `quizzes` has, so instead of a per-article
+  // setting, this is one global toggle the admin sets once and it applies
+  // to every CA MCQ practice session in the app. Reuses the same
+  // app_settings key-value table the coin economy config uses.
+  private static readonly MCQ_CONFIG_KEYS = [
+    'ca_mcq_negative_marking_enabled',
+    'ca_mcq_marks_per_correct',
+    'ca_mcq_marks_per_wrong',
+  ];
+
+  async getMcqMarkingConfig() {
+    const cacheKey = 'ca_mcq:marking_config';
+    const cached   = await this.cache.get(cacheKey);
+    if (cached) return cached;
+
+    const rows = await this.db.query(
+      `SELECT key, value FROM app_settings WHERE key = ANY($1)`,
+      [CurrentAffairsService.MCQ_CONFIG_KEYS]
+    ).catch(() => []);
+    const map: Record<string, string> = {};
+    for (const r of rows) map[r.key] = r.value;
+
+    const config = {
+      negativeMarkingEnabled: map['ca_mcq_negative_marking_enabled'] === 'true',
+      marksPerCorrect:        parseFloat(map['ca_mcq_marks_per_correct']) || 1,
+      marksPerWrong:           parseFloat(map['ca_mcq_marks_per_wrong'])   || 0,
+    };
+    const result = successResponse({ config });
+    await this.cache.set(cacheKey, result, 300);
+    return result;
+  }
+
+  async updateMcqMarkingConfig(data: any, adminId: string) {
+    const negativeMarkingEnabled = data.negativeMarkingEnabled === true;
+    const marksPerCorrect = Number.isFinite(+data.marksPerCorrect) && +data.marksPerCorrect > 0 ? +data.marksPerCorrect : 1;
+    const marksPerWrong   = Number.isFinite(+data.marksPerWrong)   && +data.marksPerWrong   >= 0 ? +data.marksPerWrong   : 0;
+
+    const entries: [string, string][] = [
+      ['ca_mcq_negative_marking_enabled', String(negativeMarkingEnabled)],
+      ['ca_mcq_marks_per_correct', String(marksPerCorrect)],
+      ['ca_mcq_marks_per_wrong', String(marksPerWrong)],
+    ];
+    for (const [key, value] of entries) {
+      await this.db.query(
+        `INSERT INTO app_settings (key, value, updated_by, updated_at) VALUES ($1,$2,$3,NOW())
+         ON CONFLICT (key) DO UPDATE SET value=$2, updated_by=$3, updated_at=NOW()`,
+        [key, value, adminId]
+      );
+    }
+    await this.cache.del('ca_mcq:marking_config');
+    return successResponse(
+      { negativeMarkingEnabled, marksPerCorrect, marksPerWrong },
+      'Negative marking settings updated ✅'
+    );
+  }
+
   // ── Inline content image upload (for the rich text editor) ─────────────
   // Local disk storage, same pattern as CoursesService.uploadLessonFile —
   // no Cloudinary transform needed here since these are inline article
@@ -362,6 +421,9 @@ class CurrentAffairsService {
 class CurrentAffairsController {
   constructor(private s: CurrentAffairsService) {}
   @Get() findAll(@Query() q: any, @Req() r: any) { return this.s.findAll(q, r.user.id); }
+  // Literal route — MUST stay above @Get(':id') or NestJS would match
+  // "mcq-config" as the :id param and 400 on ParseUUIDPipe.
+  @Get('mcq-config') getMcqMarkingConfig() { return this.s.getMcqMarkingConfig(); }
   @Get(':id') findOne(@Param('id', ParseUUIDPipe) id: string, @Req() r: any) { return this.s.findOne(id, r.user.id); }
   @Post(':id/bookmark') @HttpCode(200) toggleBookmark(@Param('id', ParseUUIDPipe) id: string, @Req() r: any) { return this.s.toggleBookmark(id, r.user.id); }
   @Get(':id/mcqs') getMcqs(@Param('id', ParseUUIDPipe) id: string) { return this.s.getMcqs(id); }
@@ -382,6 +444,11 @@ class CurrentAffairsController {
 class AdminCurrentAffairsController {
   constructor(private s: CurrentAffairsService, private config: ConfigService) {}
   @Get() @RequirePermission('current-affairs') findAll(@Query() q: any) { return this.s.findAllAdmin(q); }
+  // Literal routes — MUST stay above @Put(':id')/@Delete(':id') or NestJS
+  // would match "mcq-config" as the :id param (this project's established
+  // convention: literal segments before dynamic ones).
+  @Get('mcq-config') @RequirePermission('current-affairs') getMcqMarkingConfig() { return this.s.getMcqMarkingConfig(); }
+  @Put('mcq-config') @RequirePermission('current-affairs') updateMcqMarkingConfig(@Body() dto: any, @Req() r: any) { return this.s.updateMcqMarkingConfig(dto, r.admin.id); }
   @Post() @RequirePermission('current-affairs') @HttpCode(201) create(@Body() dto: any, @Req() r: any) { return this.s.adminCreate(dto, r.admin.id); }
   // Inline image upload for the rich text editor (paste/insert) — must stay
   // a literal route; NestJS matches top-down and a later `:id` PUT/DELETE
