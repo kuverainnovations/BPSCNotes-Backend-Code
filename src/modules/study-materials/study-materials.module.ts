@@ -156,7 +156,7 @@ export class StudyMaterialsService {
 
   // ── GET: list approved materials ──────────────────────────
   async listApproved(query: {
-    type?: string; subject?: string; search?: string;
+    type?: string; subject?: string; search?: string; language?: string;
     page?: number; limit?: number; sort?: string;
     bookmarkedOnly?: boolean | String; userId?: string;
   }) {
@@ -172,6 +172,7 @@ export class StudyMaterialsService {
 
     if (query.type    && TYPES.includes(query.type as any)) { conditions.push(`sm.material_type = $${pi++}`); params.push(query.type); }
     if (query.subject && query.subject !== 'All')           { conditions.push(`sm.subject = $${pi++}`);       params.push(query.subject); }
+    if (query.language && query.language !== 'All')         { conditions.push(`COALESCE(sm.language,'English') = $${pi++}`); params.push(query.language); }
     if (query.search?.trim()) {
       conditions.push(`(sm.title ILIKE $${pi} OR $${pi} = ANY(sm.tags) OR sm.subject ILIKE $${pi})`);
       params.push(`%${query.search.trim()}%`); pi++;
@@ -608,6 +609,18 @@ if (query.search)  { conditions.push(`(sm.title ILIKE $${pi} OR sm.subject ILIKE
     } catch (err: any) {
       this.logger.warn(`awardReferralMilestoneInline failed: ${err.message}`);
     }
+  }
+
+  // ── Admin: correct a material's language tag ─────────────────
+  async updateMaterialLanguage(id: string, language: string) {
+    const allowed = ['English', 'Hindi', 'Hindi + English'];
+    const value = allowed.includes(language) ? language : 'English';
+    const [row] = await this.db.query(
+      `UPDATE study_materials SET language=$2, updated_at=NOW() WHERE id=$1 RETURNING id, language`,
+      [id, value]
+    );
+    if (!row) throw new NotFoundException('Material not found');
+    return successResponse({ id: row.id, language: row.language }, 'Language updated');
   }
 
   async adminApprove(id: string) {
@@ -1867,6 +1880,17 @@ export class AdminStudyMaterialsController {
   @RequirePermission('study-materials')
   @HttpCode(HttpStatus.OK)
   approve(@Param('id', ParseUUIDPipe) id: string) { return this.svc.adminApprove(id); }
+
+  // ── Correct a material's language tag ────────────────────────
+  // Needed because the language column was backfilled to 'English'
+  // for all pre-existing uploads when it was added — admin can now
+  // fix the tag on older Hindi/mixed materials retroactively.
+  @Patch(':id/language')
+  @RequirePermission('study-materials')
+  @HttpCode(HttpStatus.OK)
+  updateLanguage(@Param('id', ParseUUIDPipe) id: string, @Body() b: { language: string }) {
+    return this.svc.updateMaterialLanguage(id, b.language);
+  }
 
   @Patch(':id/reject')
   @RequirePermission('study-materials')
