@@ -596,7 +596,7 @@ if (query.search)  { conditions.push(`(sm.title ILIKE $${pi} OR sm.subject ILIKE
         [referrerId, refereeId, milestone, coins]
       );
       await this.db.query(
-        `UPDATE users SET coins = coins + $1, total_coins_earned = total_coins_earned + $1 WHERE id=$2`,
+        `UPDATE users SET coins = COALESCE(coins,0) + $1, total_coins_earned = COALESCE(total_coins_earned,0) + $1 WHERE id=$2`,
         [coins, referrerId]
       );
       const bal = (await this.db.query(`SELECT coins FROM users WHERE id=$1`, [referrerId]))[0]?.coins ?? 0;

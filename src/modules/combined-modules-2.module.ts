@@ -409,7 +409,8 @@ class DailyTargetsService {
       );
       if (rule.length) {
         const coins = rule[0].coins_awarded;
-        const bal   = (await this.db.query(`UPDATE users SET coins=coins+$1 WHERE id=$2 RETURNING coins`, [coins, userId]))[0].coins;
+        const balRows = await this.db.query(`UPDATE users SET coins=COALESCE(coins,0)+$1 WHERE id=$2 RETURNING coins`, [coins, userId]);
+        const bal = balRows.length ? (Number(balRows[0].coins) || 0) : 0;
         await this.db.query(
           `INSERT INTO coin_transactions (user_id,type,amount,description,action,balance)
            VALUES ($1,'earned',$2,'Daily target plan created','daily_target_create',$3)`,

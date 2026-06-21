@@ -872,8 +872,9 @@ class SubscriptionsService {
 
       // 4. Award bonus coins
       if (coinSystemEnabled) {
-        await this.db.query(`UPDATE users SET coins=coins+$1 WHERE id=$2`, [plan.bonusCoins, userId]);
-        const newBal = (await this.db.query(`SELECT coins FROM users WHERE id=$1`, [userId]))[0].coins;
+        await this.db.query(`UPDATE users SET coins=COALESCE(coins,0)+$1 WHERE id=$2`, [plan.bonusCoins, userId]);
+        const balRow = (await this.db.query(`SELECT coins FROM users WHERE id=$1`, [userId]))[0];
+        const newBal = Number(balRow?.coins) || 0;
         await this.db.query(
           `INSERT INTO coin_transactions (user_id,type,amount,description,action,balance) VALUES ($1,'earned',$2,'Subscription bonus coins','subscription_bonus',$3)`,
           [userId, plan.bonusCoins, newBal]
@@ -963,12 +964,12 @@ class SubscriptionsService {
         );
 
         if (plan?.bonusCoins > 0 && await this.isCoinSystemEnabled()) {
-          await this.db.query(`UPDATE users SET coins=coins+$1 WHERE id=$2`, [plan.bonusCoins, sub.user_id]);
+          await this.db.query(`UPDATE users SET coins=COALESCE(coins,0)+$1 WHERE id=$2`, [plan.bonusCoins, sub.user_id]);
           const [bal] = await this.db.query(`SELECT coins FROM users WHERE id=$1`, [sub.user_id]);
           await this.db.query(
             `INSERT INTO coin_transactions (user_id,type,amount,description,action,balance)
              VALUES ($1,'earned',$2,'Subscription bonus coins','subscription_bonus',$3)`,
-            [sub.user_id, plan.bonusCoins, bal.coins]
+            [sub.user_id, plan.bonusCoins, Number(bal?.coins) || 0]
           );
         }
 

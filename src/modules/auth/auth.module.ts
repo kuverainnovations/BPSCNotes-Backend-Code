@@ -612,11 +612,12 @@ export class AuthService {
         [referrerId, refereeId, milestone, coins]
       );
       await this.db.query(
-        `UPDATE users SET coins = coins + $1, total_coins_earned = total_coins_earned + $1
+        `UPDATE users SET coins = COALESCE(coins,0) + $1, total_coins_earned = COALESCE(total_coins_earned,0) + $1
          WHERE id = $2`,
         [coins, referrerId]
       );
-      const bal = (await this.db.query(`SELECT coins FROM users WHERE id=$1`, [referrerId]))[0].coins;
+      const balRow = (await this.db.query(`SELECT coins FROM users WHERE id=$1`, [referrerId]))[0];
+      const bal = Number(balRow?.coins) || 0;
       const descriptions: Record<string, string> = {
         engagement: 'Friend enrolled in course / uploaded notes (2/3)',
         active:     'Friend completed 5 quizzes — fully active! (3/3)',

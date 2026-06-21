@@ -1376,19 +1376,21 @@ export class StudySessionsService {
   private async awardSessionCoins(userId: string, sessionId: string, amount: number, multiplier: number) {
     if (amount <= 0) return;
     const bal = await this.db.query(
-      `UPDATE users SET coins=coins+$1, total_coins_earned=total_coins_earned+$1 WHERE id=$2 RETURNING coins`,
+      `UPDATE users SET coins=COALESCE(coins,0)+$1, total_coins_earned=COALESCE(total_coins_earned,0)+$1 WHERE id=$2 RETURNING coins`,
       [amount, userId]
     );
+    if (!bal.length) return;
+    const newBalance = Number(bal[0].coins) || 0;
     await this.db.query(
       `INSERT INTO coin_transactions (user_id,type,amount,description,action,ref_id,balance)
        VALUES ($1,'earned',$2,$3,'study_time',$4,$5)`,
-      [userId, amount, `Study time (${multiplier}x tier)`, sessionId, bal[0].coins]
+      [userId, amount, `Study time (${multiplier}x tier)`, sessionId, newBalance]
     );
   }
 
   private async awardSessionXp(userId: string, sessionId: string, amount: number) {
     if (amount <= 0) return;
-    await this.db.query(`UPDATE users SET xp=xp+$1 WHERE id=$2`, [amount, userId]);
+    await this.db.query(`UPDATE users SET xp=COALESCE(xp,0)+$1 WHERE id=$2`, [amount, userId]);
     const user = await this.db.query(`SELECT xp, xp_level FROM users WHERE id=$1`, [userId]);
     if (!user.length) return;
     const nextLevel = await this.db.query(
