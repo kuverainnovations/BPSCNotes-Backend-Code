@@ -60,6 +60,7 @@ class QuizzesService {
            q.id, q.title, q.description, q.subject, q.type,
            q.total_questions, q.duration_mins, q.coins_reward,
            q.exam_tags, q.scheduled_for, q.attempt_count, q.avg_score, q.status,
+           q.negative_marking_enabled, q.marks_per_correct, q.marks_per_wrong,
            -- is_attempted: true/false boolean (not a JSON object)
            (SELECT TRUE FROM quiz_attempts qa WHERE qa.user_id=$${params.length + 1} AND qa.quiz_id=q.id LIMIT 1) AS is_attempted,
            (SELECT qa.score FROM quiz_attempts qa WHERE qa.user_id=$${params.length + 1} AND qa.quiz_id=q.id ORDER BY qa.attempted_at DESC LIMIT 1) AS my_last_score
@@ -99,7 +100,8 @@ class QuizzesService {
     const quiz = await this.db.query(
       `SELECT id, title, description, subject, type,
               total_questions, duration_mins, coins_reward,
-              exam_tags, scheduled_for, attempt_count, avg_score, status
+              exam_tags, scheduled_for, attempt_count, avg_score, status,
+              negative_marking_enabled, marks_per_correct, marks_per_wrong
        FROM quizzes WHERE id=$1 AND status='published'`,
       [quizId]
     );
@@ -186,6 +188,10 @@ if (q.scheduled_for) {
     // Postgres raw queries return numeric columns as strings — parse to avoid NaN
     const durationMins = parseInt(q.duration_mins, 10) || 15;
     const coinsReward  = parseInt(q.coins_reward,  10) || 0;
+    // Negative marking config (admin-set per quiz, see NegativeMarkingConfig migration)
+    const negEnabled       = q.negative_marking_enabled === true;
+    const marksPerCorrect  = parseFloat(q.marks_per_correct) || 1;
+    const marksPerWrong    = negEnabled ? (parseFloat(q.marks_per_wrong) || 0) : 0;
     // Prevents direct API submit without loading questions first
     const startedAttempt = await this.db.query(
       `SELECT id, attempted_at FROM quiz_attempts
@@ -234,6 +240,9 @@ if (q.scheduled_for) {
         isCorrect,
         correctAnswer: info?.correct     ?? '',
         explanation:   info?.explanation ?? '',
+        // +marksPerCorrect if right, -marksPerWrong if wrong (0 if negative
+        // marking is off for this quiz)
+        marks: isCorrect ? marksPerCorrect : -marksPerWrong,
       };
     });
 
@@ -248,8 +257,22 @@ if (q.scheduled_for) {
         isCorrect:     false,
         correctAnswer: qMap[q.id]?.correct ?? '',
         explanation:   qMap[q.id]?.explanation ?? '',
+        // Skipped questions never lose marks, even with negative marking on
+        marks: 0,
       }));
     const allAnswers = [...evaluated, ...skippedResults];
+    const total    = questions.length;
+
+
+    // wrongCount excludes skipped questions on purpose — standard
+    // competitive-exam convention is skip = 0 marks, wrong attempt = lose
+    // marks. Using total-correct here would incorrectly penalize skips too.
+    const wrongCount      = evaluated.filter((e: any) => !e.isCorrect).length;
+    const unansweredCount = skippedResults.length;
+    const totalMarks      = total * marksPerCorrect;
+    const marksObtained   = correct * marksPerCorrect;
+    const negativeMarks   = negEnabled ? wrongCount * marksPerWrong : 0;
+    const finalScore      = marksObtained - negativeMarks;
 
     // ANTI-CHEAT: Calculate time server-side — don't trust client timeTakenSecs
     // Use attempted_at from the start record vs NOW()
@@ -260,7 +283,6 @@ if (q.scheduled_for) {
     const maxSecs = durationMins * 60 + 30;
     const timeTakenSecs = Math.min(serverTimeSecs, maxSecs);
 
-    const total    = questions.length;
     const score    = total > 0 ? Math.round((correct / total) * 100) : 0;
     const accuracy = score;
 
@@ -276,10 +298,14 @@ if (q.scheduled_for) {
 
     const attempt = await this.db.query(
       `INSERT INTO quiz_attempts
-         (user_id, quiz_id, score, total_questions, correct_answers, time_taken_secs, coins_earned, answers, submitted_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW())
+         (user_id, quiz_id, score, total_questions, correct_answers, time_taken_secs, coins_earned, answers, submitted_at,
+          wrong_answers, unanswered_questions, marks_obtained, negative_marks, final_score)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW(),$9,$10,$11,$12,$13)
        RETURNING id, attempted_at`,
-      [userId, quizId, score, total, correct, timeTakenSecs, isFirstAttempt ? coinsReward : 0, JSON.stringify(allAnswers)]
+      [
+        userId, quizId, score, total, correct, timeTakenSecs, isFirstAttempt ? coinsReward : 0, JSON.stringify(allAnswers),
+        wrongCount, unansweredCount, marksObtained, negativeMarks, finalScore,
+      ]
     );
 
     // Update quiz stats
@@ -391,13 +417,23 @@ return successResponse({
   score,
   correct,
   total,
-  wrong: total - correct,
+  wrong: wrongCount,
+  unanswered: unansweredCount,
   accuracy,
   coinsEarned,
   timeTakenSecs,
 
   rank,
   percentile,
+
+  // ── Negative marking breakdown ──────────────────────────
+  negativeMarkingEnabled: negEnabled,
+  marksPerCorrect,
+  marksPerWrong,
+  totalMarks,
+  marksObtained,
+  negativeMarks,
+  finalScore,
 
   answers: allAnswers,
 });
@@ -435,8 +471,9 @@ return successResponse({
     const result = await this.db.query(
       `INSERT INTO quizzes
          (title, description, subject, type, total_questions,
-          duration_mins, coins_reward, exam_tags, scheduled_for, status, created_by)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+          duration_mins, coins_reward, exam_tags, scheduled_for, status, created_by,
+          negative_marking_enabled, marks_per_correct, marks_per_wrong)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
        RETURNING *`,
       [
         data.title, data.description || null, data.subject,
@@ -447,6 +484,9 @@ return successResponse({
         data.scheduledFor || null,
         data.status || 'draft',
         adminId,
+        data.negativeMarkingEnabled === true,
+        data.marksPerCorrect != null ? +data.marksPerCorrect : 1,
+        data.marksPerWrong   != null ? +data.marksPerWrong   : 0,
       ]
     );
     return successResponse({ quiz: result[0] }, 'Quiz created. Add questions next.');
@@ -588,6 +628,9 @@ return successResponse({
       type: 'type', durationMins: 'duration_mins',
       coinsReward: 'coins_reward',
       status: 'status', scheduledFor: 'scheduled_for', examTags: 'exam_tags',
+      negativeMarkingEnabled: 'negative_marking_enabled',
+      marksPerCorrect: 'marks_per_correct',
+      marksPerWrong: 'marks_per_wrong',
     };
     for (const [key, col] of Object.entries(map)) {
       if (data[key] !== undefined) { fields.push(`${col}=$${i++}`); vals.push(data[key]); }
