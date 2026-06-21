@@ -264,7 +264,9 @@ class CurrentAffairsService {
     );
     if (!mcqs.length) throw new NotFoundException('No questions found for this article');
 
-    const cfg = (await this.getMcqMarkingConfig()).data.config;
+   // const cfg = (await this.getMcqMarkingConfig()).data.config;
+    
+    const cfg = ((await this.getMcqMarkingConfig()) as any).data.config;
     const negEnabled       = cfg.negativeMarkingEnabled === true;
     const marksPerCorrect  = +cfg.marksPerCorrect || 1;
     const marksPerWrong    = +cfg.marksPerWrong   || 0;
