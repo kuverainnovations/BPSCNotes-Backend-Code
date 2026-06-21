@@ -103,7 +103,9 @@ class CurrentAffairsService {
         `SELECT ca.id,ca.title,ca.summary,ca.category,ca.date,ca.is_important,ca.exam_tags,ca.tags,ca.view_count,ca.bookmark_count,
            COALESCE(ca.read_time, 1) AS read_time,
            (SELECT TRUE FROM affairs_bookmarks ab WHERE ab.user_id=$${params.length+1} AND ab.affair_id=ca.id) AS is_bookmarked,
-           (SELECT COUNT(*) FROM ca_mcqs m WHERE m.affair_id=ca.id)::int AS mcq_count
+           (SELECT COUNT(*) FROM ca_mcqs m WHERE m.affair_id=ca.id)::int AS mcq_count,
+           (SELECT TRUE FROM ca_mcq_attempts cma WHERE cma.user_id=$${params.length+1} AND cma.affair_id=ca.id LIMIT 1) AS mcq_attempted,
+           (SELECT cma.final_score FROM ca_mcq_attempts cma WHERE cma.user_id=$${params.length+1} AND cma.affair_id=ca.id ORDER BY cma.attempted_at DESC LIMIT 1) AS mcq_last_score
          FROM current_affairs ca WHERE ${where}
          ORDER BY ca.date DESC, ca.is_important DESC LIMIT $${params.length+2} OFFSET $${params.length+3}`,
         [...params, userId, limit, offset]
@@ -117,7 +119,9 @@ class CurrentAffairsService {
 
   async findOne(affairId: string, userId: string) {
     const result = await this.db.query(
-      `SELECT ca.*, (SELECT TRUE FROM affairs_bookmarks WHERE user_id=$2 AND affair_id=ca.id) AS is_bookmarked
+      `SELECT ca.*, (SELECT TRUE FROM affairs_bookmarks WHERE user_id=$2 AND affair_id=ca.id) AS is_bookmarked,
+         (SELECT TRUE FROM ca_mcq_attempts cma WHERE cma.user_id=$2 AND cma.affair_id=ca.id LIMIT 1) AS mcq_attempted,
+         (SELECT cma.final_score FROM ca_mcq_attempts cma WHERE cma.user_id=$2 AND cma.affair_id=ca.id ORDER BY cma.attempted_at DESC LIMIT 1) AS mcq_last_score
        FROM current_affairs ca WHERE ca.id=$1 AND ca.status='published'`,
       [affairId, userId]
     );
@@ -243,6 +247,89 @@ class CurrentAffairsService {
       [affairId]
     );
     return successResponse({ mcqs: rows });
+  }
+
+  // Persists a CA MCQ practice result so the article list/detail can show
+  // "attempted" + last score (mirrors quiz_attempts). Scored server-side
+  // from the submitted answers rather than trusting a client-computed
+  // score — the existing getMcqs() flow already sends correct answers to
+  // the client up front (no real anti-cheat boundary for these low-stakes
+  // practice questions), but a submission endpoint specifically should
+  // still grade independently rather than accept an arbitrary number.
+  async submitMcqAttempt(affairId: string, userId: string, dto: any) {
+    await this.ensureCaMcqTable();
+    const mcqs = await this.db.query(
+      `SELECT id, correct, option_e FROM ca_mcqs WHERE affair_id=$1`,
+      [affairId]
+    );
+    if (!mcqs.length) throw new NotFoundException('No questions found for this article');
+
+    const cfg = (await this.getMcqMarkingConfig()).data.config;
+    const negEnabled       = cfg.negativeMarkingEnabled === true;
+    const marksPerCorrect  = +cfg.marksPerCorrect || 1;
+    const marksPerWrong    = +cfg.marksPerWrong   || 0;
+
+    // Map of questionId -> submitted letter. A question simply absent from
+    // this map (never tapped) is what "blank" means below — same semantics
+    // as Android's `answers: Map<String,String>` with no entry for a
+    // skipped question.
+    const submitted: Record<string, string> = {};
+    for (const a of (Array.isArray(dto?.answers) ? dto.answers : [])) {
+      if (a && typeof a.questionId === 'string' && typeof a.answer === 'string') {
+        submitted[a.questionId] = a.answer;
+      }
+    }
+
+    // Mirrors computeCaMcqResults() in CaMcqQuizScreen.kt exactly — same
+    // BPSC rule: correct=+1, wrong=-marksPerWrong, explicit "Option E / not
+    // attempting"=0, but a truly blank question loses marks like wrong.
+    const results = mcqs.map((q: any) => {
+      const userAnswer      = submitted[q.id] ?? null;
+      const optionEIsBlank  = !q.option_e || String(q.option_e).trim() === '';
+      const isNotAttempting = userAnswer === 'e' && optionEIsBlank;
+      const isBlank          = userAnswer === null;
+      const isCorrect        = !isBlank && !isNotAttempting && userAnswer === q.correct;
+      const marks = isNotAttempting ? 0
+        : isCorrect ? marksPerCorrect
+        : (negEnabled ? -marksPerWrong : 0);
+      return { questionId: q.id, answer: userAnswer, isNotAttempting, isBlank, isCorrect, marks };
+    });
+
+    const correct      = results.filter((r: any) => r.isCorrect).length;
+    const notAttempted = results.filter((r: any) => r.isNotAttempting).length;
+    const blank          = results.filter((r: any) => r.isBlank && !r.isNotAttempting).length;
+    const wrong           = results.length - correct - notAttempted - blank;
+    const marksObtained  = correct * marksPerCorrect;
+    const negativeMarks  = results.reduce((s: number, r: any) => s + (r.marks < 0 ? -r.marks : 0), 0);
+    const finalScore       = results.reduce((s: number, r: any) => s + r.marks, 0);
+    const totalMarks        = mcqs.length * marksPerCorrect;
+
+    const attempt = await this.db.query(
+      `INSERT INTO ca_mcq_attempts
+         (user_id, affair_id, total_questions, correct_answers, wrong_answers, not_attempted_count, blank_count,
+          negative_marking_enabled, marks_per_correct, marks_per_wrong,
+          marks_obtained, negative_marks, final_score, total_marks, answers)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+       RETURNING id, attempted_at`,
+      [
+        userId, affairId, mcqs.length, correct, wrong, notAttempted, blank,
+        negEnabled, marksPerCorrect, marksPerWrong,
+        marksObtained, negativeMarks, finalScore, totalMarks, JSON.stringify(results),
+      ]
+    );
+
+    // findAll()'s list cache is keyed per-filter/page/user (120s TTL) and
+    // isn't pattern-invalidated here — the attempted badge can lag up to
+    // 120s behind a fresh submission. findOne() (detail) isn't cached, so
+    // that one reflects immediately.
+
+    return successResponse({
+      attemptId:  attempt[0].id,
+      attemptedAt: attempt[0].attempted_at,
+      total: mcqs.length, correct, wrong, notAttempted, blank,
+      negativeMarkingEnabled: negEnabled, marksPerCorrect, marksPerWrong,
+      marksObtained, negativeMarks, finalScore, totalMarks,
+    }, 'Attempt recorded');
   }
 
   async logActivity(userId: string, activityType: string, durationSecs: number) {
@@ -427,6 +514,9 @@ class CurrentAffairsController {
   @Get(':id') findOne(@Param('id', ParseUUIDPipe) id: string, @Req() r: any) { return this.s.findOne(id, r.user.id); }
   @Post(':id/bookmark') @HttpCode(200) toggleBookmark(@Param('id', ParseUUIDPipe) id: string, @Req() r: any) { return this.s.toggleBookmark(id, r.user.id); }
   @Get(':id/mcqs') getMcqs(@Param('id', ParseUUIDPipe) id: string) { return this.s.getMcqs(id); }
+  @Post(':id/mcqs/submit') @HttpCode(201) submitMcqAttempt(@Param('id', ParseUUIDPipe) id: string, @Body() dto: any, @Req() r: any) {
+    return this.s.submitMcqAttempt(id, r.user.id, dto);
+  }
   // @Res({ passthrough: false }) hands the response fully to us, bypassing
   // the global TransformInterceptor (which would otherwise wrap the PDF
   // bytes in the standard {success,message,data} JSON envelope).
