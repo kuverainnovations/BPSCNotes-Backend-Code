@@ -81,6 +81,11 @@ export class TierRoomsService {
         this.notifService.notifyPromotion(userId, t.tier_key, t.name, t.icon_emoji)
           .catch((e: any) => this.logger.error(`Promotion push failed: ${e.message}`));
       }
+      const [userRow] = await this.db.query(`SELECT name FROM users WHERE id=$1`, [userId]);
+      this.gateway.recordActivityFeedEvent(
+        toTierId, t.tier_key, userId, userRow?.name ?? 'Member',
+        'promoted', { tierName: t.name, tierEmoji: t.icon_emoji },
+      ).catch(() => {});
     }
   }
 
@@ -211,14 +216,43 @@ export class TierRoomsService {
     const [members, countResult] = await Promise.all([
       this.db.query(`
         WITH this_tier AS (SELECT id FROM room_tiers WHERE tier_key=$1)
-        SELECT u.id, u.name, u.streak, u.quizzes_attempted, u.accuracy,
+        SELECT u.id, u.name, u.streak, u.longest_streak, u.avatar_url,
+               u.quizzes_attempted, u.accuracy,
                u.coins, u.xp, u.xp_level, u.total_study_minutes,
                urt.promoted_at, urt.next_tier_progress,
                EXISTS(
                  SELECT 1 FROM study_sessions ss
                  WHERE ss.user_id=u.id AND ss.ended_at IS NULL
                    AND COALESCE(ss.room_tier_id, ss.tier_id) = (SELECT id FROM this_tier)
-               ) AS is_studying_now
+               ) AS is_studying_now,
+               -- Active tab (spec section 2): when the current session in
+               -- THIS room started, so the client can show a live-ticking
+               -- timer the same way StudySessionViewModel already does for
+               -- your own session, instead of a number that's stale the
+               -- instant it's fetched.
+               (
+                 SELECT ss.started_at FROM study_sessions ss
+                 WHERE ss.user_id=u.id AND ss.ended_at IS NULL
+                   AND COALESCE(ss.room_tier_id, ss.tier_id) = (SELECT id FROM this_tier)
+                 LIMIT 1
+               ) AS current_session_started_at,
+               -- Inactive tab: most recent time this user was active
+               -- specifically IN THIS ROOM (not users.last_active_at,
+               -- which is global across all rooms and would misreport a
+               -- member as "active" here from time spent in a different
+               -- room).
+               (
+                 SELECT MAX(ss.ended_at) FROM study_sessions ss
+                 WHERE ss.user_id=u.id AND ss.ended_at IS NOT NULL
+                   AND COALESCE(ss.room_tier_id, ss.tier_id) = (SELECT id FROM this_tier)
+               ) AS last_active_at,
+               -- Inactive tab: total contribution to this specific room
+               -- (all-time), not the user's global total_study_minutes.
+               COALESCE((
+                 SELECT SUM(ss.active_minutes) FROM study_sessions ss
+                 WHERE ss.user_id=u.id
+                   AND COALESCE(ss.room_tier_id, ss.tier_id) = (SELECT id FROM this_tier)
+               ), 0)::int AS room_total_minutes
         FROM users u
         LEFT JOIN user_room_tier urt ON urt.user_id = u.id
         WHERE u.status='active' AND (
@@ -268,7 +302,13 @@ export class TierRoomsService {
     const snapshot = await this.db.query(`
       SELECT rl.rank_position, rl.study_minutes, rl.coins_earned, rl.xp_earned,
              COALESCE(rl.goals_completed, 0) AS goals_completed, rl.streak_days,
-             u.id AS user_id, u.name AS user_name, COALESCE(u.xp_level, 1) AS xp_level
+             u.id AS user_id, u.name AS user_name, COALESCE(u.xp_level, 1) AS xp_level,
+             u.avatar_url,
+             COALESCE((
+               SELECT SUM(ss.active_minutes) FROM study_sessions ss
+               WHERE ss.user_id = u.id AND COALESCE(ss.room_tier_id, ss.tier_id) = rl.tier_id
+                 AND ss.started_at::date = CURRENT_DATE
+             ), 0)::int AS study_minutes_today
       FROM room_leaderboard rl
       JOIN users u      ON u.id  = rl.user_id
       JOIN room_tiers t ON t.id  = rl.tier_id
@@ -317,7 +357,13 @@ export class TierRoomsService {
         COALESCE(u.streak, 0)::int               AS streak_days,
         u.id   AS user_id,
         u.name AS user_name,
-        COALESCE(u.xp_level, 1)                  AS xp_level
+        COALESCE(u.xp_level, 1)                  AS xp_level,
+        u.avatar_url,
+        COALESCE((
+          SELECT SUM(ss3.active_minutes) FROM study_sessions ss3
+          WHERE ss3.user_id = u.id AND COALESCE(ss3.room_tier_id, ss3.tier_id) = $1
+            AND ss3.started_at::date = CURRENT_DATE
+        ), 0)::int AS study_minutes_today
       FROM users u
       -- FIX: was joining study_sessions on user_id alone and gating the
       -- whole roster by user_room_tier.current_tier_id (the user's
@@ -351,6 +397,89 @@ export class TierRoomsService {
     const result = successResponse({ leaderboard: live, period, periodKey });
     await this.cache.set(cacheKey, result, 60); // shorter cache for live data
     return result;
+  }
+
+  // ── Room Statistics (spec section 4: Room Insights) ───────
+  // "Active Members" here means "studied in this room at some point in
+  // the last 7 days" — deliberately broader than "Members Studying Now"
+  // (the live open-session count), since the spec lists both side by side
+  // and a same-second live count would make "Active Members" redundant.
+  async getRoomStats(tierKey: string) {
+    const cacheKey = `room_stats:${tierKey}`;
+    const cached   = await this.cache.get(cacheKey);
+    if (cached) return cached;
+
+    const tier = await this.db.query(
+      `SELECT id FROM room_tiers WHERE tier_key=$1 AND is_active=TRUE LIMIT 1`, [tierKey]
+    );
+    if (!tier.length) throw new NotFoundException('Room not found.');
+    const tierId = tier[0].id;
+
+    const [stats, topPerformer] = await Promise.all([
+      this.db.query(`
+        WITH this_tier AS (SELECT $1::uuid AS id),
+             roster AS (
+               SELECT u.id, u.streak FROM users u WHERE u.status='active' AND (
+                 EXISTS(SELECT 1 FROM user_room_tier urt JOIN room_tiers t ON t.id=urt.current_tier_id
+                        WHERE urt.user_id=u.id AND t.id=(SELECT id FROM this_tier))
+                 OR EXISTS(SELECT 1 FROM study_sessions ss
+                        WHERE ss.user_id=u.id AND COALESCE(ss.room_tier_id, ss.tier_id)=(SELECT id FROM this_tier))
+               )
+             )
+        SELECT
+          (SELECT COUNT(*) FROM roster)::int AS total_members,
+          (SELECT COUNT(DISTINCT ss.user_id) FROM study_sessions ss
+             WHERE COALESCE(ss.room_tier_id, ss.tier_id)=(SELECT id FROM this_tier)
+               AND ss.started_at >= NOW() - INTERVAL '7 days')::int AS active_members,
+          (SELECT COUNT(DISTINCT ss.user_id) FROM study_sessions ss
+             WHERE COALESCE(ss.room_tier_id, ss.tier_id)=(SELECT id FROM this_tier)
+               AND ss.ended_at IS NULL)::int AS studying_now,
+          COALESCE((SELECT SUM(ss.active_minutes) FROM study_sessions ss
+             WHERE COALESCE(ss.room_tier_id, ss.tier_id)=(SELECT id FROM this_tier)
+               AND ss.started_at::date = CURRENT_DATE), 0)::int AS minutes_today,
+          COALESCE((SELECT SUM(ss.active_minutes) FROM study_sessions ss
+             WHERE COALESCE(ss.room_tier_id, ss.tier_id)=(SELECT id FROM this_tier)
+               AND ss.started_at >= NOW() - INTERVAL '7 days'), 0)::int AS minutes_this_week,
+          COALESCE((SELECT MAX(streak) FROM roster), 0)::int AS highest_streak
+      `, [tierId]),
+      this.db.query(`
+        SELECT u.id AS user_id, u.name AS user_name,
+               COALESCE(SUM(ss.active_minutes),0)::int AS minutes
+        FROM users u
+        JOIN study_sessions ss ON ss.user_id = u.id
+        WHERE COALESCE(ss.room_tier_id, ss.tier_id) = $1
+          AND ss.started_at >= NOW() - INTERVAL '7 days' AND ss.ended_at IS NOT NULL
+        GROUP BY u.id, u.name
+        ORDER BY minutes DESC
+        LIMIT 1
+      `, [tierId]),
+    ]);
+
+    const result = successResponse({
+      ...stats[0],
+      topPerformer: topPerformer[0] ?? null,
+    });
+    await this.cache.set(cacheKey, result, 30); // short TTL — feeds off live session data
+    return result;
+  }
+
+  // ── Activity Feed read (spec section 9) ────────────────────
+  // Writes happen via TierRoomsGateway.recordActivityFeedEvent(), called
+  // from startSession/endSession/promoteUser/demoteUser. This just reads
+  // the last N entries — no caching, since the whole point is freshness
+  // and the gateway already pushes new entries over WS for connected
+  // clients; this endpoint is for the initial load / pull-to-refresh.
+  async getActivityFeed(tierKey: string, limit = 50) {
+    const rows = await this.db.query(`
+      SELECT raf.id, raf.user_id AS "userId", raf.user_name AS "userName",
+             raf.event_type AS "eventType", raf.metadata, raf.created_at AS "createdAt"
+      FROM room_activity_feed raf
+      JOIN room_tiers t ON t.id = raf.room_tier_id
+      WHERE t.tier_key = $1
+      ORDER BY raf.created_at DESC
+      LIMIT $2
+    `, [tierKey, Math.min(+limit || 50, 100)]);
+    return successResponse({ feed: rows });
   }
 
   async assignDefaultTier(userId: string) {
@@ -664,6 +793,10 @@ export class StudySessionsService {
       this.gateway.server?.to(`tier:${tierKey}`).emit('room:member_joined', {
         tierKey, userId, userName,
       });
+      // Room activity feed (spec section 9) — fire and forget, never block
+      // the session start response on this.
+      this.gateway.recordActivityFeedEvent(roomTierId, tierKey, userId, userName, 'joined')
+        .catch(() => {});
     }
 
     await this.activityLog?.log(userId, ACTIONS.STUDY_SESSION_STARTED, 'Study session started', { sessionId: session[0].id, mode: sessionMode }).catch(()=>{});
@@ -772,9 +905,18 @@ export class StudySessionsService {
   }
 
   async endSession(sessionId: string, userId: string) {
+    // FIX: was only joining room_tiers on ss.tier_id (the user's reward
+    // tier — correct for coin_multiplier/xp_multiplier) and then also
+    // using that same tier_key to broadcast "member left" below. If the
+    // session was actually held in a different room than the user's home
+    // tier, the broadcast went to the wrong room — same room-vs-reward-tier
+    // bug already fixed in the gateway/leaderboard, just missed here.
+    // getActiveSession() below already had this right; matching it.
     const sessions = await this.db.query(`
-      SELECT ss.*, t.coin_multiplier, t.xp_multiplier, t.tier_key
-      FROM study_sessions ss LEFT JOIN room_tiers t ON t.id=ss.tier_id
+      SELECT ss.*, t.coin_multiplier, t.xp_multiplier, rt.tier_key AS room_tier_key
+      FROM study_sessions ss
+      LEFT JOIN room_tiers t  ON t.id  = ss.tier_id
+      LEFT JOIN room_tiers rt ON rt.id = COALESCE(ss.room_tier_id, ss.tier_id)
       WHERE ss.id=$1 AND ss.user_id=$2 AND ss.ended_at IS NULL
     `, [sessionId, userId]);
     if (!sessions.length) throw new NotFoundException('Active session not found.');
@@ -859,6 +1001,7 @@ export class StudySessionsService {
       // - Yesterday → increment streak
       // - Anything else (gap) → reset to 1
       let streakSql = '';
+      let isIncrement = false;
       if (lastDate === todayUTC) {
         // Already counted today — only update last_active_at
         streakSql = `
@@ -866,6 +1009,7 @@ export class StudySessionsService {
         `;
       } else if (lastDate === yesterdayUTC) {
         // Consecutive day — increment streak
+        isIncrement = true;
         streakSql = `
           UPDATE users SET
             last_active_at=NOW(),
@@ -873,6 +1017,7 @@ export class StudySessionsService {
             streak = streak + 1,
             longest_streak = GREATEST(longest_streak, streak + 1)
           WHERE id=$1
+          RETURNING streak
         `;
       } else {
         // Gap or first session ever — reset to 1
@@ -885,7 +1030,21 @@ export class StudySessionsService {
           WHERE id=$1
         `;
       }
-      await this.db.query(streakSql, [userId]);
+      const streakResult = await this.db.query(streakSql, [userId]);
+
+      // Room activity feed (spec section 9) — only on a genuine increment,
+      // and only at round milestones, so this doesn't fire every single
+      // day someone studies. Uses the room this session was actually held
+      // in (s.room_tier_key, fixed above), not the user's reward tier.
+      const STREAK_MILESTONES = [3, 7, 14, 30, 50, 100, 200, 365];
+      const newStreak = isIncrement ? streakResult[0]?.streak : null;
+      if (newStreak && STREAK_MILESTONES.includes(newStreak) && s.room_tier_key) {
+        const [userRow] = await this.db.query(`SELECT name FROM users WHERE id=$1`, [userId]);
+        this.gateway.recordActivityFeedEvent(
+          s.room_tier_id || s.tier_id, s.room_tier_key, userId, userRow?.name ?? 'Member',
+          'streak_milestone', { streakDays: newStreak },
+        ).catch(() => {});
+      }
     } else {
       await this.db.query(`UPDATE users SET last_active_at=NOW() WHERE id=$1`, [userId]);
     }
@@ -904,10 +1063,10 @@ export class StudySessionsService {
 
     // Broadcast member_left + presence update so lobby and room members list
     // update immediately when a user ends their session
-    if (s.tier_key) {
-      this.gateway['broadcastPresenceUpdate'](s.tier_key);
-      this.gateway.server?.to(`tier:${s.tier_key}`).emit('room:member_left', {
-        tierKey: s.tier_key, userId,
+    if (s.room_tier_key) {
+      this.gateway['broadcastPresenceUpdate'](s.room_tier_key);
+      this.gateway.server?.to(`tier:${s.room_tier_key}`).emit('room:member_left', {
+        tierKey: s.room_tier_key, userId,
       });
     }
 
@@ -1300,6 +1459,11 @@ export class TierRoomsCronService {
         this.notifService.notifyPromotion(userId, t.tier_key, t.name, t.icon_emoji)
           .catch(e => this.logger.error(`Promotion push failed: ${e.message}`));
       }
+      const [userRow] = await this.db.query(`SELECT name FROM users WHERE id=$1`, [userId]);
+      this.gateway.recordActivityFeedEvent(
+        toTierId, t.tier_key, userId, userRow?.name ?? 'Member',
+        'promoted', { tierName: t.name, tierEmoji: t.icon_emoji },
+      ).catch(() => {});
     }
   }
 
@@ -1331,6 +1495,11 @@ export class TierRoomsCronService {
       this.notifService.notifyDemotion(userId, t.tier_key, t.name, t.icon_emoji)
         .catch(e => this.logger.error(`Demotion push failed: ${e.message}`));
     }
+    const [userRow] = await this.db.query(`SELECT name FROM users WHERE id=$1`, [userId]);
+    this.gateway.recordActivityFeedEvent(
+      t.id, t.tier_key, userId, userRow?.name ?? 'Member',
+      'demoted', { tierName: t.name, tierEmoji: t.icon_emoji },
+    ).catch(() => {});
   }
 }
 
@@ -1364,6 +1533,19 @@ export class TierRoomsController {
     @Param('tierKey') tierKey: string,
     @Query('period') period: string = 'weekly',
   ) { return this.tiersService.getLeaderboard(tierKey, period); }
+
+  /** GET /rooms/tiers/:tierKey/stats — Room Insights card */
+  @Get('tiers/:tierKey/stats')
+  getRoomStats(@Param('tierKey') tierKey: string) {
+    return this.tiersService.getRoomStats(tierKey);
+  }
+
+  /** GET /rooms/tiers/:tierKey/activity?limit=50 — Room Activity Feed */
+  @Get('tiers/:tierKey/activity')
+  getActivityFeed(
+    @Param('tierKey') tierKey: string,
+    @Query('limit')   limit:   number = 50,
+  ) { return this.tiersService.getActivityFeed(tierKey, limit); }
 
   @Post('sessions/start')
   @HttpCode(HttpStatus.CREATED)

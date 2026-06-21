@@ -300,6 +300,50 @@ export class TierRoomsGateway
     });
   }
 
+  // ── SERVER: record + broadcast a room activity feed event ─
+  // Used by StudySessionsService (session joined, streak milestones) and
+  // TierRoomsCronService (promotions/demotions). Lives here rather than as
+  // a separate service because every caller already injects this gateway
+  // for broadcastPresenceUpdate/emitPromotion, so this avoids adding a new
+  // shared dependency (and the DI wiring risk that comes with it) for what
+  // is, same as room chat above, a small DB write + room broadcast.
+  async recordActivityFeedEvent(
+    roomTierId: string,
+    tierKey: string,
+    userId: string | null,
+    userName: string,
+    eventType: 'joined' | 'streak_milestone' | 'promoted' | 'demoted',
+    metadata: Record<string, any> = {},
+  ) {
+    try {
+      const [row] = await this.db.query(`
+        INSERT INTO room_activity_feed (room_tier_id, user_id, user_name, event_type, metadata)
+        VALUES ($1, $2, $3, $4, $5)
+        RETURNING id, created_at
+      `, [roomTierId, userId, userName, eventType, JSON.stringify(metadata)]);
+
+      // Keep each room's feed bounded — application-side trim (not a DB
+      // trigger; this codebase doesn't use those anywhere) right after
+      // insert. Cheap: only does real work once a room crosses 200 rows.
+      await this.db.query(`
+        DELETE FROM room_activity_feed
+        WHERE room_tier_id = $1 AND id NOT IN (
+          SELECT id FROM room_activity_feed WHERE room_tier_id = $1
+          ORDER BY created_at DESC LIMIT 200
+        )
+      `, [roomTierId]);
+
+      this.server.to(`tier:${tierKey}`).emit('room:activity', {
+        id: row.id, tierKey, userId, userName, eventType, metadata,
+        createdAt: row.created_at,
+      });
+    } catch (e: any) {
+      // Activity feed is supplementary — never let a feed write failure
+      // break the session/promotion flow that triggered it.
+      this.logger.error(`Activity feed write failed: ${e.message}`);
+    }
+  }
+
   // ── SERVER: broadcast presence (member count) ─────────────
   private async getActiveSessionCount(tierKey: string): Promise<number> {
     // Piggyback on an in-flight query for the same tier instead of firing
