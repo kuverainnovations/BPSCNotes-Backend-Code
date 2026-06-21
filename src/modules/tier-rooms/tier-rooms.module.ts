@@ -1199,112 +1199,125 @@ export class StudySessionsService {
       SET ended_at=NOW(), duration_minutes=$1, coins_earned=coins_earned+$2
       WHERE id=$3
     `, [durationMins, bonusCoins, sessionId]);
-    // ── Update streak + last_study_date ─────────────────────────
-    // Only count study days with at least 1 active minute to prevent
-    // AFK-only sessions from counting as a study day.
-    if (s.active_minutes >= 1) {
-      const todayUTC = new Date().toISOString().slice(0, 10);
-      const [lastStudy] = await this.db.query(
-        `SELECT last_study_date FROM users WHERE id=$1`, [userId]
-      );
-      const lastDate = lastStudy?.last_study_date
-        ? new Date(lastStudy.last_study_date).toISOString().slice(0, 10)
-        : null;
-      const yesterdayUTC = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
 
-      // Streak logic:
-      // - Same day as last study → keep current streak (no double-count)
-      // - Yesterday → increment streak
-      // - Anything else (gap) → reset to 1
-      let streakSql = '';
-      let isIncrement = false;
-      if (lastDate === todayUTC) {
-        // Already counted today — only update last_active_at
-        streakSql = `
-          UPDATE users SET last_active_at=NOW(), last_study_date=CURRENT_DATE WHERE id=$1
-        `;
-      } else if (lastDate === yesterdayUTC) {
-        // Consecutive day — increment streak
-        isIncrement = true;
-        streakSql = `
-          UPDATE users SET
-            last_active_at=NOW(),
-            last_study_date=CURRENT_DATE,
-            streak = streak + 1,
-            longest_streak = GREATEST(longest_streak, streak + 1)
-          WHERE id=$1
-          RETURNING streak
-        `;
+    // ── Everything below this point is secondary (streaks, anti-cheat
+    // flagging, room broadcasts, activity feed, activity log) — the
+    // session itself is ALREADY marked ended above. Wrapping it means a
+    // bug in any one of these can no longer turn a successful session-end
+    // into a misleading 500 for the client; it just gets logged instead.
+    try {
+      // ── Update streak + last_study_date ─────────────────────────
+      // Only count study days with at least 1 active minute to prevent
+      // AFK-only sessions from counting as a study day.
+      if (s.active_minutes >= 1) {
+        const todayUTC = new Date().toISOString().slice(0, 10);
+        const [lastStudy] = await this.db.query(
+          `SELECT last_study_date FROM users WHERE id=$1`, [userId]
+        );
+        const lastDate = lastStudy?.last_study_date
+          ? new Date(lastStudy.last_study_date).toISOString().slice(0, 10)
+          : null;
+        const yesterdayUTC = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
+
+        // Streak logic:
+        // - Same day as last study → keep current streak (no double-count)
+        // - Yesterday → increment streak
+        // - Anything else (gap) → reset to 1
+        let streakSql = '';
+        let isIncrement = false;
+        if (lastDate === todayUTC) {
+          // Already counted today — only update last_active_at
+          streakSql = `
+            UPDATE users SET last_active_at=NOW(), last_study_date=CURRENT_DATE WHERE id=$1
+          `;
+        } else if (lastDate === yesterdayUTC) {
+          // Consecutive day — increment streak
+          isIncrement = true;
+          streakSql = `
+            UPDATE users SET
+              last_active_at=NOW(),
+              last_study_date=CURRENT_DATE,
+              streak = streak + 1,
+              longest_streak = GREATEST(longest_streak, streak + 1)
+            WHERE id=$1
+            RETURNING streak
+          `;
+        } else {
+          // Gap or first session ever — reset to 1
+          streakSql = `
+            UPDATE users SET
+              last_active_at=NOW(),
+              last_study_date=CURRENT_DATE,
+              streak = 1,
+              longest_streak = GREATEST(longest_streak, 1)
+            WHERE id=$1
+          `;
+        }
+        const streakResult = await this.db.query(streakSql, [userId]);
+
+        // Room activity feed (spec section 9) — only on a genuine increment,
+        // and only at round milestones, so this doesn't fire every single
+        // day someone studies. Uses the room this session was actually held
+        // in (s.room_tier_key, fixed above), not the user's reward tier.
+        const STREAK_MILESTONES = [3, 7, 14, 30, 50, 100, 200, 365];
+        const newStreak = isIncrement ? streakResult[0]?.streak : null;
+        if (newStreak && STREAK_MILESTONES.includes(newStreak) && s.room_tier_key) {
+          const [userRow] = await this.db.query(`SELECT name FROM users WHERE id=$1`, [userId]);
+          this.gateway.recordActivityFeedEvent(
+            s.room_tier_id || s.tier_id, s.room_tier_key, userId, userRow?.name ?? 'Member',
+            'streak_milestone', { streakDays: newStreak },
+          ).catch(() => {});
+        }
       } else {
-        // Gap or first session ever — reset to 1
-        streakSql = `
-          UPDATE users SET
-            last_active_at=NOW(),
-            last_study_date=CURRENT_DATE,
-            streak = 1,
-            longest_streak = GREATEST(longest_streak, 1)
-          WHERE id=$1
-        `;
+        await this.db.query(`UPDATE users SET last_active_at=NOW() WHERE id=$1`, [userId]);
       }
-      const streakResult = await this.db.query(streakSql, [userId]);
 
-      // Room activity feed (spec section 9) — only on a genuine increment,
-      // and only at round milestones, so this doesn't fire every single
-      // day someone studies. Uses the room this session was actually held
-      // in (s.room_tier_key, fixed above), not the user's reward tier.
-      const STREAK_MILESTONES = [3, 7, 14, 30, 50, 100, 200, 365];
-      const newStreak = isIncrement ? streakResult[0]?.streak : null;
-      if (newStreak && STREAK_MILESTONES.includes(newStreak) && s.room_tier_key) {
+      await this.cache.del(`user_tier:${userId}`);
+      await this.cache.del(`user:${userId}`);       // invalidate getMe() cache
+      await this.cache.del(`profile:${userId}`);    // invalidate profile cache
+
+
+      // ── Anti-cheat: check session end ─────────────────────────────
+      const durationSecs = durationMins * 60;
+      await this.antiCheat.checkSessionEnd(userId, sessionId, durationSecs, s.active_minutes);
+      // ─────────────────────────────────────────────────────────────
+
+      this.logger.log(`Session ended: user=${userId} active=${s.active_minutes}min coins=${s.coins_earned}`);
+
+      // Broadcast member_left + presence update so lobby and room members list
+      // update immediately when a user ends their session
+      if (s.room_tier_key) {
+        this.gateway['broadcastPresenceUpdate'](s.room_tier_key);
+        this.gateway.server?.to(`tier:${s.room_tier_key}`).emit('room:member_left', {
+          tierKey: s.room_tier_key, userId,
+        });
+        // Room activity feed (redesign section 7) — a substantial session
+        // (matching the same 30-min bonus-coin threshold used elsewhere)
+        // is a more meaningful feed entry than a bare "left the room", so
+        // it gets its own richer event instead of firing both for the same
+        // moment.
         const [userRow] = await this.db.query(`SELECT name FROM users WHERE id=$1`, [userId]);
-        this.gateway.recordActivityFeedEvent(
-          s.room_tier_id || s.tier_id, s.room_tier_key, userId, userRow?.name ?? 'Member',
-          'streak_milestone', { streakDays: newStreak },
-        ).catch(() => {});
+        const userName = userRow?.name ?? 'Member';
+        if (s.active_minutes >= 30) {
+          this.gateway.recordActivityFeedEvent(
+            s.room_tier_id || s.tier_id, s.room_tier_key, userId, userName,
+            'session_completed', { activeMinutes: s.active_minutes },
+          ).catch(() => {});
+        } else {
+          this.gateway.recordActivityFeedEvent(
+            s.room_tier_id || s.tier_id, s.room_tier_key, userId, userName,
+            'left', {},
+          ).catch(() => {});
+        }
       }
-    } else {
-      await this.db.query(`UPDATE users SET last_active_at=NOW() WHERE id=$1`, [userId]);
+
+      await this.activityLog?.log(userId, ACTIONS.STUDY_SESSION_ENDED, `Study session ended - ${s.active_minutes} active mins`, { sessionId, activeMinutes: s.active_minutes, coins: s.coins_earned }).catch(()=>{});
+    } catch (err: any) {
+      // The session is already ended in the DB at this point — log and
+      // continue so the client still gets a successful response instead
+      // of a misleading 500 for a session that actually ended fine.
+      this.logger.error(`endSession: non-critical post-processing failed for session=${sessionId}: ${err?.message}`, err?.stack);
     }
-
-    await this.cache.del(`user_tier:${userId}`);
-    await this.cache.del(`user:${userId}`);       // invalidate getMe() cache
-    await this.cache.del(`profile:${userId}`);    // invalidate profile cache
-
-
-    // ── Anti-cheat: check session end ─────────────────────────────
-    const durationSecs = durationMins * 60;
-    await this.antiCheat.checkSessionEnd(userId, sessionId, durationSecs, s.active_minutes);
-    // ─────────────────────────────────────────────────────────────
-
-    this.logger.log(`Session ended: user=${userId} active=${s.active_minutes}min coins=${s.coins_earned}`);
-
-    // Broadcast member_left + presence update so lobby and room members list
-    // update immediately when a user ends their session
-    if (s.room_tier_key) {
-      this.gateway['broadcastPresenceUpdate'](s.room_tier_key);
-      this.gateway.server?.to(`tier:${s.room_tier_key}`).emit('room:member_left', {
-        tierKey: s.room_tier_key, userId,
-      });
-      // Room activity feed (redesign section 7) — a substantial session
-      // (matching the same 30-min bonus-coin threshold used elsewhere)
-      // is a more meaningful feed entry than a bare "left the room", so
-      // it gets its own richer event instead of firing both for the same
-      // moment.
-      const [userRow] = await this.db.query(`SELECT name FROM users WHERE id=$1`, [userId]);
-      const userName = userRow?.name ?? 'Member';
-      if (s.active_minutes >= 30) {
-        this.gateway.recordActivityFeedEvent(
-          s.room_tier_id || s.tier_id, s.room_tier_key, userId, userName,
-          'session_completed', { activeMinutes: s.active_minutes },
-        ).catch(() => {});
-      } else {
-        this.gateway.recordActivityFeedEvent(
-          s.room_tier_id || s.tier_id, s.room_tier_key, userId, userName,
-          'left', {},
-        ).catch(() => {});
-      }
-    }
-
-    await this.activityLog?.log(userId, ACTIONS.STUDY_SESSION_ENDED, `Study session ended - ${s.active_minutes} active mins`, { sessionId, activeMinutes: s.active_minutes, coins: s.coins_earned }).catch(()=>{});
 
     // Sum of active_minutes across all of today's sessions (including this
     // one, now that it's been credited above) — shown as "Today Total"
@@ -1377,6 +1390,7 @@ export class StudySessionsService {
     if (amount <= 0) return;
     await this.db.query(`UPDATE users SET xp=xp+$1 WHERE id=$2`, [amount, userId]);
     const user = await this.db.query(`SELECT xp, xp_level FROM users WHERE id=$1`, [userId]);
+    if (!user.length) return;
     const nextLevel = await this.db.query(
       `SELECT level, xp_required, coin_bonus FROM xp_levels WHERE level=$1 LIMIT 1`,
       [user[0].xp_level + 1]

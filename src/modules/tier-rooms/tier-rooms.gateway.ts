@@ -390,6 +390,11 @@ export class TierRoomsGateway
     this.getActiveSessionCount(tierKey).then(activeNow => {
       this.server.to(`tier:${tierKey}`).emit('tier:presence_update', { tierKey, activeNow });
       this.server.emit('tier:presence_update', { tierKey, activeNow });
+    }).catch(err => {
+      // Fire-and-forget by design (callers never await this), but an
+      // unhandled rejection here is still a real stability risk — log
+      // and swallow instead.
+      this.logger.warn(`broadcastPresenceUpdate(${tierKey}) failed: ${err?.message}`);
     });
   }
 
