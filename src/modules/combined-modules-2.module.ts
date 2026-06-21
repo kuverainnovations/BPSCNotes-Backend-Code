@@ -835,7 +835,7 @@ class UsersService {
         [userId]
       ),
       this.db.query(
-        `SELECT qa.score, qa.total_questions, qa.attempted_at, qa.is_passed, q.title, q.type, q.subject
+        `SELECT qa.score, qa.total_questions, qa.attempted_at, q.title, q.type, q.subject
          FROM quiz_attempts qa JOIN quizzes q ON qa.quiz_id=q.id
          WHERE qa.user_id=$1 ORDER BY qa.attempted_at DESC LIMIT 10`,
         [userId]

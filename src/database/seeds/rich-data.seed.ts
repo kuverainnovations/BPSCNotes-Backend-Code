@@ -195,28 +195,28 @@ async function seedRichData() {
 
   // ── Quizzes ────────────────────────────────────────────────
   const quizzes = [
-    ['Daily Quiz — Polity (Apr 22)',        'Polity',         'daily',  'medium', 10, 15, 60, 10, '{"BPSC 70th CCE"}',              '2026-04-22'],
-    ['Daily Quiz — History (Apr 22)',       'History',        'daily',  'medium', 10, 15, 60, 10, '{"BPSC 70th CCE"}',              '2026-04-22'],
-    ['Bihar GK Special Quiz',               'Bihar GK',       'topic',  'medium', 15, 20, 60, 15, '{"BPSC 70th CCE","Bihar Police SI"}', null],
-    ['Polity — Fundamental Rights',         'Polity',         'topic',  'easy',   10, 12, 55, 10, '{"BPSC 70th CCE","UPSC CSE"}',   null],
-    ['Modern History — Freedom Struggle',   'History',        'topic',  'hard',   20, 25, 65, 20, '{"BPSC 70th CCE","UPSC CSE"}',   null],
-    ['Economy — Budget & Banking',          'Economy',        'topic',  'medium', 15, 18, 60, 15, '{"BPSC 70th CCE","SSC CGL"}',    null],
-    ['Geography — Rivers & Mountains',      'Geography',      'topic',  'easy',   10, 12, 50, 10, '{"BPSC 70th CCE"}',              null],
-    ['Science & Technology 2026',           'Science & Tech', 'topic',  'medium', 15, 18, 60, 15, '{"BPSC 70th CCE","SSC CGL"}',    null],
-    ['BPSC 70th Full Mock Test — Paper 1',  'General Studies','mock',   'hard',   150,120, 70, 50, '{"BPSC 70th CCE"}',              null],
-    ['BPSC 70th Full Mock Test — Paper 2',  'General Studies','mock',   'hard',   150,120, 70, 50, '{"BPSC 70th CCE"}',              null],
-    ['Bihar Police SI Mock Test',           'General Studies','mock',   'medium', 100, 90, 65, 40, '{"Bihar Police SI"}',            null],
-    ['SSC CGL Tier 1 Mock Test',            'General Studies','mock',   'hard',   100, 60, 70, 40, '{"SSC CGL"}',                    null],
-    ['Railway NTPC Mock Test 2026',         'General Studies','mock',   'medium', 100, 90, 65, 40, '{"Railway NTPC"}',               null],
+    ['Daily Quiz — Polity (Apr 22)',        'Polity',         'daily',  'medium', 10, 15, 10, '{"BPSC 70th CCE"}',              '2026-04-22'],
+    ['Daily Quiz — History (Apr 22)',       'History',        'daily',  'medium', 10, 15, 10, '{"BPSC 70th CCE"}',              '2026-04-22'],
+    ['Bihar GK Special Quiz',               'Bihar GK',       'topic',  'medium', 15, 20, 15, '{"BPSC 70th CCE","Bihar Police SI"}', null],
+    ['Polity — Fundamental Rights',         'Polity',         'topic',  'easy',   10, 12, 10, '{"BPSC 70th CCE","UPSC CSE"}',   null],
+    ['Modern History — Freedom Struggle',   'History',        'topic',  'hard',   20, 25, 20, '{"BPSC 70th CCE","UPSC CSE"}',   null],
+    ['Economy — Budget & Banking',          'Economy',        'topic',  'medium', 15, 18, 15, '{"BPSC 70th CCE","SSC CGL"}',    null],
+    ['Geography — Rivers & Mountains',      'Geography',      'topic',  'easy',   10, 12, 10, '{"BPSC 70th CCE"}',              null],
+    ['Science & Technology 2026',           'Science & Tech', 'topic',  'medium', 15, 18, 15, '{"BPSC 70th CCE","SSC CGL"}',    null],
+    ['BPSC 70th Full Mock Test — Paper 1',  'General Studies','mock',   'hard',   150,120, 50, '{"BPSC 70th CCE"}',              null],
+    ['BPSC 70th Full Mock Test — Paper 2',  'General Studies','mock',   'hard',   150,120, 50, '{"BPSC 70th CCE"}',              null],
+    ['Bihar Police SI Mock Test',           'General Studies','mock',   'medium', 100, 90, 40, '{"Bihar Police SI"}',            null],
+    ['SSC CGL Tier 1 Mock Test',            'General Studies','mock',   'hard',   100, 60, 40, '{"SSC CGL"}',                    null],
+    ['Railway NTPC Mock Test 2026',         'General Studies','mock',   'medium', 100, 90, 40, '{"Railway NTPC"}',               null],
   ];
   const quizIds: string[] = [];
-  for (const [title, subject, type, difficulty, questions, duration, passing, coins, examTags, scheduled] of quizzes) {
+  for (const [title, subject, type, difficulty, questions, duration, coins, examTags, scheduled] of quizzes) {
     const attempts = Math.floor(100 + Math.random() * 5000);
     const avgScore = Math.floor(50 + Math.random() * 35);
     const res = await q(
-      `INSERT INTO quizzes (title, subject, type, difficulty, total_questions, duration_mins, passing_score, coins_reward, exam_tags, attempt_count, avg_score, status, scheduled_for, created_by)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9::text[],$10,$11,'published',$12,$13) RETURNING id`,
-      [title, subject, type, difficulty, questions, duration, passing, coins, examTags, attempts, avgScore, scheduled, adminId]
+      `INSERT INTO quizzes (title, subject, type, difficulty, total_questions, duration_mins, coins_reward, exam_tags, attempt_count, avg_score, status, scheduled_for, created_by)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8::text[],$9,$10,'published',$11,$12) RETURNING id`,
+      [title, subject, type, difficulty, questions, duration, coins, examTags, attempts, avgScore, scheduled, adminId]
     );
     quizIds.push(res[0].id);
   }
@@ -449,9 +449,9 @@ async function seedRichData() {
         const total   = 10;
         const score   = Math.round((correct / total) * 100);
         await q(
-          `INSERT INTO quiz_attempts (user_id, quiz_id, score, total_questions, correct_answers, time_taken_secs, coins_earned, is_passed, answers)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,'[]'::jsonb)`,
-          [userIds[i], quizIds[(i + j) % quizIds.length], score, total, correct, Math.floor(300 + Math.random() * 600), score >= 60 ? 10 : 0, score >= 60]
+          `INSERT INTO quiz_attempts (user_id, quiz_id, score, total_questions, correct_answers, time_taken_secs, coins_earned, answers)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,'[]'::jsonb)`,
+          [userIds[i], quizIds[(i + j) % quizIds.length], score, total, correct, Math.floor(300 + Math.random() * 600), j === 0 ? 10 : 0]
         );
       }
     }

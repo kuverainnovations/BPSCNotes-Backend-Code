@@ -58,7 +58,7 @@ class QuizzesService {
       this.db.query(
         `SELECT
            q.id, q.title, q.description, q.subject, q.type,
-           q.total_questions, q.duration_mins, q.passing_score, q.coins_reward,
+           q.total_questions, q.duration_mins, q.coins_reward,
            q.exam_tags, q.scheduled_for, q.attempt_count, q.avg_score, q.status,
            -- is_attempted: true/false boolean (not a JSON object)
            (SELECT TRUE FROM quiz_attempts qa WHERE qa.user_id=$${params.length + 1} AND qa.quiz_id=q.id LIMIT 1) AS is_attempted,
@@ -98,7 +98,7 @@ class QuizzesService {
 
     const quiz = await this.db.query(
       `SELECT id, title, description, subject, type,
-              total_questions, duration_mins, passing_score, coins_reward,
+              total_questions, duration_mins, coins_reward,
               exam_tags, scheduled_for, attempt_count, avg_score, status
        FROM quizzes WHERE id=$1 AND status='published'`,
       [quizId]
@@ -185,7 +185,6 @@ if (q.scheduled_for) {
     const q = quiz[0];
     // Postgres raw queries return numeric columns as strings — parse to avoid NaN
     const durationMins = parseInt(q.duration_mins, 10) || 15;
-    const passingScore = parseInt(q.passing_score, 10) || 60;
     const coinsReward  = parseInt(q.coins_reward,  10) || 0;
     // Prevents direct API submit without loading questions first
     const startedAttempt = await this.db.query(
@@ -264,14 +263,23 @@ if (q.scheduled_for) {
     const total    = questions.length;
     const score    = total > 0 ? Math.round((correct / total) * 100) : 0;
     const accuracy = score;
-    const isPassed = score >= passingScore;
+
+    // Anti-farming: coins are only awarded on the user's FIRST completed
+    // attempt for this quiz. "Completed" = total_questions > 0, which only
+    // ever gets set on a submit insert — distinguishes it from the bare
+    // start-stub row inserted by startQuiz() above.
+    const priorCompleted = await this.db.query(
+      `SELECT id FROM quiz_attempts WHERE user_id=$1 AND quiz_id=$2 AND total_questions > 0 LIMIT 1`,
+      [userId, quizId]
+    );
+    const isFirstAttempt = priorCompleted.length === 0;
 
     const attempt = await this.db.query(
       `INSERT INTO quiz_attempts
-         (user_id, quiz_id, score, total_questions, correct_answers, time_taken_secs, coins_earned, answers, is_passed, submitted_at)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW())
+         (user_id, quiz_id, score, total_questions, correct_answers, time_taken_secs, coins_earned, answers, submitted_at)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW())
        RETURNING id, attempted_at`,
-      [userId, quizId, score, total, correct, timeTakenSecs, isPassed ? coinsReward : 0, JSON.stringify(allAnswers), isPassed]
+      [userId, quizId, score, total, correct, timeTakenSecs, isFirstAttempt ? coinsReward : 0, JSON.stringify(allAnswers)]
     );
 
     // Update quiz stats
@@ -285,19 +293,11 @@ if (q.scheduled_for) {
     );
 
     // Update user stats
-    // quizzes_attempted counts unique quizzes solved (passed), not total attempts
+    // quizzes_attempted counts unique quizzes completed, not total attempts
     // accuracy updates on every attempt so it reflects real performance
-    const alreadyPassed = isPassed ? await this.db.query(
-      `SELECT id FROM quiz_attempts
-       WHERE user_id=$1 AND quiz_id=$2 AND is_passed=true AND id != $3
-       LIMIT 1`,
-      [userId, quizId, attempt[0].id]
-    ) : [];
-    const isFirstPass = isPassed && alreadyPassed.length === 0;
-
     await this.db.query(
       `UPDATE users SET
-         quizzes_attempted    = quizzes_attempted + ${isFirstPass ? 1 : 0},
+         quizzes_attempted    = quizzes_attempted + ${isFirstAttempt ? 1 : 0},
          accuracy             = ROUND(((accuracy * quizzes_attempted) + $1) / (quizzes_attempted + 1), 1),
          total_study_minutes  = total_study_minutes + $2,
          last_active_at       = NOW()
@@ -315,9 +315,9 @@ if (q.scheduled_for) {
     // values until that cache happened to expire on its own.
     await this.cache.del(`user_tier:${userId}`);
 
-    // ANTI-CHEAT: Only award coins on the FIRST passing attempt for this quiz
+    // ANTI-CHEAT: Only award coins on the FIRST completed attempt for this quiz
     let coinsEarned = 0;
-    if (isFirstPass) {
+    if (isFirstAttempt) {
         const quizType = q.type || 'daily';
         const coinAction = quizType === 'mock'  ? 'mock_quiz'
                          : quizType === 'topic' ? 'topic_quiz'
@@ -366,11 +366,11 @@ const rank = higherScores + 1;
 const percentile = Number(
   (((totalAttempts - rank) / totalAttempts) * 100).toFixed(2)
 );
-// 🔔 First-time pass notification
-    if (isFirstPass && coinsEarned > 0) {
+// 🔔 First-time completion notification
+    if (isFirstAttempt && coinsEarned > 0) {
       this.notifService.pushToUser(
         userId,
-        '🎉 Quiz Passed!',
+        '🎉 Quiz Completed!',
         `You scored ${score}% on "${q.title}" · 🪙 +${coinsEarned} coins!`,
         { type: 'quiz_result', quizId, screen: 'quiz_list' }
       ).catch(() => {});
@@ -393,7 +393,6 @@ return successResponse({
   total,
   wrong: total - correct,
   accuracy,
-  isPassed,
   coinsEarned,
   timeTakenSecs,
 
@@ -436,14 +435,14 @@ return successResponse({
     const result = await this.db.query(
       `INSERT INTO quizzes
          (title, description, subject, type, total_questions,
-          duration_mins, passing_score, coins_reward, exam_tags, scheduled_for, status, created_by)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+          duration_mins, coins_reward, exam_tags, scheduled_for, status, created_by)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
        RETURNING *`,
       [
         data.title, data.description || null, data.subject,
         data.type || 'daily',
         0,  // total_questions set after questions are added
-        data.durationMins || 15, data.passingScore || 60,
+        data.durationMins || 15,
         data.coinsReward || 10, data.examTags || [],
         data.scheduledFor || null,
         data.status || 'draft',
@@ -513,11 +512,11 @@ return successResponse({
       } else {
         // Create new quiz
         const [created] = await this.db.query(
-          `INSERT INTO quizzes (title, description, subject, type, total_questions, duration_mins, passing_score, coins_reward, status, created_by)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,
+          `INSERT INTO quizzes (title, description, subject, type, total_questions, duration_mins, coins_reward, status, created_by)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
           [quizMeta.title.trim(), quizMeta.description?.trim() || null, quizMeta.subject.trim(),
            quizMeta.type || 'topic', normalised.length, quizMeta.durationMins || 15,
-           quizMeta.passingScore || 60, quizMeta.coinsReward || 10,
+           quizMeta.coinsReward || 10,
            quizMeta.status || 'published', adminId]
         );
         quiz = created;
@@ -587,7 +586,7 @@ return successResponse({
     const map: any = {
       title: 'title', description: 'description', subject: 'subject',
       type: 'type', durationMins: 'duration_mins',
-      passingScore: 'passing_score', coinsReward: 'coins_reward',
+      coinsReward: 'coins_reward',
       status: 'status', scheduledFor: 'scheduled_for', examTags: 'exam_tags',
     };
     for (const [key, col] of Object.entries(map)) {
