@@ -1037,8 +1037,9 @@ export class TierRoomsCronService {
     // fetching all of it avoids needing an array-typed query parameter,
     // which isn't a pattern used elsewhere in this codebase.
     const tiers = await this.db.query(`SELECT id, tier_key FROM room_tiers`);
-    const tierKeyById = new Map(tiers.map((t: any) => [t.id, t.tier_key]));
-
+    const tierKeyById = new Map<any, string>(
+      tiers.map((t: any) => [t.id, String(t.tier_key)])
+    );
     for (const row of result) {
       const tierKey = tierKeyById.get(row.room_tier_id);
       if (!tierKey) continue;
