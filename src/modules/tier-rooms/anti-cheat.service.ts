@@ -34,12 +34,6 @@ export interface AntiCheatCheckResult {
 
 @Injectable()
 export class AntiCheatService {
-  clearActiveSession(userId: string) {
-    throw new Error('Method not implemented.');
-  }
-  flagForReview(userId: string, arg1: string, arg2: Record<string, any>) {
-    throw new Error('Method not implemented.');
-  }
   private readonly logger = new Logger(AntiCheatService.name);
 
   // Thresholds (admin can override via env or DB config in future)
@@ -184,6 +178,30 @@ export class AntiCheatService {
       `DELETE FROM user_flags WHERE user_id=$1`, [userId]
     );
     this.logger.log(`Flags cleared for user=${userId}`);
+  }
+
+  // ── Clear the cached "active session" marker for a user ──
+  // Called when a session is forcibly ended by anti-cheat (BLOCK), so the
+  // user isn't incorrectly treated as having a stale concurrent session
+  // the next time they legitimately try to start one.
+  //
+  // FIX: this was a stub that threw "Method not implemented." — every
+  // anti-cheat BLOCK on heartbeat (e.g. coin velocity abuse) crashed with
+  // an unhandled 500 instead of the intended graceful BadRequestException,
+  // and the session's cached presence marker was never actually cleared.
+  async clearActiveSession(userId: string): Promise<void> {
+    await this.cache.del(`session:active:${userId}`);
+  }
+
+  // ── Flag a user for admin review, with full context ───────
+  // Public counterpart to the internal flagUser() rate-limited helper —
+  // called directly by callers (e.g. heartbeat BLOCK handling) that already
+  // have a reason + details object, rather than building the message string
+  // themselves. Delegates to flagUser so flags share the same dedup/rate-limit.
+  //
+  // FIX: was a stub that threw "Method not implemented."
+  async flagForReview(userId: string, reason: string, details: Record<string, any>): Promise<void> {
+    await this.flagUser(userId, reason, JSON.stringify(details));
   }
 
   // ── Internal flag helper ──────────────────────────────────

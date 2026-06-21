@@ -92,6 +92,24 @@ export class TierNotificationsService {
     this.logger.log(`Promotion push sent: user=${userId} tier=${newTierKey}`);
   }
 
+  // ── Demotion notification (called by cron immediately) ────
+  // FIX: TierRoomsGateway.emitDemotion() existed and was already wired up
+  // for the WS push, but nothing ever called it — TierRoomsCronService's
+  // demoteUser() updated the DB and stopped, so a demoted user got no
+  // signal at all (no WS event, no push) until they happened to notice
+  // their room changed. Mirrors notifyPromotion below; the daily "at risk"
+  // warning (sendDemotionWarnings) is a separate, earlier heads-up — this
+  // is the immediate notice for when the demotion has actually happened.
+  async notifyDemotion(userId: string, newTierKey: string, newTierName: string, newTierEmoji: string) {
+    await this.pushToUser(
+      userId,
+      `${newTierEmoji} Moved to ${newTierName}`,
+      `Your activity dropped below the requirement, so you've moved to ${newTierName}. Keep studying to earn your way back!`,
+      { type: 'tier_demotion', tierKey: newTierKey, screen: 'rooms_hub' }
+    );
+    this.logger.log(`Demotion push sent: user=${userId} newTier=${newTierName}`);
+  }
+
   // ── Cron: Daily 08:00 — "At Risk" demotion warnings ───────
   // Users whose next_tier_progress < demotion_threshold for the tier
   // but haven't been warned in the last 24 hours.

@@ -24,15 +24,38 @@ import { Inject }               from '@nestjs/common';
 //     tier:promotion        — user was promoted (targeted to that user)
 //     tier:demotion         — user was demoted (targeted to that user)
 //     room:leaderboard_tick — top-3 leaderboard update every 30 min
-//     session:afk_warning   — server detected AFK during heartbeat
 //
 //   EVENTS RECEIVED FROM CLIENT:
-//     session:heartbeat     — client heartbeat (replaces REST heartbeat)
 //     tier:join_room        — user joined a tier room view
 //     tier:leave_room       — user left a tier room view
 //
 // Auth: JWT token sent in handshake.auth.token
-// Redis: used for presence tracking (SADD/SCARD on join/leave)
+//
+// Presence: "active now" counts come from study_sessions in Postgres
+// (shared across instances), not in-process memory — see
+// getActiveSessionCount(). Concurrent calls for the same tier within the
+// same DB round-trip share one in-flight query instead of each firing
+// their own, which is what actually matters for scale here (the count
+// itself is always correct and fresh — there's no cached/stale value to
+// reason about, just deduplicated concurrent reads).
+//
+// userSockets/socketUsers/socketTier below ARE in-process and assume a
+// single backend instance — fine for the current single-VPS deployment.
+// If this ever runs multiple instances behind a load balancer, targeted
+// per-user delivery (emitPromotion/emitDemotion, the single-socket-per-
+// user enforcement in handleConnection) needs either sticky sessions at
+// the load balancer or the Socket.IO Redis adapter; the presence COUNT
+// itself would keep working correctly either way since it's DB-backed.
+//
+// REST is the only heartbeat path (StudySessionsService.heartbeat, via
+// POST /rooms/sessions/heartbeat) — there used to be a parallel WS
+// session:heartbeat handler here too, but the app never actually called
+// it (TierRoomsSocketManager.sendHeartbeat() on Android was dead code),
+// and it had drifted out of sync with the real anti-cheat logic — it
+// never called AntiCheatService at all, so if anything had ever started
+// using it, it would have silently skipped every anti-cheat check.
+// Removed rather than fixed in place, since a second, divergent
+// heartbeat implementation living dormant is itself a future bug.
 // ════════════════════════════════════════════════════════════
 
 @WebSocketGateway({
@@ -51,12 +74,16 @@ export class TierRoomsGateway
 
   private readonly logger = new Logger(TierRoomsGateway.name);
 
-  // In-memory presence: tierKey -> Set<userId>
-  // For production scale, move to Redis SADD/SCARD
-  private readonly presence = new Map<string, Set<string>>();
-
   // userId -> socketId (one active WS connection per user)
   private readonly userSockets = new Map<string, string>();
+
+  // tierKey -> in-flight active-session-count query, so a burst of joins/
+  // leaves/disconnects for the same room within one DB round-trip share a
+  // single query instead of each firing its own. Cleared as soon as that
+  // query resolves, so the next call always gets a fresh read — this is
+  // request deduplication, not caching, so there's no staleness to reason
+  // about. See getActiveSessionCount().
+  private readonly inFlightCounts = new Map<string, Promise<number>>();
 
   // socketId -> userId (reverse lookup on disconnect)
   private readonly socketUsers = new Map<string, string>();
@@ -102,8 +129,10 @@ export class TierRoomsGateway
 
       this.logger.log(`WS connected: user=${payload.userId} socket=${client.id}`);
 
-      // Send current presence snapshot to new connection
-      const snapshot = this.buildPresenceSnapshot();
+      // Send current presence snapshot to new connection — same DB-backed
+      // active-session count as the tier:presence_update events that
+      // follow, so the number doesn't jump right after connecting.
+      const snapshot = await this.buildPresenceSnapshot();
       client.emit('presence:snapshot', snapshot);
 
     } catch (err: any) {
@@ -123,12 +152,8 @@ export class TierRoomsGateway
       this.socketUsers.delete(client.id);
 
       if (tierKey) {
-        this.presence.get(tierKey)?.delete(userId);
         this.socketTier.delete(client.id);
-        // Use async count from DB so disconnect shows accurate active session count
-        this.getActiveSessionCount(tierKey).then(count => {
-          this.broadcastPresenceUpdate(tierKey);
-        });
+        this.broadcastPresenceUpdate(tierKey);
       }
     }
     this.logger.log(`WS disconnected: socket=${client.id}`);
@@ -148,7 +173,6 @@ export class TierRoomsGateway
     // Leave previous tier room if any
     const prevTier = this.socketTier.get(client.id);
     if (prevTier && prevTier !== tierKey) {
-      this.presence.get(prevTier)?.delete(userId);
       client.leave(`tier:${prevTier}`);
       this.broadcastPresenceUpdate(prevTier);
     }
@@ -156,9 +180,6 @@ export class TierRoomsGateway
     // Join new tier room socket.io room
     client.join(`tier:${tierKey}`);
     this.socketTier.set(client.id, tierKey);
-
-    if (!this.presence.has(tierKey)) this.presence.set(tierKey, new Set());
-    this.presence.get(tierKey)!.add(userId);
 
     // FIX: Presence count = active study SESSIONS, not socket connections.
     // A user viewing the lobby gets added to socketTier (for chat routing)
@@ -178,7 +199,6 @@ export class TierRoomsGateway
     const tierKey = this.socketTier.get(client.id);
     if (!userId || !tierKey) return;
 
-    this.presence.get(tierKey)?.delete(userId);
     client.leave(`tier:${tierKey}`);
     this.socketTier.delete(client.id);
     this.broadcastPresenceUpdate(tierKey);
@@ -246,105 +266,6 @@ export class TierRoomsGateway
     `, [tierKey, limit]);
   }
 
-  // ── CLIENT: WebSocket heartbeat ───────────────────────────
-  // Replaces REST POST /rooms/sessions/heartbeat for WS-connected clients.
-  // Falls back to REST for clients that don't have WS (e.g. background app).
-  @SubscribeMessage('session:heartbeat')
-  async handleHeartbeat(
-    @ConnectedSocket() client: Socket,
-    @MessageBody() data: { sessionId: string },
-  ) {
-    const userId = (client as any).userId as string;
-    if (!userId || !data?.sessionId) {
-      throw new WsException('userId and sessionId required');
-    }
-
-    const sessions = await this.db.query(`
-      SELECT ss.id, ss.tier_id, ss.active_minutes, ss.coins_earned,
-             ss.xp_earned, ss.afk_count, ss.last_heartbeat,
-             t.coin_multiplier, t.xp_multiplier
-      FROM study_sessions ss
-      LEFT JOIN room_tiers t ON t.id = ss.tier_id
-      WHERE ss.id=$1 AND ss.user_id=$2 AND ss.ended_at IS NULL
-    `, [data.sessionId, userId]);
-
-    if (!sessions.length) {
-      throw new WsException('Session not found or already ended');
-    }
-
-    const s      = sessions[0];
-    const gapSec = (Date.now() - new Date(s.last_heartbeat).getTime()) / 1000;
-    const isAfk  = gapSec > 420;   // 7 min threshold
-
-    let coinsThisBeat = 0, xpThisBeat = 0, activeMins = 0;
-
-    if (!isAfk) {
-      activeMins    = Math.min(gapSec / 60, 5);
-      const coinMul = parseFloat(s.coin_multiplier || '1');
-      const xpMul   = parseFloat(s.xp_multiplier   || '1');
-      coinsThisBeat = Math.floor((activeMins / 60) * 6 * coinMul);
-      xpThisBeat    = Math.floor(activeMins * 1 * xpMul);
-
-      if (coinsThisBeat > 0) {
-        // Check daily cap
-        const capped = await this.checkDailyCap(userId);
-        if (!capped) {
-          await this.db.query(
-            `UPDATE users SET coins=coins+$1, total_coins_earned=total_coins_earned+$1 WHERE id=$2`,
-            [coinsThisBeat, userId]
-          );
-          const bal = await this.db.query(`SELECT coins FROM users WHERE id=$1`, [userId]);
-          await this.db.query(
-            `INSERT INTO coin_transactions (user_id,type,amount,description,action,ref_id,balance)
-             VALUES ($1,'earned',$2,'Study time (WS)','study_time',$3,$4)`,
-            [userId, coinsThisBeat, data.sessionId, bal[0].coins]
-          );
-        } else {
-          coinsThisBeat = 0;
-        }
-      }
-
-      if (xpThisBeat > 0) {
-        await this.db.query(`UPDATE users SET xp=xp+$1 WHERE id=$2`, [xpThisBeat, userId]);
-      }
-
-      const roundMins = Math.round(activeMins);
-      await this.db.query(`
-        UPDATE study_sessions
-        SET active_minutes=active_minutes+$1, coins_earned=coins_earned+$2,
-            xp_earned=xp_earned+$3, last_heartbeat=NOW()
-        WHERE id=$4
-      `, [roundMins, coinsThisBeat, xpThisBeat, data.sessionId]);
-
-      if (roundMins > 0) {
-        await this.db.query(
-          `UPDATE users SET total_study_minutes=total_study_minutes+$1 WHERE id=$2`,
-          [roundMins, userId]
-        );
-      }
-      await this.cache.del(`user_tier:${userId}`);
-    } else {
-      await this.db.query(
-        `UPDATE study_sessions SET afk_count=afk_count+1, last_heartbeat=NOW() WHERE id=$1`,
-        [data.sessionId]
-      );
-      // Emit AFK warning directly to this socket (private)
-      client.emit('session:afk_warning', { sessionId: data.sessionId, gapSeconds: Math.round(gapSec) });
-    }
-
-    // Return result to this socket
-    return {
-      event:              'session:heartbeat_ack',
-      isAfk,
-      activeMinsThisBeat: Math.round(activeMins),
-      coinsEarnedThisBeat: coinsThisBeat,
-      xpEarnedThisBeat:    xpThisBeat,
-      totalCoinsThisSession: s.coins_earned + coinsThisBeat,
-      totalXpThisSession:    s.xp_earned    + xpThisBeat,
-      totalActiveMinutes:    s.active_minutes + Math.round(activeMins),
-    };
-  }
-
   // ── SERVER: emit promotion event to a specific user ───────
   // Called by TierRoomsCronService after promoteUser()
   emitPromotion(userId: string, tierKey: string, tierName: string, tierEmoji: string) {
@@ -381,17 +302,40 @@ export class TierRoomsGateway
 
   // ── SERVER: broadcast presence (member count) ─────────────
   private async getActiveSessionCount(tierKey: string): Promise<number> {
+    // Piggyback on an in-flight query for the same tier instead of firing
+    // a duplicate — a burst of joins/leaves/disconnects in the same room
+    // (e.g. a network blip dropping many users at once) would otherwise
+    // fire one identical COUNT query per affected socket.
+    const existing = this.inFlightCounts.get(tierKey);
+    if (existing) return existing;
+
+    const promise = (async () => {
+      try {
+        // FIX: was joining through user_room_tier.current_tier_id — a user's
+        // permanent/home tier, NOT the room they're actually sitting in. A
+        // session can be in a different room than the user's home tier (the
+        // app explicitly supports studying in a lower, already-unlocked
+        // room — see StudySessionsService.startSession's room_tier_id), so
+        // this undercounted the room actually being visited and overcounted
+        // the user's home room. Count by the session's own room directly,
+        // same pattern getTierMembers() already uses correctly.
+        const [row] = await this.db.query(
+          `SELECT COUNT(DISTINCT ss.user_id)::int AS active
+           FROM study_sessions ss
+           WHERE COALESCE(ss.room_tier_id, ss.tier_id) = (SELECT id FROM room_tiers WHERE tier_key = $1)
+             AND ss.ended_at IS NULL`,
+          [tierKey]
+        );
+        return row?.active ?? 0;
+      } catch { return 0; }
+    })();
+
+    this.inFlightCounts.set(tierKey, promise);
     try {
-      const [row] = await this.db.query(
-        `SELECT COUNT(DISTINCT ss.user_id)::int AS active
-         FROM study_sessions ss
-         JOIN user_room_tier urt ON urt.user_id = ss.user_id
-         JOIN room_tiers rt ON rt.id = urt.current_tier_id
-         WHERE rt.tier_key = $1 AND ss.ended_at IS NULL`,
-        [tierKey]
-      );
-      return row?.active ?? 0;
-    } catch { return 0; }
+      return await promise;
+    } finally {
+      this.inFlightCounts.delete(tierKey);
+    }
   }
 
   broadcastPresenceUpdate(tierKey: string) {  // public — called from StudySessionsService
@@ -404,23 +348,21 @@ export class TierRoomsGateway
     });
   }
 
-  private buildPresenceSnapshot(): Record<string, number> {
+  // FIX: was built from the in-memory socket-presence Map — a different,
+  // less accurate concept ("sockets currently viewing this tier") than the
+  // DB-backed active-session count that every subsequent tier:presence_update
+  // actually uses. A freshly-connected client would see one number here and
+  // then have it jump as soon as any presence_update arrived. Now both use
+  // the same source of truth. room_tiers is a tiny table — fine to compute
+  // every active tier's count on every connect.
+  private async buildPresenceSnapshot(): Promise<Record<string, number>> {
+    const tiers = await this.db.query(`SELECT tier_key FROM room_tiers WHERE is_active = TRUE`);
+    const counts = await Promise.all(
+      tiers.map((t: any) => this.getActiveSessionCount(t.tier_key))
+    );
     const snapshot: Record<string, number> = {};
-    this.presence.forEach((users, tierKey) => { snapshot[tierKey] = users.size; });
+    tiers.forEach((t: any, i: number) => { snapshot[t.tier_key] = counts[i]; });
     return snapshot;
-  }
-
-  private async checkDailyCap(userId: string): Promise<boolean> {
-    const rule = await this.db.query(
-      `SELECT max_per_day FROM coin_rules WHERE action='study_time' AND is_active=TRUE LIMIT 1`
-    );
-    if (!rule.length) return false;
-    const today = await this.db.query(
-      `SELECT COALESCE(SUM(amount),0)::int AS total FROM coin_transactions
-       WHERE user_id=$1 AND action='study_time' AND created_at::date=CURRENT_DATE`,
-      [userId]
-    );
-    return +today[0].total >= +rule[0].max_per_day;
   }
 
   private extractToken(client: Socket): string | null {
@@ -429,13 +371,6 @@ export class TierRoomsGateway
       client.handshake.headers?.authorization?.replace('Bearer ', '') ||
       null
     );
-  }
-
-  // ── Cron: every 30 min during study hours — leaderboard tick
-  // Called by TierRoomsCronService, NOT a @Cron here
-  // (cron lives in the service, gateway just handles emit)
-  async getOnlineCount(tierKey: string): Promise<number> {
-    return this.presence.get(tierKey)?.size ?? 0;
   }
 
   isUserOnline(userId: string): boolean {

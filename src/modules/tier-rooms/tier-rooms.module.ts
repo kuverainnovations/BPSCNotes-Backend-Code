@@ -293,18 +293,19 @@ export class TierRoomsService {
 
     // Build date range for the period
     const now = new Date();
-    let dateFilter = '';
+    let dateFilterFor = (alias: string) => '';
     const params: any[] = [tier[0].id];
     if (period === 'weekly') {
       const weekAgo = new Date(now.getTime() - 7 * 86400000);
       params.push(weekAgo.toISOString());
-      dateFilter = `AND ss.started_at >= $2`;
+      dateFilterFor = (alias: string) => `AND ${alias}.started_at >= $2`;
     } else if (period === 'monthly') {
       const monthStart = new Date(now.getFullYear(), now.getMonth(), 1);
       params.push(monthStart.toISOString());
-      dateFilter = `AND ss.started_at >= $2`;
+      dateFilterFor = (alias: string) => `AND ${alias}.started_at >= $2`;
     }
     // alltime: no date filter
+    const dateFilter = dateFilterFor('ss');
 
     const live = await this.db.query(`
       SELECT
@@ -317,11 +318,31 @@ export class TierRoomsService {
         u.id   AS user_id,
         u.name AS user_name,
         COALESCE(u.xp_level, 1)                  AS xp_level
-      FROM user_room_tier urt
-      JOIN users u ON u.id = urt.user_id
+      FROM users u
+      -- FIX: was joining study_sessions on user_id alone and gating the
+      -- whole roster by user_room_tier.current_tier_id (the user's
+      -- permanent/home tier). That attributed 100% of a user's study time
+      -- to whichever tier is their CURRENT home tier, regardless of which
+      -- room a given session actually happened in — so e.g. a user
+      -- promoted mid-week loses their old room's leaderboard credit for
+      -- time genuinely studied there, and a user visiting a different
+      -- room never shows up on that room's board. Sum only sessions whose
+      -- own room matches this tier (COALESCE(room_tier_id, tier_id), same
+      -- as getTierMembers' is_studying_now), and roster = home-tier
+      -- members UNION anyone who actually has a session here this period.
       LEFT JOIN study_sessions ss
-        ON ss.user_id = urt.user_id AND ss.ended_at IS NOT NULL ${dateFilter}
-      WHERE urt.current_tier_id = $1 AND u.status = 'active'
+        ON ss.user_id = u.id
+        AND COALESCE(ss.room_tier_id, ss.tier_id) = $1
+        AND ss.ended_at IS NOT NULL ${dateFilter}
+      WHERE u.status = 'active' AND (
+        EXISTS (SELECT 1 FROM user_room_tier urt WHERE urt.user_id = u.id AND urt.current_tier_id = $1)
+        OR EXISTS (
+          SELECT 1 FROM study_sessions ss2
+          WHERE ss2.user_id = u.id
+            AND COALESCE(ss2.room_tier_id, ss2.tier_id) = $1
+            AND ss2.ended_at IS NOT NULL ${dateFilterFor('ss2')}
+        )
+      )
       GROUP BY u.id, u.name, u.streak, u.xp_level
       ORDER BY study_minutes DESC, coins_earned DESC
       LIMIT 100
@@ -668,6 +689,11 @@ export class StudySessionsService {
     const gapSecs = (Date.now() - new Date(s.last_heartbeat).getTime()) / 1000;
 
     // ── Anti-cheat: heartbeat checks ───────────────────────
+    // FIX: this used to call antiCheat.checkHeartbeat() a second time with
+    // identical args right after this block — same DB/cache queries run
+    // twice per heartbeat for no reason, and the second block's BLOCK
+    // branch could never execute since this one already throws/returns
+    // first. One check, used for both BLOCK and WARN below.
     const hbCheck = await this.antiCheat.checkHeartbeat(userId, sessionId, gapSecs, s);
     if (hbCheck.result === 'BLOCK') {
       // Revoke session — don't award any more coins
@@ -677,19 +703,6 @@ export class StudySessionsService {
       throw new BadRequestException(hbCheck.reason || 'Session terminated by anti-cheat');
     }
     const antiCheatWarn = hbCheck.result === 'WARN';
-
-    // ── Anti-cheat: check heartbeat + coin velocity ──────────────
-    const acHb = await this.antiCheat.checkHeartbeat(userId, sessionId, gapSecs, s);
-    if (acHb.result === 'BLOCK') {
-      this.logger.warn(`Heartbeat BLOCKED for user=${userId}: ${acHb.reason}`);
-      return successResponse({ isAfk: true, activeMinsThisBeat: 0,
-        coinsEarnedThisBeat: 0, xpEarnedThisBeat: 0,
-        totalCoinsThisSession: s.coins_earned, totalXpThisSession: s.xp_earned,
-        totalActiveMinutes: s.active_minutes,
-        message: 'Unusual activity detected. Coins not awarded.',
-      });
-    }
-    // ─────────────────────────────────────────────────────────────
 
     if (gapSecs > this.AFK_THRESHOLD_S) {
       await this.db.query(
@@ -711,8 +724,14 @@ export class StudySessionsService {
     let coinsThisBeat    = Math.floor((activeMins / 60) * this.BASE_COINS_PER_HOUR * coinMultiplier);
     let xpThisBeat       = Math.floor(activeMins * this.BASE_XP_PER_MINUTE * xpMultiplier);
 
-    // Anti-cheat WARN reduces coins to 50% for this beat
-
+    // FIX: this reduction was documented in a comment but never actually
+    // applied — antiCheatWarn was computed above and then never read again,
+    // so a WARN-tier suspicious heartbeat (e.g. heartbeat_velocity, afk_ratio)
+    // was silently rewarded in full, same as a clean one.
+    if (antiCheatWarn) {
+      coinsThisBeat = Math.floor(coinsThisBeat * 0.5);
+      xpThisBeat    = Math.floor(xpThisBeat * 0.5);
+    }
 
     if (coinsThisBeat > 0) {
       const capped = await this.checkDailyCap(userId, 'study_time');
@@ -746,7 +765,9 @@ export class StudySessionsService {
       totalCoinsThisSession: s.coins_earned + coinsThisBeat,
       totalXpThisSession: s.xp_earned + xpThisBeat,
       totalActiveMinutes: s.active_minutes + roundMins,
-      message: `Active! +${coinsThisBeat} coins, +${xpThisBeat} XP`,
+      message: antiCheatWarn
+        ? `Unusual activity detected — rewards reduced. +${coinsThisBeat} coins, +${xpThisBeat} XP`
+        : `Active! +${coinsThisBeat} coins, +${xpThisBeat} XP`,
     });
   }
 
@@ -994,14 +1015,38 @@ export class TierRoomsCronService {
 
   @Cron('*/5 * * * *')
   async closeExpiredSessions() {
+    // FIX: this used to just UPDATE the rows and stop — connected clients
+    // watching that room's live status (section 3/13: "Status should
+    // update instantly through WebSocket events", "avoid... users
+    // remaining online after leaving room") never found out a member went
+    // stale until their own next manual refresh or poll. Capture which
+    // room + user each closed session belonged to and broadcast it.
     const result = await this.db.query(`
       UPDATE study_sessions
       SET ended_at         = last_heartbeat + INTERVAL '5 minutes',
           duration_minutes = EXTRACT(EPOCH FROM (last_heartbeat+INTERVAL '5 minutes'-started_at))::int/60
       WHERE ended_at IS NULL AND last_heartbeat < NOW()-INTERVAL '15 minutes'
-      RETURNING id
+      RETURNING id, user_id, COALESCE(room_tier_id, tier_id) AS room_tier_id
     `);
-    if (result.length) this.logger.log(`Auto-closed ${result.length} expired sessions`);
+    if (!result.length) return;
+    this.logger.log(`Auto-closed ${result.length} expired sessions`);
+
+    const tierIds = Array.from(new Set(result.map((r: any) => r.room_tier_id).filter(Boolean)));
+    if (!tierIds.length) return;
+    // room_tiers is a tiny, rarely-changing table (a handful of rows) —
+    // fetching all of it avoids needing an array-typed query parameter,
+    // which isn't a pattern used elsewhere in this codebase.
+    const tiers = await this.db.query(`SELECT id, tier_key FROM room_tiers`);
+    const tierKeyById = new Map(tiers.map((t: any) => [t.id, t.tier_key]));
+
+    for (const row of result) {
+      const tierKey = tierKeyById.get(row.room_tier_id);
+      if (!tierKey) continue;
+      this.gateway.broadcastPresenceUpdate(tierKey);
+      this.gateway.server?.to(`tier:${tierKey}`).emit('room:member_left', {
+        tierKey, userId: row.user_id, reason: 'session_expired',
+      });
+    }
   }
 
   @Cron('5 0 * * *')
@@ -1104,17 +1149,36 @@ export class TierRoomsCronService {
     const tiers      = await this.db.query(`SELECT id, tier_key FROM room_tiers WHERE is_active=TRUE`);
 
     for (const tier of tiers) {
+      // FIX: was `FROM user_room_tier urt ... LEFT JOIN study_sessions ss
+      // ON ss.user_id=urt.user_id` gated by `urt.current_tier_id=$3` — every
+      // session a user ever ran got summed into whichever tier is their
+      // CURRENT home tier, not the room each session actually took place
+      // in. A user promoted partway through the month would have their
+      // entire month's study time (most of it earned in their old room)
+      // moved onto the new tier's board, and the old room's board would
+      // show 0 for them despite weeks of real studying there. Filter
+      // sessions by their own room (COALESCE(room_tier_id, tier_id), same
+      // as getTierMembers), and roster = home-tier members UNION anyone
+      // who actually studied in this room this month.
       const stats = await this.db.query(`
-        SELECT urt.user_id,
+        SELECT u.id AS user_id,
           COALESCE(SUM(ss.active_minutes),0)::int AS study_minutes,
           COALESCE(SUM(ss.coins_earned),0)::int   AS coins_earned,
           COALESCE(SUM(ss.xp_earned),0)::int      AS xp_earned,
           COALESCE(u.streak,0)::int                AS streak_days
-        FROM user_room_tier urt JOIN users u ON u.id=urt.user_id
-        LEFT JOIN study_sessions ss ON ss.user_id=urt.user_id
+        FROM users u
+        LEFT JOIN study_sessions ss ON ss.user_id=u.id
+          AND COALESCE(ss.room_tier_id, ss.tier_id)=$3
           AND ss.started_at>=$1 AND ss.started_at<$2 AND ss.ended_at IS NOT NULL
-        WHERE urt.current_tier_id=$3 AND u.status='active'
-        GROUP BY urt.user_id, u.streak ORDER BY study_minutes DESC, coins_earned DESC
+        WHERE u.status='active' AND (
+          EXISTS (SELECT 1 FROM user_room_tier urt WHERE urt.user_id=u.id AND urt.current_tier_id=$3)
+          OR EXISTS (
+            SELECT 1 FROM study_sessions ss2
+            WHERE ss2.user_id=u.id AND COALESCE(ss2.room_tier_id, ss2.tier_id)=$3
+              AND ss2.started_at>=$1 AND ss2.started_at<$2 AND ss2.ended_at IS NOT NULL
+          )
+        )
+        GROUP BY u.id, u.streak ORDER BY study_minutes DESC, coins_earned DESC
       `, [monthStart.toISOString(), monthEnd.toISOString(), tier.id]);
 
       for (let i = 0; i < stats.length; i++) {
@@ -1148,17 +1212,27 @@ export class TierRoomsCronService {
     const weekStart = new Date(now.getTime()-7*86400000);
 
     for (const tier of tiers) {
+      // FIX: same room-vs-home-tier issue as the monthly snapshot above —
+      // see that comment for the full explanation.
       const stats = await this.db.query(`
-        SELECT urt.user_id,
+        SELECT u.id AS user_id,
           COALESCE(SUM(ss.active_minutes),0)::int AS study_minutes,
           COALESCE(SUM(ss.coins_earned),0)::int   AS coins_earned,
           COALESCE(SUM(ss.xp_earned),0)::int      AS xp_earned,
           COALESCE(u.streak,0)::int                AS streak_days
-        FROM user_room_tier urt JOIN users u ON u.id=urt.user_id
+        FROM users u
         LEFT JOIN study_sessions ss
-          ON ss.user_id=urt.user_id AND ss.started_at>=$1 AND ss.ended_at IS NOT NULL
-        WHERE urt.current_tier_id=$2 AND u.status='active'
-        GROUP BY urt.user_id, u.streak
+          ON ss.user_id=u.id AND COALESCE(ss.room_tier_id, ss.tier_id)=$2
+          AND ss.started_at>=$1 AND ss.ended_at IS NOT NULL
+        WHERE u.status='active' AND (
+          EXISTS (SELECT 1 FROM user_room_tier urt WHERE urt.user_id=u.id AND urt.current_tier_id=$2)
+          OR EXISTS (
+            SELECT 1 FROM study_sessions ss2
+            WHERE ss2.user_id=u.id AND COALESCE(ss2.room_tier_id, ss2.tier_id)=$2
+              AND ss2.started_at>=$1 AND ss2.ended_at IS NOT NULL
+          )
+        )
+        GROUP BY u.id, u.streak
         ORDER BY study_minutes DESC, coins_earned DESC
       `, [weekStart.toISOString(), tier.id]);
 
@@ -1230,7 +1304,7 @@ export class TierRoomsCronService {
 
   private async demoteUser(userId: string, currentTierId: string, graceDays: number) {
     const lower = await this.db.query(`
-      SELECT t.id FROM room_tiers t JOIN room_tiers curr ON curr.id=$1
+      SELECT t.id, t.tier_key, t.name, t.icon_emoji FROM room_tiers t JOIN room_tiers curr ON curr.id=$1
       WHERE t.sort_order=curr.sort_order-1 AND t.is_active=TRUE LIMIT 1
     `, [currentTierId]);
     if (!lower.length) return;
@@ -1244,6 +1318,18 @@ export class TierRoomsCronService {
     await this.db.query(`UPDATE users SET room_tier_id=$1 WHERE id=$2`, [lower[0].id, userId]);
     await this.cache.del(`user_tier:${userId}`);
     this.logger.log(`Demoted user=${userId}`);
+
+    // FIX: this used to stop here — emitDemotion() on the gateway already
+    // existed for exactly this, and notifyDemotion() now exists too (see
+    // tier-notifications.service.ts), but neither was ever called, so a
+    // demoted user got silently moved with no in-app or push signal at
+    // all. Mirrors promoteUser's WS-first, push-fallback pattern.
+    const t = lower[0];
+    const wsDelivered = this.gateway.emitDemotion(userId, t.tier_key, t.name, t.icon_emoji);
+    if (!wsDelivered) {
+      this.notifService.notifyDemotion(userId, t.tier_key, t.name, t.icon_emoji)
+        .catch(e => this.logger.error(`Demotion push failed: ${e.message}`));
+    }
   }
 }
 
