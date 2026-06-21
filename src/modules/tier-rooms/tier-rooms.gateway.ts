@@ -312,7 +312,8 @@ export class TierRoomsGateway
     tierKey: string,
     userId: string | null,
     userName: string,
-    eventType: 'joined' | 'streak_milestone' | 'promoted' | 'demoted',
+    eventType: 'joined' | 'left' | 'streak_milestone' | 'promoted' | 'demoted'
+      | 'session_completed' | 'champion',
     metadata: Record<string, any> = {},
   ) {
     try {

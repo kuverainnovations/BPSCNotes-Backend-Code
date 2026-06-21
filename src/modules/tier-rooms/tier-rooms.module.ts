@@ -210,9 +210,22 @@ export class TierRoomsService {
     return result;
   }
 
+  // ── Online/idle threshold for the 3-state status column ───
+  // Studying = open session right now. Online = not studying, but was
+  // active in this room within the last N minutes (i.e. likely still has
+  // the app open / just stepped away). Offline = neither. This is a
+  // time-based heuristic rather than true socket presence — the gateway's
+  // per-user connection state is in-process and not currently exposed to
+  // the REST layer, and wiring that through would mean injecting the
+  // gateway into TierRoomsService for a single derived field. The
+  // heuristic gets the same practical answer for the leaderboard's
+  // purposes without that extra coupling.
+  private static readonly ONLINE_WINDOW_MINUTES = 30;
+
   async getTierMembers(tierKey: string, query: any) {
     const { page = 1, limit = 20 } = query;
     const offset = (page - 1) * limit;
+    const onlineWindow = TierRoomsService.ONLINE_WINDOW_MINUTES;
     const [members, countResult] = await Promise.all([
       this.db.query(`
         WITH this_tier AS (SELECT id FROM room_tiers WHERE tier_key=$1)
@@ -225,34 +238,80 @@ export class TierRoomsService {
                  WHERE ss.user_id=u.id AND ss.ended_at IS NULL
                    AND COALESCE(ss.room_tier_id, ss.tier_id) = (SELECT id FROM this_tier)
                ) AS is_studying_now,
-               -- Active tab (spec section 2): when the current session in
-               -- THIS room started, so the client can show a live-ticking
-               -- timer the same way StudySessionViewModel already does for
-               -- your own session, instead of a number that's stale the
-               -- instant it's fetched.
+               -- Active tab: when the current session in THIS room
+               -- started, so the client can show a live-ticking timer the
+               -- same way StudySessionViewModel already does for your own
+               -- session, instead of a number that's stale the instant
+               -- it's fetched.
                (
                  SELECT ss.started_at FROM study_sessions ss
                  WHERE ss.user_id=u.id AND ss.ended_at IS NULL
                    AND COALESCE(ss.room_tier_id, ss.tier_id) = (SELECT id FROM this_tier)
                  LIMIT 1
                ) AS current_session_started_at,
-               -- Inactive tab: most recent time this user was active
-               -- specifically IN THIS ROOM (not users.last_active_at,
-               -- which is global across all rooms and would misreport a
-               -- member as "active" here from time spent in a different
-               -- room).
+               -- Most recent time this user was active specifically IN
+               -- THIS ROOM (not users.last_active_at, which is global
+               -- across all rooms and would misreport a member as
+               -- "active" here from time spent in a different room).
                (
                  SELECT MAX(ss.ended_at) FROM study_sessions ss
                  WHERE ss.user_id=u.id AND ss.ended_at IS NOT NULL
                    AND COALESCE(ss.room_tier_id, ss.tier_id) = (SELECT id FROM this_tier)
                ) AS last_active_at,
-               -- Inactive tab: total contribution to this specific room
-               -- (all-time), not the user's global total_study_minutes.
+               -- All-time contribution to this specific room (not the
+               -- user's global total_study_minutes).
                COALESCE((
                  SELECT SUM(ss.active_minutes) FROM study_sessions ss
                  WHERE ss.user_id=u.id
                    AND COALESCE(ss.room_tier_id, ss.tier_id) = (SELECT id FROM this_tier)
-               ), 0)::int AS room_total_minutes
+               ), 0)::int AS room_total_minutes,
+               -- Today / this week / this month, room-scoped — the full
+               -- leaderboard shows all three simultaneously per member
+               -- rather than gating behind a period selector.
+               COALESCE((
+                 SELECT SUM(ss.active_minutes) FROM study_sessions ss
+                 WHERE ss.user_id=u.id AND COALESCE(ss.room_tier_id, ss.tier_id)=(SELECT id FROM this_tier)
+                   AND ss.started_at::date = CURRENT_DATE
+               ), 0)::int AS today_minutes,
+               COALESCE((
+                 SELECT SUM(ss.active_minutes) FROM study_sessions ss
+                 WHERE ss.user_id=u.id AND COALESCE(ss.room_tier_id, ss.tier_id)=(SELECT id FROM this_tier)
+                   AND ss.started_at >= NOW() - INTERVAL '7 days'
+               ), 0)::int AS week_minutes,
+               COALESCE((
+                 SELECT SUM(ss.active_minutes) FROM study_sessions ss
+                 WHERE ss.user_id=u.id AND COALESCE(ss.room_tier_id, ss.tier_id)=(SELECT id FROM this_tier)
+                   AND ss.started_at >= date_trunc('month', CURRENT_DATE)
+               ), 0)::int AS month_minutes,
+               -- Rank by this week's room minutes — matches the existing
+               -- default leaderboard period. Ties broken by streak so the
+               -- order is stable rather than arbitrary.
+               RANK() OVER (
+                 ORDER BY COALESCE((
+                   SELECT SUM(ss.active_minutes) FROM study_sessions ss
+                   WHERE ss.user_id=u.id AND COALESCE(ss.room_tier_id, ss.tier_id)=(SELECT id FROM this_tier)
+                     AND ss.started_at >= NOW() - INTERVAL '7 days'
+                 ), 0) DESC, u.streak DESC
+               )::int AS rank_position,
+               -- 3-state status for the leaderboard tabs/badge.
+               CASE
+                 WHEN EXISTS(
+                   SELECT 1 FROM study_sessions ss WHERE ss.user_id=u.id AND ss.ended_at IS NULL
+                     AND COALESCE(ss.room_tier_id, ss.tier_id) = (SELECT id FROM this_tier)
+                 ) THEN 'studying'
+                 WHEN EXISTS(
+                   SELECT 1 FROM study_sessions ss WHERE ss.user_id=u.id
+                     AND COALESCE(ss.room_tier_id, ss.tier_id) = (SELECT id FROM this_tier)
+                     AND COALESCE(ss.ended_at, ss.last_heartbeat) >= NOW() - (${onlineWindow}||' minutes')::interval
+                 ) THEN 'online'
+                 ELSE 'offline'
+               END AS status,
+               -- Achievement badge count (spec wants badges on each row;
+               -- reuses the existing achievements module's tables
+               -- read-only rather than building a parallel badge system).
+               COALESCE((
+                 SELECT COUNT(*) FROM user_achievements ua WHERE ua.user_id = u.id
+               ), 0)::int AS badge_count
         FROM users u
         LEFT JOIN user_room_tier urt ON urt.user_id = u.id
         WHERE u.status='active' AND (
@@ -270,7 +329,7 @@ export class TierRoomsService {
               AND COALESCE(ss.room_tier_id, ss.tier_id) = (SELECT id FROM this_tier)
           )
         )
-        ORDER BY u.xp DESC, u.streak DESC
+        ORDER BY rank_position ASC
         LIMIT $2 OFFSET $3
       `, [tierKey, limit, offset]),
       this.db.query(`
@@ -434,12 +493,21 @@ export class TierRoomsService {
           (SELECT COUNT(DISTINCT ss.user_id) FROM study_sessions ss
              WHERE COALESCE(ss.room_tier_id, ss.tier_id)=(SELECT id FROM this_tier)
                AND ss.ended_at IS NULL)::int AS studying_now,
+          -- "Online" mirrors getTierMembers' status heuristic: active in
+          -- this room (open OR just-ended session / heartbeat) within the
+          -- online window, whether or not they're studying right now.
+          (SELECT COUNT(DISTINCT ss.user_id) FROM study_sessions ss
+             WHERE COALESCE(ss.room_tier_id, ss.tier_id)=(SELECT id FROM this_tier)
+               AND COALESCE(ss.ended_at, ss.last_heartbeat) >= NOW() - INTERVAL '30 minutes')::int AS online_members,
           COALESCE((SELECT SUM(ss.active_minutes) FROM study_sessions ss
              WHERE COALESCE(ss.room_tier_id, ss.tier_id)=(SELECT id FROM this_tier)
                AND ss.started_at::date = CURRENT_DATE), 0)::int AS minutes_today,
           COALESCE((SELECT SUM(ss.active_minutes) FROM study_sessions ss
              WHERE COALESCE(ss.room_tier_id, ss.tier_id)=(SELECT id FROM this_tier)
                AND ss.started_at >= NOW() - INTERVAL '7 days'), 0)::int AS minutes_this_week,
+          COALESCE((SELECT SUM(ss.active_minutes) FROM study_sessions ss
+             WHERE COALESCE(ss.room_tier_id, ss.tier_id)=(SELECT id FROM this_tier)
+               AND ss.started_at >= date_trunc('month', CURRENT_DATE)), 0)::int AS minutes_this_month,
           COALESCE((SELECT MAX(streak) FROM roster), 0)::int AS highest_streak
       `, [tierId]),
       this.db.query(`
@@ -461,6 +529,154 @@ export class TierRoomsService {
     });
     await this.cache.set(cacheKey, result, 30); // short TTL — feeds off live session data
     return result;
+  }
+
+  // ── Room Champions (redesign section 5) ────────────────────
+  // Today/Week/Month champion = most room-minutes in that window.
+  // Most Improved = biggest positive jump in weekly minutes vs the prior
+  // 7-day window (this week minus last week), so this rewards genuine
+  // recent improvement rather than just raw volume — someone who's always
+  // studied a lot wouldn't otherwise show up here over someone who just
+  // doubled their pace.
+  async getRoomChampions(tierKey: string) {
+    const tier = await this.db.query(
+      `SELECT id FROM room_tiers WHERE tier_key=$1 AND is_active=TRUE LIMIT 1`, [tierKey]
+    );
+    if (!tier.length) throw new NotFoundException('Room not found.');
+    const tierId = tier[0].id;
+
+    const championQuery = (dateFilter: string) => this.db.query(`
+      SELECT u.id AS user_id, u.name AS user_name, u.avatar_url,
+             COALESCE(SUM(ss.active_minutes),0)::int AS minutes
+      FROM users u
+      JOIN study_sessions ss ON ss.user_id = u.id
+      WHERE COALESCE(ss.room_tier_id, ss.tier_id) = $1
+        AND ss.ended_at IS NOT NULL ${dateFilter}
+      GROUP BY u.id, u.name, u.avatar_url
+      HAVING COALESCE(SUM(ss.active_minutes),0) > 0
+      ORDER BY minutes DESC
+      LIMIT 1
+    `, [tierId]);
+
+    const [today, week, month, improvedRows] = await Promise.all([
+      championQuery(`AND ss.started_at::date = CURRENT_DATE`),
+      championQuery(`AND ss.started_at >= NOW() - INTERVAL '7 days'`),
+      championQuery(`AND ss.started_at >= date_trunc('month', CURRENT_DATE)`),
+      this.db.query(`
+        SELECT u.id AS user_id, u.name AS user_name, u.avatar_url,
+               COALESCE(thisWeek.minutes,0)::int - COALESCE(lastWeek.minutes,0)::int AS delta_minutes
+        FROM users u
+        LEFT JOIN LATERAL (
+          SELECT SUM(ss.active_minutes) AS minutes FROM study_sessions ss
+          WHERE ss.user_id=u.id AND COALESCE(ss.room_tier_id, ss.tier_id)=$1
+            AND ss.ended_at IS NOT NULL AND ss.started_at >= NOW() - INTERVAL '7 days'
+        ) thisWeek ON TRUE
+        LEFT JOIN LATERAL (
+          SELECT SUM(ss.active_minutes) AS minutes FROM study_sessions ss
+          WHERE ss.user_id=u.id AND COALESCE(ss.room_tier_id, ss.tier_id)=$1
+            AND ss.ended_at IS NOT NULL
+            AND ss.started_at >= NOW() - INTERVAL '14 days' AND ss.started_at < NOW() - INTERVAL '7 days'
+        ) lastWeek ON TRUE
+        WHERE EXISTS(
+          SELECT 1 FROM study_sessions ss2 WHERE ss2.user_id=u.id
+            AND COALESCE(ss2.room_tier_id, ss2.tier_id)=$1 AND ss2.ended_at IS NOT NULL
+        )
+        ORDER BY delta_minutes DESC
+        LIMIT 1
+      `, [tierId]),
+    ]);
+
+    const mostImproved = improvedRows[0]?.delta_minutes > 0 ? improvedRows[0] : null;
+
+    // Champion-change detection (redesign section 7: "User became
+    // champion" activity feed event). Checked here rather than a
+    // dedicated cron — this endpoint is hit whenever anyone opens the
+    // leaderboard/room, which in practice is frequent enough, and avoids
+    // adding a new scheduled job just for this. Only the weekly champion
+    // is tracked this way (today's resets daily and would fire constantly
+    // near midnight; monthly changes are rare enough this matters less).
+    if (week[0]) {
+      const cacheKey = `room_champion:weekly:${tierKey}`;
+      const prevChampionId = await this.cache.get(cacheKey) as string | undefined;
+      if (prevChampionId !== week[0].user_id) {
+        await this.cache.set(cacheKey, week[0].user_id, 7 * 24 * 60 * 60);
+        if (prevChampionId) { // don't fire on the very first computation ever
+          this.gateway.recordActivityFeedEvent(
+            tierId, tierKey, week[0].user_id, week[0].user_name,
+            'champion', { period: 'weekly', minutes: week[0].minutes },
+          ).catch(() => {});
+        }
+      }
+    }
+
+    return successResponse({
+      todayChampion:   today[0] ?? null,
+      weeklyChampion:  week[0] ?? null,
+      monthlyChampion: month[0] ?? null,
+      mostImproved,
+    });
+  }
+
+  // ── Personal ranking (redesign section 4) ──────────────────
+  // Rank is computed the same way as getTierMembers' rank_position
+  // (weekly room-minutes), so "your rank" always matches where you'd
+  // actually find yourself in the member list.
+  async getMyRank(tierKey: string, userId: string) {
+    const tier = await this.db.query(
+      `SELECT id FROM room_tiers WHERE tier_key=$1 AND is_active=TRUE LIMIT 1`, [tierKey]
+    );
+    if (!tier.length) throw new NotFoundException('Room not found.');
+    const tierId = tier[0].id;
+
+    const rows = await this.db.query(`
+      WITH this_tier AS (SELECT $1::uuid AS id),
+           roster AS (
+             SELECT u.id, u.streak,
+               COALESCE((SELECT SUM(ss.active_minutes) FROM study_sessions ss
+                 WHERE ss.user_id=u.id AND COALESCE(ss.room_tier_id, ss.tier_id)=(SELECT id FROM this_tier)
+                   AND ss.started_at::date = CURRENT_DATE), 0)::int AS today_minutes,
+               COALESCE((SELECT SUM(ss.active_minutes) FROM study_sessions ss
+                 WHERE ss.user_id=u.id AND COALESCE(ss.room_tier_id, ss.tier_id)=(SELECT id FROM this_tier)
+                   AND ss.started_at >= NOW() - INTERVAL '7 days'), 0)::int AS week_minutes,
+               COALESCE((SELECT SUM(ss.active_minutes) FROM study_sessions ss
+                 WHERE ss.user_id=u.id AND COALESCE(ss.room_tier_id, ss.tier_id)=(SELECT id FROM this_tier)
+                   AND ss.started_at >= date_trunc('month', CURRENT_DATE)), 0)::int AS month_minutes
+             FROM users u WHERE u.status='active' AND (
+               EXISTS(SELECT 1 FROM user_room_tier urt JOIN room_tiers t ON t.id=urt.current_tier_id
+                      WHERE urt.user_id=u.id AND t.id=(SELECT id FROM this_tier))
+               OR EXISTS(SELECT 1 FROM study_sessions ss
+                      WHERE ss.user_id=u.id AND COALESCE(ss.room_tier_id, ss.tier_id)=(SELECT id FROM this_tier))
+             )
+           ),
+           ranked AS (
+             SELECT *, RANK() OVER (ORDER BY week_minutes DESC, streak DESC)::int AS rank_position
+             FROM roster
+           )
+      SELECT * FROM ranked
+    `, [tierId]);
+
+    const me = rows.find((r: any) => r.id === userId);
+    if (!me) {
+      return successResponse({
+        rankPosition: null, todayMinutes: 0, weekMinutes: 0, monthMinutes: 0,
+        streak: 0, minutesToNextRank: null, nextRankPosition: null,
+      });
+    }
+    // Closest roster member ranked immediately better than me — the gap
+    // is how many more weekly minutes would overtake them.
+    const better = rows
+      .filter((r: any) => r.rank_position < me.rank_position)
+      .sort((a: any, b: any) => b.rank_position - a.rank_position)[0];
+
+    return successResponse({
+      rankPosition: me.rank_position,
+      todayMinutes: me.today_minutes,
+      weekMinutes: me.week_minutes,
+      monthMinutes: me.month_minutes,
+      streak: me.streak,
+      minutesToNextRank: better ? Math.max(better.week_minutes - me.week_minutes + 1, 1) : null,
+      nextRankPosition: better ? better.rank_position : null,
+    });
   }
 
   // ── Activity Feed read (spec section 9) ────────────────────
@@ -1068,6 +1284,24 @@ export class StudySessionsService {
       this.gateway.server?.to(`tier:${s.room_tier_key}`).emit('room:member_left', {
         tierKey: s.room_tier_key, userId,
       });
+      // Room activity feed (redesign section 7) — a substantial session
+      // (matching the same 30-min bonus-coin threshold used elsewhere)
+      // is a more meaningful feed entry than a bare "left the room", so
+      // it gets its own richer event instead of firing both for the same
+      // moment.
+      const [userRow] = await this.db.query(`SELECT name FROM users WHERE id=$1`, [userId]);
+      const userName = userRow?.name ?? 'Member';
+      if (s.active_minutes >= 30) {
+        this.gateway.recordActivityFeedEvent(
+          s.room_tier_id || s.tier_id, s.room_tier_key, userId, userName,
+          'session_completed', { activeMinutes: s.active_minutes },
+        ).catch(() => {});
+      } else {
+        this.gateway.recordActivityFeedEvent(
+          s.room_tier_id || s.tier_id, s.room_tier_key, userId, userName,
+          'left', {},
+        ).catch(() => {});
+      }
     }
 
     await this.activityLog?.log(userId, ACTIONS.STUDY_SESSION_ENDED, `Study session ended - ${s.active_minutes} active mins`, { sessionId, activeMinutes: s.active_minutes, coins: s.coins_earned }).catch(()=>{});
@@ -1196,9 +1430,8 @@ export class TierRoomsCronService {
     // fetching all of it avoids needing an array-typed query parameter,
     // which isn't a pattern used elsewhere in this codebase.
     const tiers = await this.db.query(`SELECT id, tier_key FROM room_tiers`);
-    const tierKeyById = new Map<any, string>(
-      tiers.map((t: any) => [t.id, String(t.tier_key)])
-    );
+    const tierKeyById = new Map(tiers.map((t: any) => [t.id, t.tier_key]));
+
     for (const row of result) {
       const tierKey = tierKeyById.get(row.room_tier_id);
       if (!tierKey) continue;
@@ -1538,6 +1771,18 @@ export class TierRoomsController {
   @Get('tiers/:tierKey/stats')
   getRoomStats(@Param('tierKey') tierKey: string) {
     return this.tiersService.getRoomStats(tierKey);
+  }
+
+  /** GET /rooms/tiers/:tierKey/champions — Today/Week/Month champions + Most Improved */
+  @Get('tiers/:tierKey/champions')
+  getRoomChampions(@Param('tierKey') tierKey: string) {
+    return this.tiersService.getRoomChampions(tierKey);
+  }
+
+  /** GET /rooms/tiers/:tierKey/my-rank — personal ranking + gap to next rank */
+  @Get('tiers/:tierKey/my-rank')
+  getMyRank(@Req() r: any, @Param('tierKey') tierKey: string) {
+    return this.tiersService.getMyRank(tierKey, r.user.id);
   }
 
   /** GET /rooms/tiers/:tierKey/activity?limit=50 — Room Activity Feed */
