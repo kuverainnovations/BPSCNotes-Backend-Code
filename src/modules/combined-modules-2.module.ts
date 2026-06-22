@@ -808,7 +808,15 @@ class UsersService {
     const [userRow, subjectStats, recentQuizzes, weeklyActivity] = await Promise.all([
       // Fetch user-level stats so Android header (rank/accuracy/study) always has data
       this.db.query(
-        `SELECT streak, accuracy, rank, total_study_minutes, quizzes_attempted FROM users WHERE id=$1`,
+        `SELECT streak, accuracy, rank, total_study_minutes, quizzes_attempted,
+                COALESCE((
+                  SELECT SUM(active_minutes)
+                  FROM study_sessions
+                  WHERE user_id=$1
+                    AND started_at >= CURRENT_DATE
+                    AND started_at <  CURRENT_DATE + INTERVAL '1 day'
+                ), 0)::int AS today_study_minutes
+         FROM users WHERE id=$1`,
         [userId]
       ),
       this.db.query(
@@ -945,6 +953,7 @@ class UsersService {
       accuracy:           parseFloat(u.accuracy) || 0,
       current_streak:     u.streak || 0,
       total_study_minutes: u.total_study_minutes || 0,
+      today_study_minutes: u.today_study_minutes || 0,
       quizzes_attempted:  u.quizzes_attempted || 0,
       // FIX: compute live rank — u.rank in DB is null until batch job runs
       rank: u.rank || await this.db.query(
