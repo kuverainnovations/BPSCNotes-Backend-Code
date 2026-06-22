@@ -216,54 +216,93 @@ function renderParagraph(doc: any, el: any, ctx: RenderCtx) {
 function renderBlockquote(doc: any, el: any, ctx: RenderCtx) {
   const x = ctx.contentX + 18;
   const w = ctx.contentWidth - 18;
-  const startY = doc.y;
   const blocks = (el.children || []).filter((c: any) => c.type === 'tag' && c.name === 'p');
   const paragraphs = blocks.length ? blocks : [{ children: el.children }];
-  ensureSpace(doc, 36);
-  // Light blue background behind the whole blockquote
-  const approxH = paragraphs.length * BODY_SIZE * 3;
-  doc.save().fillColor(BRAND_LIGHT).fillOpacity(0.6)
-    .roundedRect(ctx.contentX, startY - 2, ctx.contentWidth, approxH + 10, 4)
+
+  // ensureSpace BEFORE capturing startY — if it adds a new page the captured
+  // Y must be on the NEW page, otherwise the background rect draws at the old
+  // page position and the text is invisible over it.
+  ensureSpace(doc, 40);
+  const startY = doc.y;
+
+  // Rough background: draw a generous rectangle now; the left border that
+  // matches exact content height is drawn afterwards.
+  const approxH = paragraphs.length * BODY_SIZE * 3.5 + 16;
+  doc.save().fillColor(BRAND_LIGHT).fillOpacity(0.55)
+    .roundedRect(ctx.contentX, startY - 2, ctx.contentWidth, approxH, 4)
     .fill().restore();
   doc.fillOpacity(1);
+
   for (const p of paragraphs) {
     const runs = trimRuns(flattenRuns(p.children, { italic: true, color: MUTED }));
     if (!runs.length) continue;
     emitRuns(doc, runs, BODY_SIZE, x, w);
     doc.moveDown(0.3);
   }
+
   const endY = doc.y;
-  // Left accent bar
+  // Exact-height left accent bar drawn AFTER content so its height is correct
   doc.save().fillColor(BRAND)
-    .rect(ctx.contentX, startY - 2, 3.5, Math.max(8, endY - startY + 10))
+    .rect(ctx.contentX, startY - 2, 3.5, Math.max(8, endY - startY + 8))
     .fill().restore();
+
   doc.moveDown(0.5);
   doc.x = ctx.contentX;
 }
+
+// Block-level tags that must NEVER be flattened into inline text runs.
+// When any of these appears as a direct child of <li>, flattenRuns would
+// concatenate their entire text content (including all table cells) into one
+// continuous run — that's the "TesthhhhkkkklllsdnssdsddeeeeE" bug visible
+// when a table sits inside a list item. We exclude them from ownKids and
+// render them properly as block elements after the inline text instead.
+const BLOCK_TAGS_IN_LI = new Set([
+  'ul','ol','table','blockquote','img','figure',
+  'h1','h2','h3','h4','h5','h6','div','p',
+]);
 
 function renderList(doc: any, items: any[], ctx: RenderCtx, ordered: boolean, depth: number) {
   let idx = 1;
   for (const li of items || []) {
     if (li.type !== 'tag' || li.name !== 'li') continue;
     const indent = depth * 18;
-    const x = ctx.contentX + indent + 16;
-    const w = ctx.contentWidth - indent - 16;
+    const x  = ctx.contentX + indent + 16;
+    const w  = ctx.contentWidth - indent - 16;
     ensureSpace(doc, BODY_SIZE * 2);
     const marker = ordered ? `${idx}.` : '•';
     idx++;
-    // Marker
+
+    // Render marker
     doc.font('Helvetica').fontSize(BODY_SIZE).fillColor(BRAND)
       .text(marker, ctx.contentX + indent, doc.y, { width: 14, continued: false });
     doc.moveUp(1);
+
+    // Inline-only children (text, strong, em, span, a, mark, br, u, s)
     const ownKids = (li.children || []).filter(
-      (c: any) => !(c.type === 'tag' && (c.name === 'ul' || c.name === 'ol'))
+      (c: any) => !(c.type === 'tag' && BLOCK_TAGS_IN_LI.has(c.name))
     );
     const runs = trimRuns(flattenRuns(ownKids, {}));
-    if (runs.length) emitRuns(doc, runs, BODY_SIZE, x, w);
+    if (runs.length) {
+      emitRuns(doc, runs, BODY_SIZE, x, w);
+    } else {
+      // No inline text — step past the marker line so the first block
+      // element below doesn't overlap the bullet point.
+      doc.moveDown(1);
+    }
     doc.moveDown(0.3);
+
+    // Block-level children (nested lists, tables, blockquotes, images…)
+    // rendered as full block elements so their structure is preserved.
     for (const sub of li.children || []) {
-      if (sub.type === 'tag' && sub.name === 'ul') renderList(doc, sub.children, ctx, false, depth + 1);
-      if (sub.type === 'tag' && sub.name === 'ol') renderList(doc, sub.children, ctx, true,  depth + 1);
+      if (sub.type !== 'tag') continue;
+      if (sub.name === 'ul') {
+        renderList(doc, sub.children, ctx, false, depth + 1);
+      } else if (sub.name === 'ol') {
+        renderList(doc, sub.children, ctx, true, depth + 1);
+      } else if (BLOCK_TAGS_IN_LI.has(sub.name)) {
+        // Table, blockquote, img, headings etc — render as a block
+        renderNodes(doc, [sub], ctx);
+      }
     }
   }
   doc.moveDown(0.2);
@@ -364,6 +403,16 @@ function renderNodes(doc: any, nodes: any[], ctx: RenderCtx) {
       case 'ol': renderList(doc, node.children, ctx, true,  0); break;
       case 'table': renderTable(doc, node, ctx); break;
       case 'img':   renderImage(doc, node, ctx); break;
+      case 'hr': {
+        // TipTap horizontal rule — render as a light divider line
+        doc.moveDown(0.4);
+        doc.moveTo(ctx.contentX, doc.y)
+          .lineTo(ctx.contentX + ctx.contentWidth, doc.y)
+          .strokeColor(BORDER).lineWidth(0.75).stroke();
+        doc.moveDown(0.6);
+        doc.x = ctx.contentX;
+        break;
+      }
       default: renderNodes(doc, node.children, ctx);
     }
   }
@@ -406,7 +455,16 @@ async function loadImageBuffer(src: string, uploadDir: string): Promise<Buffer |
 }
 
 // ── Logo cache ────────────────────────────────────────────────────────────
+// Logo look-up order (first match wins):
+//  1. Same dir as the compiled .js (dist/common/utils/logo.png) — populated
+//     by nest-cli.json assetDir config below so it survives docker build.
+//  2. dist/assets/ — alternative nest-cli.json placement.
+//  3. process.cwd()/src/assets/ — works in dev (ts-node) or when the full
+//     source tree is present in the container.
+//  4. uploads/ — user-placed logo on the VPS volume; works in all configs.
 const LOGO_PATHS = [
+  join(__dirname, 'logo.png'),
+  join(__dirname, '../../assets/logo.png'),
   join(process.cwd(), 'src',     'assets', 'logo.png'),
   join(process.cwd(), 'src',     'assets', 'logo.jpg'),
   join(process.cwd(), 'uploads', 'logo.png'),
