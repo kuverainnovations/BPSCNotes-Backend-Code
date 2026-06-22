@@ -442,7 +442,7 @@ class CurrentAffairsService {
   // ── PDF export ───────────────────────────────────────────────
   async streamPdf(affairId: string, res: Response, uploadDir: string) {
     const result = await this.db.query(
-      `SELECT title, category, date, source, tags, full_content FROM current_affairs
+      `SELECT title, summary, category, date, source, tags, full_content FROM current_affairs
        WHERE id=$1 AND status='published'`,
       [affairId]
     );
@@ -450,6 +450,7 @@ class CurrentAffairsService {
     const row = result[0];
     await streamArticlePdf(res, {
       title: row.title,
+      summary: row.summary || '',
       category: row.category,
       date: row.date,
       source: row.source,

@@ -1,19 +1,5 @@
 // ════════════════════════════════════════════════════════════
 // CURRENT AFFAIRS — ARTICLE PDF GENERATOR
-//
-// Renders the same sanitized rich-content HTML the admin panel and
-// Android WebView display into a watermarked PDF. Deliberately built
-// on PDFKit (already a dependency — see certificate-generator.util.ts)
-// rather than a headless-browser approach (Puppeteer/Playwright):
-// this backend runs Node 20 on Alpine on a modest VPS, and pulling in
-// Chromium there means a much larger Docker image, `--no-sandbox` /
-// shared-memory workarounds, and real per-request memory/CPU pressure
-// for something that doesn't need full CSS/browser fidelity — the
-// admin editor's output is a small, known set of tags (see
-// CA_SANITIZE_OPTIONS in combined-modules-1.module.ts), which a
-// hand-rolled walker can render perfectly well without a browser.
-//
-// Install: npm install htmlparser2 --save
 // ════════════════════════════════════════════════════════════
 import * as fs from 'fs';
 import * as http from 'http';
@@ -27,20 +13,24 @@ const PDFDocument = require('pdfkit');
 
 export interface ArticlePdfData {
   title: string;
+  summary?: string;
   category: string;
   date: string;
   source?: string | null;
   tags?: string[];
-  fullContentHtml: string; // already sanitized server-side
+  fullContentHtml: string;
 }
 
-// ── Look & feel ─────────────────────────────────────────────
-const INK         = '#1E293B';
-const MUTED       = '#64748B';
-const BRAND       = '#1565C0';
-const BRAND_LIGHT = '#E8F1FC';
-const BORDER      = '#CBD5E1';
-const PAGE_MARGIN = 50;
+// ── Palette (mirrors RichContentView.tsx admin + app WebView CSS) ──────
+const INK         = '#1E293B';   // body text
+const MUTED       = '#64748B';   // secondary / meta text
+const BRAND       = '#1565C0';   // headings, links, category chip
+const BRAND_LIGHT = '#E8F1FC';   // table header bg
+const ACCENT      = '#0A2472';   // page header chip bg
+const BORDER      = '#CBD5E1';   // horizontal rules, table borders
+const HIGHLIGHT_DEFAULT = '#FEF9C3'; // fallback highlight (yellow)
+const PAGE_MARGIN = 48;
+const BODY_SIZE   = 11.5;        // pt — slightly larger = more readable on A4
 
 interface Style {
   bold?: boolean; italic?: boolean; underline?: boolean; strike?: boolean;
@@ -49,80 +39,73 @@ interface Style {
 interface Run { text: string; style: Style }
 interface RenderCtx { contentX: number; contentWidth: number; imageMap: Map<string, Buffer> }
 
-// ── Style helpers ────────────────────────────────────────────
-function fontFor(style: Style): string {
-  if (style.bold && style.italic) return 'Helvetica-BoldOblique';
-  if (style.bold) return 'Helvetica-Bold';
-  if (style.italic) return 'Helvetica-Oblique';
+// ── Font helpers ────────────────────────────────────────────
+function fontFor(s: Style): string {
+  if (s.bold && s.italic) return 'Helvetica-BoldOblique';
+  if (s.bold)   return 'Helvetica-Bold';
+  if (s.italic) return 'Helvetica-Oblique';
   return 'Helvetica';
 }
 
-// Extract CSS `color` value from an inline style string.
-// Handles both #hex and rgb()/rgba() formats — TipTap's Color extension
-// typically outputs hex, but rgba() can appear when colors are applied
-// programmatically or pasted from other sources.
-function extractStyleColor(styleAttr?: string): string | undefined {
-  if (!styleAttr) return undefined;
-  const m = /(?:^|;)\s*color\s*:\s*(#[0-9a-fA-F]{3,8}|rgba?\([^)]+\))/.exec(styleAttr);
-  return m ? m[1].trim() : undefined;
-}
-
-// Extract CSS `background-color` value — same format handling.
-function extractBgColor(styleAttr?: string): string | undefined {
-  if (!styleAttr) return undefined;
-  const m = /background-color\s*:\s*(#[0-9a-fA-F]{3,8}|rgba?\([^)]+\))/.exec(styleAttr);
-  return m ? m[1].trim() : undefined;
-}
-
-// Convert any CSS color string to a format PDFKit definitively accepts.
-// PDFKit's own color parser handles hex fine, but rgb()/rgba() support
-// varies by version. Passing [r, g, b] as an array is always safe.
-function toPdfColor(colorStr: string | undefined): string | number[] {
-  if (!colorStr) return INK;
-  const s = colorStr.trim();
-  // Hex — PDFKit handles these natively
+// ── Color helpers ────────────────────────────────────────────
+// Both the sanitizer regex and TipTap can produce rgb() or rgba(); convert
+// to the [r,g,b] array form PDFKit always handles correctly.
+function toPdfColor(c: string | undefined): string | number[] {
+  if (!c) return INK;
+  const s = c.trim();
   if (s.startsWith('#')) return s;
-  // rgb() or rgba() → [r, g, b] array (PDFKit always accepts this form)
   const m = /rgba?\((\d+(?:\.\d+)?),\s*(\d+(?:\.\d+)?),\s*(\d+(?:\.\d+)?)/.exec(s);
   if (m) return [Math.round(+m[1]), Math.round(+m[2]), Math.round(+m[3])];
-  // Named colors (red, blue, …) — PDFKit knows CSS named colors
-  return s;
+  return s; // named colour — PDFKit knows standard CSS names
 }
-function extractWidthPct(styleAttr?: string): number | undefined {
-  if (!styleAttr) return undefined;
-  const m = /width\s*:\s*(\d+(?:\.\d+)?)%/.exec(styleAttr);
+
+function extractStyleColor(attr?: string): string | undefined {
+  if (!attr) return undefined;
+  const m = /(?:^|;)\s*color\s*:\s*(#[0-9a-fA-F]{3,8}|rgba?\([^)]+\))/.exec(attr);
+  return m ? m[1].trim() : undefined;
+}
+function extractBgColor(attr?: string): string | undefined {
+  if (!attr) return undefined;
+  const m = /background-color\s*:\s*(#[0-9a-fA-F]{3,8}|rgba?\([^)]+\))/.exec(attr);
+  return m ? m[1].trim() : undefined;
+}
+function extractWidthPct(attr?: string): number | undefined {
+  if (!attr) return undefined;
+  const m = /width\s*:\s*(\d+(?:\.\d+)?)%/.exec(attr);
   return m ? parseFloat(m[1]) : undefined;
 }
-// Matches the exact margin shorthands RichTextEditor.tsx's AlignableImage
-// extension produces: "10px auto" (center), "10px 0 10px auto" (right),
-// "10px auto 10px 0" (left).
-function extractAlign(styleAttr?: string): 'left' | 'center' | 'right' {
-  if (!styleAttr) return 'left';
-  const m = /margin\s*:\s*([^;]+);?/.exec(styleAttr);
+function extractAlign(attr?: string): 'left' | 'center' | 'right' {
+  if (!attr) return 'left';
+  const m = /margin\s*:\s*([^;]+)/.exec(attr);
   if (!m) return 'left';
-  const t = m[1].trim().split(/\s+/);
-  if (t.length === 2 && t[1] === 'auto') return 'center';
-  if (t.length === 4) {
-    if (t[3] === 'auto' && t[1] !== 'auto') return 'right';
-    if (t[1] === 'auto' && t[3] !== 'auto') return 'left';
-  }
+  const parts = m[1].trim().split(/\s+/);
+  if (parts.length === 2 && parts[1] === 'auto') return 'center';
+  if (parts.length === 4 && parts[3] === 'auto' && parts[1] !== 'auto') return 'right';
   return 'left';
 }
-function collapseWs(text: string): string { return text.replace(/\s+/g, ' '); }
+function collapseWs(t: string): string { return t.replace(/[\t\r\n ]+/g, ' '); }
 function safeFileName(title: string): string {
   return (title || 'article').replace(/[^a-zA-Z0-9\-_ ]/g, '').trim().slice(0, 80) || 'article';
 }
+// Strip HTML tags to plain text for use in plain-text PDF fields (title, source)
+function stripHtmlForPdf(html: string): string {
+  return (html || '')
+    .replace(/<[^>]+>/g, '')
+    .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+    .replace(/&nbsp;/g, ' ').replace(/&quot;/g, '"').replace(/&#39;/g, "'")
+    .replace(/\s+/g, ' ').trim();
+}
 
-// ── HTML → styled run list ──────────────────────────────────
+// ── HTML → styled run list ────────────────────────────────────────────────
 function flattenRuns(nodes: any[], style: Style, runs: Run[] = []): Run[] {
   for (const node of nodes || []) {
     if (node.type === 'text') {
-      const text = collapseWs(node.data || '');
-      if (text) runs.push({ text, style });
+      const t = collapseWs(node.data || '');
+      if (t) runs.push({ text: t, style });
       continue;
     }
     if (node.type !== 'tag') continue;
-    const attribs = node.attribs || {};
+    const a = node.attribs || {};
     switch (node.name) {
       case 'strong': case 'b':
         flattenRuns(node.children, { ...style, bold: true }, runs); break;
@@ -130,26 +113,32 @@ function flattenRuns(nodes: any[], style: Style, runs: Run[] = []): Run[] {
         flattenRuns(node.children, { ...style, italic: true }, runs); break;
       case 'u':
         flattenRuns(node.children, { ...style, underline: true }, runs); break;
-      case 's':
+      case 's': case 'del': case 'strike':
         flattenRuns(node.children, { ...style, strike: true }, runs); break;
       case 'a':
-        flattenRuns(node.children, { ...style, color: style.color || BRAND, underline: true, link: attribs.href }, runs);
+        flattenRuns(node.children,
+          { ...style, color: style.color || BRAND, underline: true, link: a.href },
+          runs);
         break;
       case 'span': case 'mark': {
-        const color = extractStyleColor(attribs.style);
-        const bg    = extractBgColor(attribs.style);
-        flattenRuns(node.children, { ...style, color: color || style.color, highlight: bg || style.highlight }, runs);
+        const color = extractStyleColor(a.style);
+        const bg    = extractBgColor(a.style) ?? (node.name === 'mark' ? HIGHLIGHT_DEFAULT : undefined);
+        flattenRuns(node.children,
+          { ...style,
+            color:     color ?? style.color,
+            highlight: bg    ?? style.highlight },
+          runs);
         break;
       }
       case 'br':
-        runs.push({ text: '\n', style });
-        break;
+        runs.push({ text: '\n', style }); break;
       default:
         flattenRuns(node.children, style, runs);
     }
   }
   return runs;
 }
+
 function trimRuns(runs: Run[]): Run[] {
   if (!runs.length) return runs;
   const out = runs.map(r => ({ ...r }));
@@ -158,38 +147,31 @@ function trimRuns(runs: Run[]): Run[] {
   return out.filter(r => r.text.length > 0);
 }
 
-// Emits a chain of mixed-style runs as one flowing paragraph via PDFKit's
-// `continued` text mode so bold/italic/color/highlight can sit inline.
-//
-// Key implementation decisions:
-//  - First run uses explicit (x, y) coordinates — relying purely on doc.x
-//    after `doc.x = x` works in most versions but can desync after font
-//    or color changes in some PDFKit builds. Explicit coords on run[0]
-//    anchor the paragraph to the right position.
-//  - toPdfColor() converts any CSS color format (hex, rgb, rgba) to the
-//    [r,g,b] array form PDFKit always accepts, avoiding silent misparse.
-//  - fillOpacity(1) is explicitly restored before text after highlight draw
-//    so opacity changes from the background rect never bleed into the text.
-function emitParagraphRuns(doc: any, runs: Run[], fontSize: number, x: number, width: number) {
+// ── Core renderer: mixed-style inline text ────────────────────────────────
+// Uses PDFKit's `continued` mode for same-line runs. First run receives
+// explicit x,y so position is always anchored regardless of prior state.
+function emitRuns(doc: any, runs: Run[], size: number, x: number, width: number) {
   if (!runs.length) return;
-  const startY = doc.y;
+  const y0 = doc.y;
   runs.forEach((run, i) => {
     const isLast = i === runs.length - 1;
-    // ── Highlight background ──────────────────────────────────
+
+    // Highlight background drawn BEFORE text, same row
     if (run.style.highlight && run.text.trim()) {
-      const tw = doc.widthOfString(run.text, { font: fontFor(run.style), size: fontSize });
+      const tw = doc.widthOfString(run.text, { font: fontFor(run.style), size });
       doc.save()
         .fillColor(toPdfColor(run.style.highlight))
-        .fillOpacity(0.85)
-        .rect(doc.x, doc.y + 1, tw, fontSize * 1.25)
+        .fillOpacity(0.82)
+        .rect(doc.x, doc.y + 1.5, tw, size * 1.3)
         .fill()
         .restore();
-      // Explicitly reset opacity after restore so it never bleeds into text
       doc.fillOpacity(1);
     }
-    // ── Text ─────────────────────────────────────────────────
-    const color = run.style.color ? toPdfColor(run.style.color) : INK;
-    doc.font(fontFor(run.style)).fontSize(fontSize).fillColor(color);
+
+    doc.font(fontFor(run.style))
+       .fontSize(size)
+       .fillColor(run.style.color ? toPdfColor(run.style.color) : INK);
+
     const opts: any = {
       continued: !isLast,
       underline: !!run.style.underline,
@@ -197,59 +179,65 @@ function emitParagraphRuns(doc: any, runs: Run[], fontSize: number, x: number, w
       link:      run.style.link || undefined,
       width,
     };
-    if (i === 0) {
-      // Anchor first run with explicit coordinates — prevents any stale
-      // doc.x/doc.y from a preceding element affecting paragraph start.
-      doc.text(run.text, x, startY, opts);
-    } else {
-      doc.text(run.text, opts);
-    }
+    if (i === 0) doc.text(run.text, x, y0, opts);
+    else         doc.text(run.text, opts);
   });
 }
 
-function ensureSpace(doc: any, neededHeight: number) {
-  const topOfContent = doc.page.margins.top;
-  // If we're already near the top of a fresh page, adding another page
-  // would immediately produce a blank one — skip in that case.
-  if (doc.y < topOfContent + 120) return;
-  if (doc.y + neededHeight > doc.page.height - doc.page.margins.bottom) doc.addPage();
+// ── Page-space guard ──────────────────────────────────────────────────────
+function ensureSpace(doc: any, needed: number) {
+  const freshTop = doc.page.margins.top + 80;
+  if (doc.y < freshTop) return; // already near top of a new page
+  if (doc.y + needed > doc.page.height - doc.page.margins.bottom) doc.addPage();
 }
 
+// ── Block renderers ───────────────────────────────────────────────────────
 function renderHeading(doc: any, el: any, ctx: RenderCtx, size: number) {
   const runs = trimRuns(flattenRuns(el.children, { bold: true }));
   if (!runs.length) return;
-  ensureSpace(doc, size + 14);
-  emitParagraphRuns(doc, runs, size, ctx.contentX, ctx.contentWidth);
-  doc.moveDown(0.35);
+  ensureSpace(doc, size * 2.5);
+  doc.moveDown(0.5);
+  // Give headings the brand blue unless an explicit colour span overrides
+  runs.forEach(r => { if (!r.style.color) r.style.color = BRAND; });
+  emitRuns(doc, runs, size, ctx.contentX, ctx.contentWidth);
+  doc.moveDown(0.3);
+  doc.x = ctx.contentX;
 }
 
 function renderParagraph(doc: any, el: any, ctx: RenderCtx) {
   const runs = trimRuns(flattenRuns(el.children, {}));
-  if (!runs.length) return; // skip empty <p> entirely — no moveDown accumulation
-  emitParagraphRuns(doc, runs, 11, ctx.contentX, ctx.contentWidth);
-  doc.moveDown(0.45);
+  if (!runs.length) return;
+  ensureSpace(doc, BODY_SIZE * 3);
+  emitRuns(doc, runs, BODY_SIZE, ctx.contentX, ctx.contentWidth);
+  doc.moveDown(0.55);
+  doc.x = ctx.contentX;
 }
 
 function renderBlockquote(doc: any, el: any, ctx: RenderCtx) {
-  const x = ctx.contentX + 16;
-  const w = ctx.contentWidth - 16;
+  const x = ctx.contentX + 18;
+  const w = ctx.contentWidth - 18;
   const startY = doc.y;
   const blocks = (el.children || []).filter((c: any) => c.type === 'tag' && c.name === 'p');
   const paragraphs = blocks.length ? blocks : [{ children: el.children }];
+  ensureSpace(doc, 36);
+  // Light blue background behind the whole blockquote
+  const approxH = paragraphs.length * BODY_SIZE * 3;
+  doc.save().fillColor(BRAND_LIGHT).fillOpacity(0.6)
+    .roundedRect(ctx.contentX, startY - 2, ctx.contentWidth, approxH + 10, 4)
+    .fill().restore();
+  doc.fillOpacity(1);
   for (const p of paragraphs) {
     const runs = trimRuns(flattenRuns(p.children, { italic: true, color: MUTED }));
     if (!runs.length) continue;
-    ensureSpace(doc, 30);
-    emitParagraphRuns(doc, runs, 11, x, w);
+    emitRuns(doc, runs, BODY_SIZE, x, w);
     doc.moveDown(0.3);
   }
   const endY = doc.y;
-  if (endY > startY) {
-    // Cosmetic left border — not corrected for blockquotes that
-    // straddle a page break, which is rare enough to be an acceptable gap.
-    doc.save().fillColor(BRAND).rect(ctx.contentX, startY, 3, Math.max(0, endY - startY - 4)).fill().restore();
-  }
-  doc.moveDown(0.4);
+  // Left accent bar
+  doc.save().fillColor(BRAND)
+    .rect(ctx.contentX, startY - 2, 3.5, Math.max(8, endY - startY + 10))
+    .fill().restore();
+  doc.moveDown(0.5);
   doc.x = ctx.contentX;
 }
 
@@ -257,24 +245,28 @@ function renderList(doc: any, items: any[], ctx: RenderCtx, ordered: boolean, de
   let idx = 1;
   for (const li of items || []) {
     if (li.type !== 'tag' || li.name !== 'li') continue;
-    const indent = depth * 16;
-    const x = ctx.contentX + indent;
-    const w = ctx.contentWidth - indent;
-    ensureSpace(doc, 20);
+    const indent = depth * 18;
+    const x = ctx.contentX + indent + 16;
+    const w = ctx.contentWidth - indent - 16;
+    ensureSpace(doc, BODY_SIZE * 2);
     const marker = ordered ? `${idx}.` : '•';
     idx++;
-    const ownChildren = (li.children || []).filter((c: any) => !(c.type === 'tag' && (c.name === 'ul' || c.name === 'ol')));
-    const runs = trimRuns(flattenRuns(ownChildren, {}));
-    // Marker prefixed into the same run chain — wrapped continuation lines
-    // land flush at the column edge rather than hanging-indented past the
-    // marker; a deliberate simplification for short, typical bullet items.
-    emitParagraphRuns(doc, [{ text: `${marker}  `, style: {} }, ...runs], 11, x, w);
-    doc.moveDown(0.25);
+    // Marker
+    doc.font('Helvetica').fontSize(BODY_SIZE).fillColor(BRAND)
+      .text(marker, ctx.contentX + indent, doc.y, { width: 14, continued: false });
+    doc.moveUp(1);
+    const ownKids = (li.children || []).filter(
+      (c: any) => !(c.type === 'tag' && (c.name === 'ul' || c.name === 'ol'))
+    );
+    const runs = trimRuns(flattenRuns(ownKids, {}));
+    if (runs.length) emitRuns(doc, runs, BODY_SIZE, x, w);
+    doc.moveDown(0.3);
     for (const sub of li.children || []) {
       if (sub.type === 'tag' && sub.name === 'ul') renderList(doc, sub.children, ctx, false, depth + 1);
-      if (sub.type === 'tag' && sub.name === 'ol') renderList(doc, sub.children, ctx, true, depth + 1);
+      if (sub.type === 'tag' && sub.name === 'ol') renderList(doc, sub.children, ctx, true,  depth + 1);
     }
   }
+  doc.moveDown(0.2);
   doc.x = ctx.contentX;
 }
 
@@ -285,7 +277,9 @@ function renderTable(doc: any, tableEl: any, ctx: RenderCtx) {
       if (n.type !== 'tag') continue;
       if (n.name === 'thead' || n.name === 'tbody') { walk(n.children); continue; }
       if (n.name === 'tr') {
-        const cells = (n.children || []).filter((c: any) => c.type === 'tag' && (c.name === 'td' || c.name === 'th'));
+        const cells = (n.children || []).filter(
+          (c: any) => c.type === 'tag' && (c.name === 'td' || c.name === 'th')
+        );
         if (cells.length) rows.push({ cells, isHeader: cells.some((c: any) => c.name === 'th') });
       }
     }
@@ -294,39 +288,45 @@ function renderTable(doc: any, tableEl: any, ctx: RenderCtx) {
   if (!rows.length) return;
 
   const numCols = Math.max(...rows.map(r => r.cells.length));
-  if (numCols === 0) return;
-  const colWidth = ctx.contentWidth / numCols;
-  const padX = 6, padY = 5;
+  if (!numCols) return;
+  const colW = ctx.contentWidth / numCols;
+  const pX = 7, pY = 5;
 
   for (const row of rows) {
-    // Table cells are flattened to plain text — mixed bold/italic/links
-    // *within* a single cell aren't preserved, a deliberate trade-off to
-    // keep the grid-layout math (column widths, row-height measurement,
-    // page-break checks) tractable.
-    const cellTexts = row.cells.map((c: any) => trimRuns(flattenRuns(c.children, {})).map(r => r.text).join(''));
-    let rowHeight = 0;
-    cellTexts.forEach((text) => {
-      const h = doc.heightOfString(text || ' ', { width: colWidth - padX * 2, font: row.isHeader ? 'Helvetica-Bold' : 'Helvetica', size: 9 });
-      rowHeight = Math.max(rowHeight, h);
+    const texts = row.cells.map((c: any) =>
+      trimRuns(flattenRuns(c.children, {})).map(r => r.text).join('')
+    );
+    const cellSize = row.isHeader ? 9.5 : 9;
+    let rowH = 0;
+    texts.forEach(t => {
+      const h = doc.heightOfString(t || ' ', {
+        width: colW - pX * 2,
+        font:  row.isHeader ? 'Helvetica-Bold' : 'Helvetica',
+        size:  cellSize,
+      });
+      rowH = Math.max(rowH, h);
     });
-    rowHeight += padY * 2;
-    ensureSpace(doc, rowHeight);
+    rowH = Math.max(rowH + pY * 2, 22);
+    ensureSpace(doc, rowH + 4);
 
-    const rowY = doc.y;
+    const ry = doc.y;
     if (row.isHeader) {
-      doc.save().fillColor(BRAND_LIGHT).rect(ctx.contentX, rowY, ctx.contentWidth, rowHeight).fill().restore();
+      doc.save().fillColor(BRAND).fillOpacity(1)
+        .rect(ctx.contentX, ry, ctx.contentWidth, rowH).fill().restore();
     }
-    row.cells.forEach((_cell: any, i: number) => {
-      const cx = ctx.contentX + i * colWidth;
-      doc.save().strokeColor(BORDER).lineWidth(0.5).rect(cx, rowY, colWidth, rowHeight).stroke().restore();
-      doc.font(row.isHeader ? 'Helvetica-Bold' : 'Helvetica').fontSize(9).fillColor(INK)
-        .text(cellTexts[i] || '', cx + padX, rowY + padY, { width: colWidth - padX * 2, height: rowHeight - padY * 2 });
+    row.cells.forEach((_: any, ci: number) => {
+      const cx = ctx.contentX + ci * colW;
+      doc.save().strokeColor(row.isHeader ? BRAND : BORDER).lineWidth(0.5)
+        .rect(cx, ry, colW, rowH).stroke().restore();
+      doc.font(row.isHeader ? 'Helvetica-Bold' : 'Helvetica')
+         .fontSize(cellSize)
+         .fillColor(row.isHeader ? '#FFFFFF' : INK)
+         .text(texts[ci] || '', cx + pX, ry + pY, { width: colW - pX * 2 });
     });
-
-    doc.y = rowY + rowHeight;
+    doc.y = ry + rowH;
     doc.x = ctx.contentX;
   }
-  doc.moveDown(0.6);
+  doc.moveDown(0.7);
 }
 
 function renderImage(doc: any, el: any, ctx: RenderCtx) {
@@ -336,17 +336,17 @@ function renderImage(doc: any, el: any, ctx: RenderCtx) {
   let img: any;
   try { img = doc.openImage(buf); } catch { return; }
 
-  const widthPct = extractWidthPct(el.attribs?.style) ?? 100;
-  const align = extractAlign(el.attribs?.style);
-  const targetW = Math.min(ctx.contentWidth, ctx.contentWidth * (widthPct / 100));
+  const pct    = extractWidthPct(el.attribs?.style) ?? 100;
+  const align  = extractAlign(el.attribs?.style);
+  const targetW = Math.min(ctx.contentWidth, ctx.contentWidth * pct / 100);
   const targetH = img.height * (targetW / img.width);
 
-  ensureSpace(doc, targetH);
-  let x = ctx.contentX;
-  if (align === 'center') x = ctx.contentX + (ctx.contentWidth - targetW) / 2;
-  else if (align === 'right') x = ctx.contentX + (ctx.contentWidth - targetW);
+  ensureSpace(doc, Math.min(targetH, 200));
+  let imgX = ctx.contentX;
+  if (align === 'center') imgX = ctx.contentX + (ctx.contentWidth - targetW) / 2;
+  else if (align === 'right')  imgX = ctx.contentX + ctx.contentWidth - targetW;
 
-  doc.image(img, x, doc.y, { width: targetW, height: targetH });
+  doc.image(img, imgX, doc.y, { width: targetW });
   doc.y += targetH + 10;
   doc.x = ctx.contentX;
 }
@@ -355,23 +355,21 @@ function renderNodes(doc: any, nodes: any[], ctx: RenderCtx) {
   for (const node of nodes || []) {
     if (node.type !== 'tag') continue;
     switch (node.name) {
-      case 'h1': renderHeading(doc, node, ctx, 17); break;
+      case 'h1': renderHeading(doc, node, ctx, 17);   break;
       case 'h2': renderHeading(doc, node, ctx, 14.5); break;
       case 'h3': renderHeading(doc, node, ctx, 12.5); break;
-      case 'p': renderParagraph(doc, node, ctx); break;
+      case 'p':  renderParagraph(doc, node, ctx);     break;
       case 'blockquote': renderBlockquote(doc, node, ctx); break;
       case 'ul': renderList(doc, node.children, ctx, false, 0); break;
-      case 'ol': renderList(doc, node.children, ctx, true, 0); break;
+      case 'ol': renderList(doc, node.children, ctx, true,  0); break;
       case 'table': renderTable(doc, node, ctx); break;
-      case 'img': renderImage(doc, node, ctx); break;
+      case 'img':   renderImage(doc, node, ctx); break;
       default: renderNodes(doc, node.children, ctx);
     }
   }
 }
 
-// ── Images: collected and pre-fetched once before the synchronous
-// PDFKit drawing pass starts (PDFKit's drawing calls aren't safe to
-// interleave with async work) ───────────────────────────────────
+// ── Image pre-fetching ────────────────────────────────────────────────────
 function collectImageSrcs(nodes: any[], acc: string[] = []): string[] {
   for (const node of nodes || []) {
     if (node.type !== 'tag') continue;
@@ -384,186 +382,214 @@ function fetchBuffer(url: string): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const lib = url.startsWith('https') ? https : http;
     const req = lib.get(url, { timeout: 8000 }, (res) => {
-      if (res.statusCode && res.statusCode >= 400) { reject(new Error(`HTTP ${res.statusCode}`)); return; }
+      if (res.statusCode && res.statusCode >= 400) {
+        reject(new Error(`HTTP ${res.statusCode}`)); return;
+      }
       const chunks: Buffer[] = [];
       res.on('data', (c) => chunks.push(c));
-      res.on('end', () => resolve(Buffer.concat(chunks)));
+      res.on('end',  () => resolve(Buffer.concat(chunks)));
     });
-    req.on('error', reject);
+    req.on('error',   reject);
     req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
   });
 }
 async function loadImageBuffer(src: string, uploadDir: string): Promise<Buffer | null> {
-  // Article images are always our own /uploads/current-affairs/... files
-  // (the editor only ever inserts via the upload-image endpoint) — read
-  // straight off disk rather than round-tripping through HTTP to ourselves.
-  // The network fetch is just a defensive fallback.
   try {
     const idx = src.indexOf('/uploads/');
     if (idx !== -1) {
-      const relative = src.substring(idx + '/uploads/'.length);
-      const localPath = join(uploadDir, relative);
-      if (fs.existsSync(localPath)) return fs.readFileSync(localPath);
+      const rel  = src.substring(idx + '/uploads/'.length);
+      const path = join(uploadDir, rel);
+      if (fs.existsSync(path)) return fs.readFileSync(path);
     }
-  } catch (_) { /* fall through to network fetch */ }
+  } catch (_) {}
   return fetchBuffer(src).catch(() => null);
 }
 
-// ── Page chrome — drawn in a post-process pass over every already-
-// rendered page (bufferPages: true), not interleaved with content
-// drawing, which keeps PDFKit's internal text-flow state safe ───
-function drawWatermark(doc: any, logoBuffer?: Buffer) {
+// ── Logo cache ────────────────────────────────────────────────────────────
+const LOGO_PATHS = [
+  join(process.cwd(), 'src',     'assets', 'logo.png'),
+  join(process.cwd(), 'src',     'assets', 'logo.jpg'),
+  join(process.cwd(), 'uploads', 'logo.png'),
+  join(process.cwd(), 'uploads', 'logo.jpg'),
+];
+let _logo: Buffer | null | undefined;
+function loadLogo(): Buffer | null {
+  if (_logo !== undefined) return _logo;
+  for (const p of LOGO_PATHS) {
+    try { if (fs.existsSync(p)) { _logo = fs.readFileSync(p); return _logo; } }
+    catch (_) {}
+  }
+  _logo = null;
+  return null;
+}
+
+// ── Page chrome ───────────────────────────────────────────────────────────
+function drawWatermark(doc: any, logo?: Buffer) {
   const { width, height } = doc.page;
   doc.save();
-
-  if (logoBuffer) {
-    // Single centered logo image — matches study materials watermark style.
-    // Drawn at ~35% of page width, centered both axes, low opacity so it
-    // sits behind content without obscuring it.
+  doc.fillOpacity(0.06);
+  if (logo) {
     try {
-      const img = doc.openImage(logoBuffer);
-      const maxW = width * 0.35;
-      const maxH = height * 0.35;
-      const scale = Math.min(maxW / img.width, maxH / img.height);
-      const iw = img.width * scale;
-      const ih = img.height * scale;
-      const ix = (width - iw) / 2;
-      const iy = (height - ih) / 2;
-      doc.fillOpacity(0.07).image(img, ix, iy, { width: iw, height: ih });
+      const img  = doc.openImage(logo);
+      const maxW = width * 0.32;
+      const maxH = height * 0.32;
+      const sc   = Math.min(maxW / img.width, maxH / img.height);
+      const iw   = img.width  * sc;
+      const ih   = img.height * sc;
+      doc.image(img, (width - iw) / 2, (height - ih) / 2, { width: iw, height: ih });
     } catch (_) {
-      // Image failed to open (corrupt / unsupported format) — fall through
-      // to the text fallback below rather than crashing the whole PDF.
-      doc.fillColor(BRAND).fillOpacity(0.07);
-      doc.font('Helvetica-Bold').fontSize(28)
+      // corrupt / unsupported — fall through to text
+      doc.fillColor(BRAND).font('Helvetica-Bold').fontSize(28)
         .text('BPSCNotes', 0, height / 2 - 20, { width, align: 'center' });
     }
   } else {
-    // No logo file available — single centered text instead of the old
-    // tiled diagonal repeat (which looked cluttered).
-    doc.fillColor(BRAND).fillOpacity(0.07);
-    doc.font('Helvetica-Bold').fontSize(28)
+    doc.fillColor(BRAND).font('Helvetica-Bold').fontSize(28)
       .text('BPSCNotes', 0, height / 2 - 20, { width, align: 'center' });
     doc.fontSize(11)
       .text('www.bpscnotes.in', 0, height / 2 + 18, { width, align: 'center' });
   }
-
   doc.restore();
 }
+
 function drawFooter(doc: any, pageNum: number, totalPages: number) {
   const { width, height, margins } = doc.page;
   doc.save();
   doc.fillOpacity(1).fillColor(MUTED).font('Helvetica').fontSize(8);
-  doc.text(`BPSC Notes  ·  Page ${pageNum} of ${totalPages}`, margins.left, height - margins.bottom + 16, {
-    width: width - margins.left - margins.right,
-    align: 'center',
-  });
+  doc.text(
+    `BPSC Notes  ·  bpscnotes.in  ·  Page ${pageNum} of ${totalPages}`,
+    margins.left, height - margins.bottom + 14,
+    { width: width - margins.left - margins.right, align: 'center' }
+  );
   doc.restore();
 }
+
+// ── Article header ────────────────────────────────────────────────────────
+// Layout (top → bottom):
+//   [■ CATEGORY]                     category chip with brand bg
+//   Article Headline Title           bold, INK, large
+//   DD Month YYYY  ·  Source: ...    small, muted
+//   Summary lead paragraph           italic, muted (if present)
+//   ────────────────────────────────  divider
 function drawHeader(doc: any, data: ArticlePdfData, contentWidth: number) {
-  doc.fillColor(BRAND).font('Helvetica-Bold').fontSize(10)
-    .text((data.category || '').toUpperCase(), PAGE_MARGIN, doc.y, { width: contentWidth });
-  doc.moveDown(0.3);
+  const x = PAGE_MARGIN;
+
+  // Category chip
+  const cat = (data.category || 'General').toUpperCase();
+  const catW = doc.widthOfString(cat, { font: 'Helvetica-Bold', size: 8 }) + 16;
+  doc.save()
+    .fillColor(ACCENT)
+    .roundedRect(x, doc.y, catW, 16, 3)
+    .fill()
+    .restore();
+  doc.font('Helvetica-Bold').fontSize(8).fillColor('#FFFFFF')
+    .text(cat, x + 8, doc.y + 4, { width: catW, lineBreak: false });
+  doc.y += 22;
+  doc.x = x;
+
+  // Title
   doc.fillColor(INK).font('Helvetica-Bold').fontSize(20)
-    .text(data.title, PAGE_MARGIN, doc.y, { width: contentWidth });
-  doc.moveDown(0.3);
+    .text(data.title, x, doc.y, { width: contentWidth });
+  doc.moveDown(0.4);
+
+  // Date + source meta line
   let dateStr = data.date;
-  try { dateStr = new Date(data.date).toLocaleDateString('en-IN', { day: 'numeric', month: 'long', year: 'numeric' }); } catch (_) {}
+  try {
+    dateStr = new Date(data.date).toLocaleDateString('en-IN', {
+      day: 'numeric', month: 'long', year: 'numeric',
+    });
+  } catch (_) {}
+  const meta = `${dateStr}${data.source ? '   ·   Source: ' + data.source : ''}`;
   doc.fillColor(MUTED).font('Helvetica').fontSize(9.5)
-    .text(`${dateStr}${data.source ? '   ·   Source: ' + data.source : ''}`, PAGE_MARGIN, doc.y, { width: contentWidth });
+    .text(meta, x, doc.y, { width: contentWidth });
   doc.moveDown(0.6);
-  doc.moveTo(PAGE_MARGIN, doc.y).lineTo(PAGE_MARGIN + contentWidth, doc.y).strokeColor(BORDER).lineWidth(1).stroke();
-  doc.moveDown(0.8);
-  doc.x = PAGE_MARGIN;
+
+  // Summary — rendered with inline-HTML support so any bold/colour the
+  // admin applied in the TipTap summary field also appears in the PDF.
+  if (data.summary && stripHtmlForPdf(data.summary).trim()) {
+    const summaryDom = parseDocument(data.summary);
+    const summaryRuns = trimRuns(flattenRuns(summaryDom.children as any[], { italic: true, color: MUTED }));
+    if (summaryRuns.length) {
+      emitRuns(doc, summaryRuns, BODY_SIZE, x, contentWidth);
+      doc.moveDown(0.6);
+    }
+  }
+
+  // Divider
+  doc.moveTo(x, doc.y).lineTo(x + contentWidth, doc.y)
+    .strokeColor(BORDER).lineWidth(1).stroke();
+  doc.moveDown(0.9);
+  doc.x = x;
 }
+
 function drawTagsFooter(doc: any, data: ArticlePdfData, contentWidth: number) {
   if (!data.tags?.length) return;
-  doc.moveDown(0.6);
-  doc.moveTo(PAGE_MARGIN, doc.y).lineTo(PAGE_MARGIN + contentWidth, doc.y).strokeColor(BORDER).lineWidth(0.5).stroke();
-  doc.moveDown(0.4);
+  doc.moveDown(0.7);
+  doc.moveTo(PAGE_MARGIN, doc.y)
+    .lineTo(PAGE_MARGIN + contentWidth, doc.y)
+    .strokeColor(BORDER).lineWidth(0.5).stroke();
+  doc.moveDown(0.45);
   doc.fillColor(BRAND).font('Helvetica').fontSize(9)
-    .text(data.tags.map(t => `#${t}`).join('   '), PAGE_MARGIN, doc.y, { width: contentWidth });
+    .text(data.tags.map(t => `#${t}`).join('   '), PAGE_MARGIN, doc.y, {
+      width: contentWidth,
+    });
 }
 
-// ── Simple HTML tag stripper for plain-text fields (title, source)
-// The admin panel now saves Headline as inline-rich HTML — PDFKit draws
-// raw strings, so we must strip before passing to the header renderer.
-function stripHtmlForPdf(html: string): string {
-  return (html || '')
-    .replace(/<[^>]+>/g, '')
-    .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
-    .replace(/&nbsp;/g, ' ').replace(/&quot;/g, '"').replace(/&#39;/g, "'")
-    .replace(/\s+/g, ' ').trim();
-}
+// ── Public entry point ────────────────────────────────────────────────────
+export async function streamArticlePdf(
+  res: Response,
+  data: ArticlePdfData,
+  uploadDir: string,
+): Promise<void> {
+  // Title/source are inline-HTML from TipTap — strip for plain-text PDFKit fields
+  const plainTitle  = stripHtmlForPdf(data.title);
+  const plainSource = data.source ? stripHtmlForPdf(data.source) : undefined;
 
-// Logo look-up order: uploaded file at predictable path (works in Docker
-// since uploads/ is a mounted volume), then src/assets/ (dev), then none.
-const LOGO_SEARCH_PATHS = [
-  join(process.cwd(), 'uploads', 'logo.png'),
-  join(process.cwd(), 'uploads', 'logo.jpg'),
-  join(process.cwd(), 'src', 'assets', 'logo.png'),
-  join(process.cwd(), 'src', 'assets', 'logo.jpg'),
-];
-let _logoBuf: Buffer | null | undefined; // undefined = not yet checked
-function loadLogoCached(): Buffer | null {
-  if (_logoBuf !== undefined) return _logoBuf;
-  for (const p of LOGO_SEARCH_PATHS) {
-    try { if (fs.existsSync(p)) { _logoBuf = fs.readFileSync(p); return _logoBuf; } }
-    catch (_) {}
-  }
-  _logoBuf = null;
-  return null;
-}
-
-/**
- * Streams a watermarked PDF of a Current Affairs article directly to the
- * HTTP response. Generated fresh on every call (no disk caching) — typical
- * article length + locally-stored images keeps this fast enough that
- * caching isn't worth the staleness/invalidation complexity.
- */
-export async function streamArticlePdf(res: Response, data: ArticlePdfData, uploadDir: string): Promise<void> {
-  // Strip HTML from title — the admin panel saves it as inline-rich HTML
-  // (TipTap inline marks), but PDFKit renders raw strings, not HTML.
-  const plainTitle = stripHtmlForPdf(data.title);
-
-  // Collapse consecutive empty <p></p> blocks — TipTap's default empty
-  // state adds trailing empty paragraphs that manifested as blank PDF pages.
-  const stripped = (data.fullContentHtml || '')
+  // Clean up trailing TipTap empty paragraphs
+  const raw = (data.fullContentHtml || '')
     .replace(/(<p>\s*<\/p>\s*){2,}/gi, '<p></p>')
-    .replace(/(<p>\s*<\/p>\s*)+$/gi, '');
+    .replace(/(<p>\s*<\/p>\s*)+$/gi,   '');
 
-  // If the stored content has no HTML tags (article created with the old
-  // plain-textarea editor), wrap each line in <p> so renderNodes sees it
-  // as actual paragraphs rather than bare text nodes it would skip.
-  const hasHtmlTags = /<[a-z][\s\S]*?>/i.test(stripped);
-  const cleanedHtml = hasHtmlTags
-    ? stripped
-    : stripped.split(/\n+/).filter(l => l.trim()).map(l => `<p>${l}</p>`).join('');
+  // Wrap plain-text articles (created before TipTap was added) in <p> tags
+  const hasHtml   = /<[a-z][\s\S]*?>/i.test(raw);
+  const cleanHtml = hasHtml
+    ? raw
+    : raw.split(/\n+/).filter(l => l.trim()).map(l => `<p>${l}</p>`).join('');
 
-  const dom = parseDocument(cleanedHtml);
-  const imageSrcs = collectImageSrcs(dom.children);
-  const imageMap = new Map<string, Buffer>();
+  const dom       = parseDocument(cleanHtml);
+  const imageSrcs = collectImageSrcs(dom.children as any[]);
+  const imageMap  = new Map<string, Buffer>();
   await Promise.all(imageSrcs.map(async (src) => {
     const buf = await loadImageBuffer(src, uploadDir);
     if (buf) imageMap.set(src, buf);
   }));
 
-  const logoBuffer = loadLogoCached() ?? undefined;
+  const logo = loadLogo() ?? undefined;
 
-  const doc = new PDFDocument({ size: 'A4', margin: PAGE_MARGIN, bufferPages: true });
-  const contentWidth = doc.page.width - PAGE_MARGIN * 2;
+  const doc = new PDFDocument({
+    size:         'A4',
+    margin:       PAGE_MARGIN,
+    bufferPages:  true,
+    info: {
+      Title:   plainTitle,
+      Author:  'BPSCNotes',
+      Subject: data.category || 'Current Affairs',
+    },
+  });
+  const cw = doc.page.width - PAGE_MARGIN * 2;
 
   res.setHeader('Content-Type', 'application/pdf');
   res.setHeader('Content-Disposition', `attachment; filename="${safeFileName(plainTitle)}.pdf"`);
   doc.pipe(res);
 
-  drawHeader(doc, { ...data, title: plainTitle }, contentWidth);
-  renderNodes(doc, dom.children, { contentX: PAGE_MARGIN, contentWidth, imageMap });
-  drawTagsFooter(doc, data, contentWidth);
+  drawHeader(doc, { ...data, title: plainTitle, source: plainSource }, cw);
+  renderNodes(doc, dom.children as any[], { contentX: PAGE_MARGIN, contentWidth: cw, imageMap });
+  drawTagsFooter(doc, data, cw);
 
+  // Post-process: watermark + page numbers on every buffered page
   const range = doc.bufferedPageRange();
   for (let i = range.start; i < range.start + range.count; i++) {
     doc.switchToPage(i);
-    drawWatermark(doc, logoBuffer);
+    drawWatermark(doc, logo);
     drawFooter(doc, i - range.start + 1, range.count);
   }
 
