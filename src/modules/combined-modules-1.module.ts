@@ -493,10 +493,6 @@ class CurrentAffairsService {
     return result;
   }
 
-  // Per-article override sits alongside the global config (product decision:
-  // keep both). Not cached — this is only called once per quiz start /
-  // submit, and per-article caching would need invalidation plumbing that
-  // isn't worth it for a call this infrequent.
   async getEffectiveMcqMarkingConfig(affairId: string) {
     const rows = await this.db.query(
       `SELECT mcq_negative_marking_override, mcq_marks_per_correct_override, mcq_marks_per_wrong_override
@@ -513,8 +509,26 @@ class CurrentAffairsService {
       };
       return successResponse({ config });
     }
-    const global = await this.getMcqMarkingConfig();
-    return successResponse({ config: { ...global.data.config, isOverride: false } });
+    // Inline the global config lookup rather than calling getMcqMarkingConfig()
+    // and accessing .data — TypeScript can't infer the return shape of an
+    // async method through a generic wrapper without an explicit return type,
+    // so the .data access would be typed as `unknown`.
+    const cacheKey = 'ca_mcq:marking_config';
+    const cached = await this.cache.get<any>(cacheKey);
+    const globalConfig = cached?.data?.config ?? await (async () => {
+      const settingRows = await this.db.query(
+        `SELECT key, value FROM app_settings WHERE key = ANY($1)`,
+        [CurrentAffairsService.MCQ_CONFIG_KEYS]
+      ).catch(() => []);
+      const map: Record<string, string> = {};
+      for (const r of settingRows) map[r.key] = r.value;
+      return {
+        negativeMarkingEnabled: map['ca_mcq_negative_marking_enabled'] === 'true',
+        marksPerCorrect:        parseFloat(map['ca_mcq_marks_per_correct']) || 1,
+        marksPerWrong:           parseFloat(map['ca_mcq_marks_per_wrong'])   || 0,
+      };
+    })();
+    return successResponse({ config: { ...globalConfig, isOverride: false } });
   }
 
   async updateMcqMarkingConfig(data: any, adminId: string) {
