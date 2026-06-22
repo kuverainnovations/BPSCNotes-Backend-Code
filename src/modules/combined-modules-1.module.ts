@@ -66,6 +66,24 @@ function sanitizeCaContent(html: string | undefined | null): string {
   return sanitizeHtml(html, CA_SANITIZE_OPTIONS);
 }
 
+// Headline/Summary only ever load inline-mark TipTap extensions (bold,
+// color, highlight, link — no headings/lists/images/tables), but the
+// server shouldn't trust that client-side restriction alone — anyone
+// hitting the API directly could post arbitrary HTML. Strip down to the
+// same inline-only allowlist server-side too.
+const CA_SANITIZE_OPTIONS_INLINE = {
+  allowedTags: ['strong', 'em', 'u', 's', 'span', 'a', 'mark'],
+  allowedAttributes: CA_SANITIZE_OPTIONS.allowedAttributes,
+  allowedStyles: CA_SANITIZE_OPTIONS.allowedStyles,
+  allowedSchemes: CA_SANITIZE_OPTIONS.allowedSchemes,
+  transformTags: CA_SANITIZE_OPTIONS.transformTags,
+};
+
+function sanitizeCaInline(html: string | undefined | null): string {
+  if (!html) return '';
+  return sanitizeHtml(html, CA_SANITIZE_OPTIONS_INLINE);
+}
+
 // ════════════════════════════════════════════════════════════
 // CURRENT AFFAIRS MODULE
 // ════════════════════════════════════════════════════════════
@@ -166,6 +184,7 @@ class CurrentAffairsService {
         `SELECT ca.id, ca.title, ca.summary, ca.full_content, ca.category,
                 ca.date, ca.is_important, ca.exam_tags, ca.tags, ca.status,
                 ca.view_count, ca.bookmark_count, ca.created_at, ca.read_time,
+                ca.mcq_negative_marking_override, ca.mcq_marks_per_correct_override, ca.mcq_marks_per_wrong_override,
                 (SELECT COUNT(*) FROM ca_mcqs m WHERE m.affair_id=ca.id)::int AS mcq_count
          FROM current_affairs ca
          WHERE ${where}
@@ -188,7 +207,7 @@ class CurrentAffairsService {
     const result = await this.db.query(
       `INSERT INTO current_affairs (title, summary, full_content, category, source, date, is_important, exam_tags, tags, status, author, read_time, created_by)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *`,
-      [data.title, data.summary, sanitizeCaContent(data.fullContent), data.category, data.source, data.date||new Date().toISOString().split('T')[0], data.isImportant||false, mergedTags, data.tags||[], data.status||'draft', data.author, data.readTime||1, adminId]
+      [sanitizeCaInline(data.title), sanitizeCaInline(data.summary), sanitizeCaContent(data.fullContent), data.category, data.source, data.date||new Date().toISOString().split('T')[0], data.isImportant||false, mergedTags, data.tags||[], data.status||'draft', data.author, data.readTime||1, adminId]
     );
     return successResponse({ affair: result[0] }, 'Article created — live in app ✅');
   }
@@ -199,8 +218,24 @@ class CurrentAffairsService {
     const map: any = { title:'title', summary:'summary', fullContent:'full_content', category:'category', source:'source', date:'date', isImportant:'is_important', status:'status', readTime:'read_time' };
     for (const [key, col] of Object.entries(map)) {
       if (data[key] !== undefined) {
-        const val = key === 'fullContent' ? sanitizeCaContent(data[key]) : data[key];
+        const val = key === 'fullContent' ? sanitizeCaContent(data[key])
+          : (key === 'title' || key === 'summary') ? sanitizeCaInline(data[key])
+          : data[key];
         fields.push(`${col}=$${i++}`); vals.push(val);
+      }
+    }
+    // Per-article MCQ marking override — sits alongside the global config.
+    // `mcqNegativeMarkingOverride === null` is the explicit "clear the
+    // override, inherit global again" signal (distinct from `undefined`,
+    // which means "this field wasn't part of the request at all").
+    if (data.mcqNegativeMarkingOverride !== undefined) {
+      fields.push(`mcq_negative_marking_override=$${i++}`); vals.push(data.mcqNegativeMarkingOverride);
+      if (data.mcqNegativeMarkingOverride === null) {
+        fields.push(`mcq_marks_per_correct_override=NULL`);
+        fields.push(`mcq_marks_per_wrong_override=NULL`);
+      } else {
+        fields.push(`mcq_marks_per_correct_override=$${i++}`); vals.push(Number(data.mcqMarksPerCorrectOverride) || 1);
+        fields.push(`mcq_marks_per_wrong_override=$${i++}`);   vals.push(Number(data.mcqMarksPerWrongOverride) || 0);
       }
     }
     // Merge type into exam_tags so it persists
@@ -246,7 +281,8 @@ class CurrentAffairsService {
       `SELECT * FROM ca_mcqs WHERE affair_id=$1 ORDER BY created_at ASC`,
       [affairId]
     );
-    return successResponse({ mcqs: rows });
+    const markingConfig = (await this.getEffectiveMcqMarkingConfig(affairId)).data.config;
+    return successResponse({ mcqs: rows, markingConfig });
   }
 
   // Persists a CA MCQ practice result so the article list/detail can show
@@ -264,9 +300,7 @@ class CurrentAffairsService {
     );
     if (!mcqs.length) throw new NotFoundException('No questions found for this article');
 
-   // const cfg = (await this.getMcqMarkingConfig()).data.config;
-    
-    const cfg = ((await this.getMcqMarkingConfig()) as any).data.config;
+    const cfg = (await this.getEffectiveMcqMarkingConfig(affairId)).data.config;
     const negEnabled       = cfg.negativeMarkingEnabled === true;
     const marksPerCorrect  = +cfg.marksPerCorrect || 1;
     const marksPerWrong    = +cfg.marksPerWrong   || 0;
@@ -457,6 +491,30 @@ class CurrentAffairsService {
     const result = successResponse({ config });
     await this.cache.set(cacheKey, result, 300);
     return result;
+  }
+
+  // Per-article override sits alongside the global config (product decision:
+  // keep both). Not cached — this is only called once per quiz start /
+  // submit, and per-article caching would need invalidation plumbing that
+  // isn't worth it for a call this infrequent.
+  async getEffectiveMcqMarkingConfig(affairId: string) {
+    const rows = await this.db.query(
+      `SELECT mcq_negative_marking_override, mcq_marks_per_correct_override, mcq_marks_per_wrong_override
+       FROM current_affairs WHERE id=$1`,
+      [affairId]
+    );
+    const row = rows[0];
+    if (row && row.mcq_negative_marking_override !== null) {
+      const config = {
+        negativeMarkingEnabled: row.mcq_negative_marking_override === true,
+        marksPerCorrect:        parseFloat(row.mcq_marks_per_correct_override) || 1,
+        marksPerWrong:           parseFloat(row.mcq_marks_per_wrong_override)   || 0,
+        isOverride: true,
+      };
+      return successResponse({ config });
+    }
+    const global = await this.getMcqMarkingConfig();
+    return successResponse({ config: { ...global.data.config, isOverride: false } });
   }
 
   async updateMcqMarkingConfig(data: any, adminId: string) {
