@@ -164,6 +164,10 @@ function emitParagraphRuns(doc: any, runs: Run[], fontSize: number, x: number, w
 }
 
 function ensureSpace(doc: any, neededHeight: number) {
+  const topOfContent = doc.page.margins.top;
+  // If we're already near the top of a fresh page, adding another page
+  // would immediately produce a blank one — skip in that case.
+  if (doc.y < topOfContent + 120) return;
   if (doc.y + neededHeight > doc.page.height - doc.page.margins.bottom) doc.addPage();
 }
 
@@ -177,7 +181,7 @@ function renderHeading(doc: any, el: any, ctx: RenderCtx, size: number) {
 
 function renderParagraph(doc: any, el: any, ctx: RenderCtx) {
   const runs = trimRuns(flattenRuns(el.children, {}));
-  if (!runs.length) { doc.moveDown(0.3); return; }
+  if (!runs.length) return; // skip empty <p> entirely — no moveDown accumulation
   emitParagraphRuns(doc, runs, 11, ctx.contentX, ctx.contentWidth);
   doc.moveDown(0.45);
 }
@@ -364,15 +368,41 @@ async function loadImageBuffer(src: string, uploadDir: string): Promise<Buffer |
 // ── Page chrome — drawn in a post-process pass over every already-
 // rendered page (bufferPages: true), not interleaved with content
 // drawing, which keeps PDFKit's internal text-flow state safe ───
-function drawWatermark(doc: any) {
+function drawWatermark(doc: any, logoBuffer?: Buffer) {
   const { width, height } = doc.page;
   doc.save();
-  doc.fillColor(BRAND).fillOpacity(0.06);
-  doc.rotate(-35, { origin: [width / 2, height / 2] });
-  doc.font('Helvetica-Bold').fontSize(20);
-  for (let y = -height; y < height * 2; y += 110) {
-    doc.text('BPSC Notes   ·   www.bpscnotes.in', -width, y, { width: width * 3, align: 'center' });
+
+  if (logoBuffer) {
+    // Single centered logo image — matches study materials watermark style.
+    // Drawn at ~35% of page width, centered both axes, low opacity so it
+    // sits behind content without obscuring it.
+    try {
+      const img = doc.openImage(logoBuffer);
+      const maxW = width * 0.35;
+      const maxH = height * 0.35;
+      const scale = Math.min(maxW / img.width, maxH / img.height);
+      const iw = img.width * scale;
+      const ih = img.height * scale;
+      const ix = (width - iw) / 2;
+      const iy = (height - ih) / 2;
+      doc.fillOpacity(0.07).image(img, ix, iy, { width: iw, height: ih });
+    } catch (_) {
+      // Image failed to open (corrupt / unsupported format) — fall through
+      // to the text fallback below rather than crashing the whole PDF.
+      doc.fillColor(BRAND).fillOpacity(0.07);
+      doc.font('Helvetica-Bold').fontSize(28)
+        .text('BPSCNotes', 0, height / 2 - 20, { width, align: 'center' });
+    }
+  } else {
+    // No logo file available — single centered text instead of the old
+    // tiled diagonal repeat (which looked cluttered).
+    doc.fillColor(BRAND).fillOpacity(0.07);
+    doc.font('Helvetica-Bold').fontSize(28)
+      .text('BPSCNotes', 0, height / 2 - 20, { width, align: 'center' });
+    doc.fontSize(11)
+      .text('www.bpscnotes.in', 0, height / 2 + 18, { width, align: 'center' });
   }
+
   doc.restore();
 }
 function drawFooter(doc: any, pageNum: number, totalPages: number) {
@@ -410,6 +440,36 @@ function drawTagsFooter(doc: any, data: ArticlePdfData, contentWidth: number) {
     .text(data.tags.map(t => `#${t}`).join('   '), PAGE_MARGIN, doc.y, { width: contentWidth });
 }
 
+// ── Simple HTML tag stripper for plain-text fields (title, source)
+// The admin panel now saves Headline as inline-rich HTML — PDFKit draws
+// raw strings, so we must strip before passing to the header renderer.
+function stripHtmlForPdf(html: string): string {
+  return (html || '')
+    .replace(/<[^>]+>/g, '')
+    .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+    .replace(/&nbsp;/g, ' ').replace(/&quot;/g, '"').replace(/&#39;/g, "'")
+    .replace(/\s+/g, ' ').trim();
+}
+
+// Logo look-up order: uploaded file at predictable path (works in Docker
+// since uploads/ is a mounted volume), then src/assets/ (dev), then none.
+const LOGO_SEARCH_PATHS = [
+  join(process.cwd(), 'uploads', 'logo.png'),
+  join(process.cwd(), 'uploads', 'logo.jpg'),
+  join(process.cwd(), 'src', 'assets', 'logo.png'),
+  join(process.cwd(), 'src', 'assets', 'logo.jpg'),
+];
+let _logoBuf: Buffer | null | undefined; // undefined = not yet checked
+function loadLogoCached(): Buffer | null {
+  if (_logoBuf !== undefined) return _logoBuf;
+  for (const p of LOGO_SEARCH_PATHS) {
+    try { if (fs.existsSync(p)) { _logoBuf = fs.readFileSync(p); return _logoBuf; } }
+    catch (_) {}
+  }
+  _logoBuf = null;
+  return null;
+}
+
 /**
  * Streams a watermarked PDF of a Current Affairs article directly to the
  * HTTP response. Generated fresh on every call (no disk caching) — typical
@@ -417,7 +477,17 @@ function drawTagsFooter(doc: any, data: ArticlePdfData, contentWidth: number) {
  * caching isn't worth the staleness/invalidation complexity.
  */
 export async function streamArticlePdf(res: Response, data: ArticlePdfData, uploadDir: string): Promise<void> {
-  const dom = parseDocument(data.fullContentHtml || '');
+  // Strip HTML from title — the admin panel saves it as inline-rich HTML
+  // (TipTap inline marks), but PDFKit renders raw strings, not HTML.
+  const plainTitle = stripHtmlForPdf(data.title);
+
+  // Collapse consecutive empty <p></p> blocks — TipTap's default empty
+  // state adds trailing empty paragraphs that manifested as blank PDF pages.
+  const cleanedHtml = (data.fullContentHtml || '')
+    .replace(/(<p>\s*<\/p>\s*){2,}/gi, '<p></p>') // deduplicate runs of empties
+    .replace(/(<p>\s*<\/p>\s*)+$/gi, '');           // strip trailing empties entirely
+
+  const dom = parseDocument(cleanedHtml);
   const imageSrcs = collectImageSrcs(dom.children);
   const imageMap = new Map<string, Buffer>();
   await Promise.all(imageSrcs.map(async (src) => {
@@ -425,21 +495,23 @@ export async function streamArticlePdf(res: Response, data: ArticlePdfData, uplo
     if (buf) imageMap.set(src, buf);
   }));
 
+  const logoBuffer = loadLogoCached() ?? undefined;
+
   const doc = new PDFDocument({ size: 'A4', margin: PAGE_MARGIN, bufferPages: true });
   const contentWidth = doc.page.width - PAGE_MARGIN * 2;
 
   res.setHeader('Content-Type', 'application/pdf');
-  res.setHeader('Content-Disposition', `attachment; filename="${safeFileName(data.title)}.pdf"`);
+  res.setHeader('Content-Disposition', `attachment; filename="${safeFileName(plainTitle)}.pdf"`);
   doc.pipe(res);
 
-  drawHeader(doc, data, contentWidth);
+  drawHeader(doc, { ...data, title: plainTitle }, contentWidth);
   renderNodes(doc, dom.children, { contentX: PAGE_MARGIN, contentWidth, imageMap });
   drawTagsFooter(doc, data, contentWidth);
 
   const range = doc.bufferedPageRange();
   for (let i = range.start; i < range.start + range.count; i++) {
     doc.switchToPage(i);
-    drawWatermark(doc);
+    drawWatermark(doc, logoBuffer);
     drawFooter(doc, i - range.start + 1, range.count);
   }
 
