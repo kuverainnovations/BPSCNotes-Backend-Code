@@ -47,8 +47,8 @@ const CA_SANITIZE_OPTIONS = {
   },
   allowedStyles: {
     '*': {
-      color: [/^#[0-9a-fA-F]{3,6}$/, /^rgb\(/],
-      'background-color': [/^#[0-9a-fA-F]{3,6}$/, /^rgb\(/],
+      color: [/^#[0-9a-fA-F]{3,8}$/, /^rgba?\(/],
+      'background-color': [/^#[0-9a-fA-F]{3,8}$/, /^rgba?\(/],
       'text-align': [/^left$|^center$|^right$/],
       width: [/^\d+(%|px)$/],
       display: [/^block$|^inline-block$/],

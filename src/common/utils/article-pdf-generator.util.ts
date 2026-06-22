@@ -56,15 +56,37 @@ function fontFor(style: Style): string {
   if (style.italic) return 'Helvetica-Oblique';
   return 'Helvetica';
 }
+
+// Extract CSS `color` value from an inline style string.
+// Handles both #hex and rgb()/rgba() formats — TipTap's Color extension
+// typically outputs hex, but rgba() can appear when colors are applied
+// programmatically or pasted from other sources.
 function extractStyleColor(styleAttr?: string): string | undefined {
   if (!styleAttr) return undefined;
-  const m = /(?:^|;)\s*color\s*:\s*(#[0-9a-fA-F]{3,6}|rgb\([^)]+\))/.exec(styleAttr);
-  return m ? m[1] : undefined;
+  const m = /(?:^|;)\s*color\s*:\s*(#[0-9a-fA-F]{3,8}|rgba?\([^)]+\))/.exec(styleAttr);
+  return m ? m[1].trim() : undefined;
 }
+
+// Extract CSS `background-color` value — same format handling.
 function extractBgColor(styleAttr?: string): string | undefined {
   if (!styleAttr) return undefined;
-  const m = /background-color\s*:\s*(#[0-9a-fA-F]{3,6}|rgb\([^)]+\))/.exec(styleAttr);
-  return m ? m[1] : undefined;
+  const m = /background-color\s*:\s*(#[0-9a-fA-F]{3,8}|rgba?\([^)]+\))/.exec(styleAttr);
+  return m ? m[1].trim() : undefined;
+}
+
+// Convert any CSS color string to a format PDFKit definitively accepts.
+// PDFKit's own color parser handles hex fine, but rgb()/rgba() support
+// varies by version. Passing [r, g, b] as an array is always safe.
+function toPdfColor(colorStr: string | undefined): string | number[] {
+  if (!colorStr) return INK;
+  const s = colorStr.trim();
+  // Hex — PDFKit handles these natively
+  if (s.startsWith('#')) return s;
+  // rgb() or rgba() → [r, g, b] array (PDFKit always accepts this form)
+  const m = /rgba?\((\d+(?:\.\d+)?),\s*(\d+(?:\.\d+)?),\s*(\d+(?:\.\d+)?)/.exec(s);
+  if (m) return [Math.round(+m[1]), Math.round(+m[2]), Math.round(+m[3])];
+  // Named colors (red, blue, …) — PDFKit knows CSS named colors
+  return s;
 }
 function extractWidthPct(styleAttr?: string): number | undefined {
   if (!styleAttr) return undefined;
@@ -137,29 +159,51 @@ function trimRuns(runs: Run[]): Run[] {
 }
 
 // Emits a chain of mixed-style runs as one flowing paragraph via PDFKit's
-// `continued` text mode, so bold/italic/underline/links/highlights can all
-// sit inline within the same wrapped paragraph.
+// `continued` text mode so bold/italic/color/highlight can sit inline.
+//
+// Key implementation decisions:
+//  - First run uses explicit (x, y) coordinates — relying purely on doc.x
+//    after `doc.x = x` works in most versions but can desync after font
+//    or color changes in some PDFKit builds. Explicit coords on run[0]
+//    anchor the paragraph to the right position.
+//  - toPdfColor() converts any CSS color format (hex, rgb, rgba) to the
+//    [r,g,b] array form PDFKit always accepts, avoiding silent misparse.
+//  - fillOpacity(1) is explicitly restored before text after highlight draw
+//    so opacity changes from the background rect never bleed into the text.
 function emitParagraphRuns(doc: any, runs: Run[], fontSize: number, x: number, width: number) {
   if (!runs.length) return;
-  doc.x = x;
+  const startY = doc.y;
   runs.forEach((run, i) => {
     const isLast = i === runs.length - 1;
+    // ── Highlight background ──────────────────────────────────
     if (run.style.highlight && run.text.trim()) {
-      // Approximation: only accurate for runs that don't wrap mid-highlight,
-      // which covers the vast majority of real highlighted phrases.
-      const w = doc.widthOfString(run.text, { font: fontFor(run.style), size: fontSize });
-      doc.save().fillColor(run.style.highlight).fillOpacity(0.9)
-        .rect(doc.x, doc.y + 1, w, fontSize * 1.2).fill();
-      doc.restore();
+      const tw = doc.widthOfString(run.text, { font: fontFor(run.style), size: fontSize });
+      doc.save()
+        .fillColor(toPdfColor(run.style.highlight))
+        .fillOpacity(0.85)
+        .rect(doc.x, doc.y + 1, tw, fontSize * 1.25)
+        .fill()
+        .restore();
+      // Explicitly reset opacity after restore so it never bleeds into text
+      doc.fillOpacity(1);
     }
-    doc.font(fontFor(run.style)).fontSize(fontSize).fillColor(run.style.color || INK);
-    doc.text(run.text, {
+    // ── Text ─────────────────────────────────────────────────
+    const color = run.style.color ? toPdfColor(run.style.color) : INK;
+    doc.font(fontFor(run.style)).fontSize(fontSize).fillColor(color);
+    const opts: any = {
       continued: !isLast,
       underline: !!run.style.underline,
-      strike: !!run.style.strike,
-      link: run.style.link || undefined,
+      strike:    !!run.style.strike,
+      link:      run.style.link || undefined,
       width,
-    });
+    };
+    if (i === 0) {
+      // Anchor first run with explicit coordinates — prevents any stale
+      // doc.x/doc.y from a preceding element affecting paragraph start.
+      doc.text(run.text, x, startY, opts);
+    } else {
+      doc.text(run.text, opts);
+    }
   });
 }
 
@@ -483,9 +527,17 @@ export async function streamArticlePdf(res: Response, data: ArticlePdfData, uplo
 
   // Collapse consecutive empty <p></p> blocks — TipTap's default empty
   // state adds trailing empty paragraphs that manifested as blank PDF pages.
-  const cleanedHtml = (data.fullContentHtml || '')
-    .replace(/(<p>\s*<\/p>\s*){2,}/gi, '<p></p>') // deduplicate runs of empties
-    .replace(/(<p>\s*<\/p>\s*)+$/gi, '');           // strip trailing empties entirely
+  const stripped = (data.fullContentHtml || '')
+    .replace(/(<p>\s*<\/p>\s*){2,}/gi, '<p></p>')
+    .replace(/(<p>\s*<\/p>\s*)+$/gi, '');
+
+  // If the stored content has no HTML tags (article created with the old
+  // plain-textarea editor), wrap each line in <p> so renderNodes sees it
+  // as actual paragraphs rather than bare text nodes it would skip.
+  const hasHtmlTags = /<[a-z][\s\S]*?>/i.test(stripped);
+  const cleanedHtml = hasHtmlTags
+    ? stripped
+    : stripped.split(/\n+/).filter(l => l.trim()).map(l => `<p>${l}</p>`).join('');
 
   const dom = parseDocument(cleanedHtml);
   const imageSrcs = collectImageSrcs(dom.children);
