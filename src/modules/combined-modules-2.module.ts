@@ -1223,7 +1223,59 @@ class LeaderboardCronService implements OnModuleInit {
   }
 }
 
-@Module({ imports:[ConfigModule], controllers:[UsersController, AdminUsersExtraController], providers:[UsersService, LeaderboardCronService], exports:[UsersService] })
+// ─────────────────────────────────────────────────────────────
+// STREAK REMINDER CRON — fires at 8 AM IST (02:30 UTC)
+// Sends "Don't break your streak!" push to users who have a
+// streak > 0 but have NOT studied today yet.
+// ─────────────────────────────────────────────────────────────
+@Injectable()
+class StreakReminderService {
+  private readonly logger = new Logger('StreakReminderService');
+  constructor(@InjectDataSource() private readonly db: DataSource) {}
+
+  @Cron('30 2 * * *')   // 02:30 UTC = 08:00 IST
+  async sendStreakReminders() {
+    try {
+      const users = await this.db.query(
+        `SELECT u.id, u.fcm_token, u.streak, u.name
+         FROM users u
+         WHERE u.streak > 0
+           AND u.fcm_token IS NOT NULL
+           AND u.notification_enabled = TRUE
+           AND u.status = 'active'
+           AND u.last_active_at < CURRENT_DATE     -- not active today yet
+         LIMIT 2000`
+      );
+      if (!users.length) return;
+
+      const tokens: string[] = users.map((u: any) => u.fcm_token).filter(Boolean);
+      this.logger.log(`sendStreakReminders: ${tokens.length} users with active streaks`);
+
+      const adminFb = require('firebase-admin');
+      if (!adminFb.apps.length) return;
+
+      // Batch in chunks of 500
+      for (let i = 0; i < tokens.length; i += 500) {
+        const chunk = tokens.slice(i, i + 500);
+        const maxStreak = Math.max(...users.slice(i, i + 500).map((u: any) => u.streak));
+        await adminFb.messaging().sendEachForMulticast({
+          tokens: chunk,
+          notification: {
+            title: `🔥 ${maxStreak}-Day Streak at Risk!`,
+            body: `Study for at least 5 minutes today to keep your streak alive!`,
+          },
+          data: { type: 'streak_reminder', screen: 'home' },
+          android: { priority: 'high' },
+        });
+      }
+      this.logger.log(`sendStreakReminders: sent to ${tokens.length} users`);
+    } catch (err: any) {
+      this.logger.warn(`sendStreakReminders failed: ${err.message}`);
+    }
+  }
+}
+
+@Module({ imports:[ConfigModule], controllers:[UsersController, AdminUsersExtraController], providers:[UsersService, LeaderboardCronService, StreakReminderService], exports:[UsersService] })
 export class UsersModule {}
 
 // ════════════════════════════════════════════════════════════
