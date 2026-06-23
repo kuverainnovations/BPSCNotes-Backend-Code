@@ -3,6 +3,7 @@ import {
   Body, Param, Query, Req, Res, HttpCode, HttpStatus,
   NotFoundException, BadRequestException, ConflictException,
   UseGuards, ParseUUIDPipe, OnModuleInit, UseInterceptors, UploadedFile,
+  Logger,
 } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
 import { InjectDataSource } from '@nestjs/typeorm';

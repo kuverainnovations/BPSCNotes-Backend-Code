@@ -671,8 +671,9 @@ if (query.search)  { conditions.push(`(sm.title ILIKE $${pi} OR sm.subject ILIKE
     }
     this.logger.log(`backfillPageCounts: updated=${updated} skipped=${skipped} total=${rows.length}`);
     return successResponse({ updated, skipped, total: rows.length }, 'Backfill complete');
-  
+  }
 
+  async adminApprove(id: string) {
     await this.db.query(`UPDATE study_materials SET status='approved', updated_at=NOW() WHERE id=$1`, [id]);
 
     // Award coins to the uploader for the upload_note task (once per material approved)
