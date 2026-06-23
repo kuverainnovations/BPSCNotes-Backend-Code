@@ -181,8 +181,8 @@ class CurrentAffairsService {
     const where = conditions.join(' AND ');
     const [rows, countResult] = await Promise.all([
       this.db.query(
-        `SELECT ca.id, ca.title, ca.summary, ca.full_content, ca.category,
-                ca.date, ca.is_important, ca.exam_tags, ca.tags, ca.status,
+        `SELECT ca.id, ca.title, ca.summary, ca.full_content, ca.key_points, ca.exam_relevance, ca.important_facts,
+                ca.category, ca.date, ca.is_important, ca.exam_tags, ca.tags, ca.status,
                 ca.view_count, ca.bookmark_count, ca.created_at, ca.read_time,
                 ca.mcq_negative_marking_override, ca.mcq_marks_per_correct_override, ca.mcq_marks_per_wrong_override,
                 (SELECT COUNT(*) FROM ca_mcqs m WHERE m.affair_id=ca.id)::int AS mcq_count
@@ -205,9 +205,22 @@ class CurrentAffairsService {
     // Always ensure the type is in exam_tags as first element
     const mergedTags = [typeTag, ...examTagsWithType.filter((t: string) => !['prelims','mains','both'].includes(t))];
     const result = await this.db.query(
-      `INSERT INTO current_affairs (title, summary, full_content, category, source, date, is_important, exam_tags, tags, status, author, read_time, created_by)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *`,
-      [sanitizeCaInline(data.title), sanitizeCaInline(data.summary), sanitizeCaContent(data.fullContent), data.category, data.source, data.date||new Date().toISOString().split('T')[0], data.isImportant||false, mergedTags, data.tags||[], data.status||'draft', data.author, data.readTime||1, adminId]
+      `INSERT INTO current_affairs
+         (title, summary, full_content, key_points, exam_relevance, important_facts,
+          category, source, date, is_important, exam_tags, tags, status, author, read_time, created_by)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) RETURNING *`,
+      [
+        sanitizeCaInline(data.title),
+        sanitizeCaInline(data.summary),
+        sanitizeCaContent(data.fullContent),
+        data.keyPoints   ? sanitizeCaContent(data.keyPoints)   : null,
+        data.examRelevance ? sanitizeCaContent(data.examRelevance) : null,
+        data.importantFacts ? sanitizeCaContent(data.importantFacts) : null,
+        data.category, data.source,
+        data.date||new Date().toISOString().split('T')[0],
+        data.isImportant||false, mergedTags, data.tags||[],
+        data.status||'draft', data.author, data.readTime||1, adminId,
+      ]
     );
     return successResponse({ affair: result[0] }, 'Article created — live in app ✅');
   }
@@ -215,10 +228,16 @@ class CurrentAffairsService {
   async adminUpdate(affairId: string, data: any) {
     const fields: string[] = [], vals: any[] = [];
     let i = 1;
-    const map: any = { title:'title', summary:'summary', fullContent:'full_content', category:'category', source:'source', date:'date', isImportant:'is_important', status:'status', readTime:'read_time' };
+    const map: any = {
+      title:'title', summary:'summary', fullContent:'full_content',
+      keyPoints:'key_points', examRelevance:'exam_relevance', importantFacts:'important_facts',
+      category:'category', source:'source', date:'date', isImportant:'is_important',
+      status:'status', readTime:'read_time',
+    };
     for (const [key, col] of Object.entries(map)) {
       if (data[key] !== undefined) {
-        const val = key === 'fullContent' ? sanitizeCaContent(data[key])
+        const val = (key === 'fullContent' || key === 'keyPoints' || key === 'examRelevance' || key === 'importantFacts')
+          ? sanitizeCaContent(data[key])
           : (key === 'title' || key === 'summary') ? sanitizeCaInline(data[key])
           : data[key];
         fields.push(`${col}=$${i++}`); vals.push(val);
@@ -442,20 +461,27 @@ class CurrentAffairsService {
   // ── PDF export ───────────────────────────────────────────────
   async streamPdf(affairId: string, res: Response, uploadDir: string) {
     const result = await this.db.query(
-      `SELECT title, summary, category, date, source, tags, full_content FROM current_affairs
+      `SELECT title, summary, category, date, source, tags, full_content, key_points, exam_relevance, important_facts FROM current_affairs
        WHERE id=$1 AND status='published'`,
       [affairId]
     );
     if (!result.length) throw new NotFoundException('Article not found');
     const row = result[0];
+    // Build full content HTML: headline sections + new fields + main body
+    // Each non-empty section gets a labelled H2 header before its content.
+    const sections: string[] = [];
+    if (row.key_points)      sections.push(`<h2>Key Points</h2>${row.key_points}`);
+    if (row.exam_relevance)  sections.push(`<h2>Exam Relevance</h2>${row.exam_relevance}`);
+    if (row.full_content)    sections.push(row.full_content);
+    if (row.important_facts) sections.push(`<h2>Important Facts &amp; Figures</h2>${row.important_facts}`);
     await streamArticlePdf(res, {
-      title: row.title,
-      summary: row.summary || '',
-      category: row.category,
-      date: row.date,
-      source: row.source,
-      tags: row.tags || [],
-      fullContentHtml: row.full_content || '',
+      title:           row.title,
+      summary:         row.summary || '',
+      category:        row.category,
+      date:            row.date,
+      source:          row.source,
+      tags:            row.tags || [],
+      fullContentHtml: sections.join('\n'),
     }, uploadDir);
   }
 
