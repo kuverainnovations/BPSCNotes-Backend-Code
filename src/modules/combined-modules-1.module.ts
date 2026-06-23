@@ -163,13 +163,13 @@ class CurrentAffairsService {
 
   async findAllAdmin(query: any) {
     // Note: current_affairs table has no 'type' column — type is stored in exam_tags[0]
-    const { page=1, limit=20, status, date, search, category, exam } = query;
-    const offset = (page-1)*limit;
+    const { page=1, limit=20, status, date, search, category, exam, important } = query;
+    const offset = (page-1)*Number(limit);
     const conditions = ['1=1'], params: any[] = [];
     if (status)   { conditions.push(`ca.status=$${params.length+1}`);     params.push(status); }
     if (date)     { conditions.push(`ca.date=$${params.length+1}`);        params.push(date); }
     if (category) { conditions.push(`ca.category=$${params.length+1}`);    params.push(category); }
-    if (search)   { conditions.push(`ca.title ILIKE $${params.length+1}`); params.push(`%${search}%`); }
+    if (search)   { conditions.push(`(ca.title ILIKE $${params.length+1} OR ca.summary ILIKE $${params.length+1})`); params.push(`%${search}%`); }
     if (exam) {
       if (exam === 'prelims' || exam === 'mains') {
         conditions.push(`($${params.length+1}=ANY(ca.exam_tags) OR 'both'=ANY(ca.exam_tags))`);
@@ -179,8 +179,18 @@ class CurrentAffairsService {
         params.push(exam);
       }
     }
+    if (important === 'true' || important === true) conditions.push(`ca.is_important=TRUE`);
     const where = conditions.join(' AND ');
-    const [rows, countResult] = await Promise.all([
+
+    // Build filtered-stats WHERE without the exam filter so we can count prelims/mains/important
+    // across the same category+search+status slice the user is viewing.
+    // This gives "stats for this filter context" rather than global unfiltered counts.
+    const baseConditions = conditions.filter(c => !c.includes('exam_tags'));
+    const baseWhere = baseConditions.join(' AND ');
+    // baseParams = params without the exam value (always the last pushed param when exam is set)
+    const baseParams = exam ? params.slice(0, -1) : [...params];
+
+    const [rows, countResult, prelimsResult, mainsResult, importantResult] = await Promise.all([
       this.db.query(
         `SELECT ca.id, ca.title, ca.summary, ca.full_content, ca.key_points, ca.exam_relevance, ca.important_facts,
                 ca.category, ca.date, ca.is_important, ca.exam_tags, ca.tags, ca.status,
@@ -191,11 +201,38 @@ class CurrentAffairsService {
          WHERE ${where}
          ORDER BY ca.date DESC, ca.created_at DESC
          LIMIT $${params.length+1} OFFSET $${params.length+2}`,
-        [...params, limit, offset]
+        [...params, Number(limit), offset]
       ),
       this.db.query(`SELECT COUNT(*) FROM current_affairs ca WHERE ${where}`, params),
+      // Prelims = articles tagged prelims OR both, within same base filters
+      this.db.query(
+        `SELECT COUNT(*) FROM current_affairs ca
+         WHERE ${baseWhere} AND ('prelims'=ANY(ca.exam_tags) OR 'both'=ANY(ca.exam_tags))`,
+        baseParams
+      ),
+      // Mains = articles tagged mains OR both, within same base filters
+      this.db.query(
+        `SELECT COUNT(*) FROM current_affairs ca
+         WHERE ${baseWhere} AND ('mains'=ANY(ca.exam_tags) OR 'both'=ANY(ca.exam_tags))`,
+        baseParams
+      ),
+      // Important = is_important=TRUE, within same base filters
+      this.db.query(
+        `SELECT COUNT(*) FROM current_affairs ca
+         WHERE ${baseWhere} AND ca.is_important=TRUE`,
+        baseParams
+      ),
     ]);
-    return successResponse({ affairs: rows }, 'Success', paginationMeta(parseInt(countResult[0].count), page, limit));
+
+    return successResponse({
+      affairs:   rows,
+      counts: {
+        total:     parseInt(countResult[0].count),
+        prelims:   parseInt(prelimsResult[0].count),
+        mains:     parseInt(mainsResult[0].count),
+        important: parseInt(importantResult[0].count),
+      },
+    }, 'Success', paginationMeta(parseInt(countResult[0].count), Number(page), Number(limit)));
   }
 
   async adminCreate(data: any, adminId: string) {
