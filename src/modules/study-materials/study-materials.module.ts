@@ -269,12 +269,16 @@ export class StudyMaterialsService {
     });
   }
 
-  // ── GET: distinct subjects ────────────────────────────────
+  // ── GET: subjects from master table (admin-controlled) ────
+  // Previously: DISTINCT from study_materials rows — showed only subjects
+  // that happened to have approved uploads, hardcoded in the seed.
+  // Now: reads from the subjects master table so admin can add/enable/disable
+  // subjects independently of whether any materials exist yet.
   async getSubjects() {
     const rows = await this.db.query(
-      `SELECT DISTINCT subject FROM study_materials WHERE status='approved' ORDER BY subject`
+      `SELECT name FROM subjects WHERE is_active = TRUE ORDER BY sort_order, name`
     );
-    return successResponse({ subjects: ['All', ...rows.map((r: any) => r.subject)] });
+    return successResponse({ subjects: ['All', ...rows.map((r: any) => r.name)] });
   }
 
   // ── GET: single material detail ───────────────────────────
@@ -623,7 +627,52 @@ if (query.search)  { conditions.push(`(sm.title ILIKE $${pi} OR sm.subject ILIKE
     return successResponse({ id: row.id, language: row.language }, 'Language updated');
   }
 
-  async adminApprove(id: string) {
+  // ── Admin: backfill page_count for existing PDFs ──────────
+  // Reads every approved PDF where page_count=0, re-parses the file
+  // on disk, and updates the DB. Safe to call multiple times (idempotent).
+  async backfillPageCounts() {
+    const rows = await this.db.query(
+      `SELECT id, file_key FROM study_materials
+       WHERE material_type IN ('pdf','pyq','book') AND page_count = 0 AND file_key IS NOT NULL`
+    );
+    let updated = 0;
+    let skipped = 0;
+    for (const row of rows) {
+      const filePath = join(this.uploadDir, row.file_key);
+      if (!fs.existsSync(filePath)) { skipped++; continue; }
+      try {
+        const pdfBytes = fs.readFileSync(filePath);
+        const pdfStr   = pdfBytes.toString('latin1');
+        let pageCount  = 0;
+        const typeMatches = pdfStr.match(/\/Type\s*\/Page[^s]/g);
+        if (typeMatches) {
+          pageCount = typeMatches.length;
+        }
+        if (pageCount === 0) {
+          const alt = pdfStr.match(/\/Count\s+(\d+)/g);
+          if (alt) {
+            const nums = alt.map((s: string) => parseInt(s.replace(/\/Count\s+/, ''), 10)).filter((n: number) => !isNaN(n));
+            pageCount  = nums.length > 0 ? Math.max(...nums) : 0;
+          }
+        }
+        if (pageCount > 0) {
+          await this.db.query(
+            `UPDATE study_materials SET page_count=$1, updated_at=NOW() WHERE id=$2`,
+            [pageCount, row.id]
+          );
+          updated++;
+        } else {
+          skipped++;
+        }
+      } catch (err: any) {
+        this.logger.warn(`backfillPageCounts: skip ${row.id} — ${err.message}`);
+        skipped++;
+      }
+    }
+    this.logger.log(`backfillPageCounts: updated=${updated} skipped=${skipped} total=${rows.length}`);
+    return successResponse({ updated, skipped, total: rows.length }, 'Backfill complete');
+  
+
     await this.db.query(`UPDATE study_materials SET status='approved', updated_at=NOW() WHERE id=$1`, [id]);
 
     // Award coins to the uploader for the upload_note task (once per material approved)
@@ -982,6 +1031,7 @@ if (query.search)  { conditions.push(`(sm.title ILIKE $${pi} OR sm.subject ILIKE
          sm.id, sm.title, sm.subject, sm.material_type AS "materialType",
          sm.file_key, sm.file_size_bytes AS "fileSizeBytes",
          sm.page_count AS "pageCount",
+         COALESCE(sm.language, 'English') AS language,
          COALESCE(sm.price, 0) AS price,
          COALESCE(sm.free_pages, 3) AS "freePages",
          u.name AS "uploaderName",
@@ -1892,7 +1942,15 @@ export class AdminStudyMaterialsController {
     return this.svc.updateMaterialLanguage(id, b.language);
   }
 
-  @Patch(':id/reject')
+  // ── Backfill page_count for all PDFs that show 0 ─────────────
+  // Admin triggers this once after deploy. Safe to call multiple times.
+  // POST /admin/study-materials/backfill-page-counts
+  @Post('backfill-page-counts')
+  @RequirePermission('study-materials')
+  @HttpCode(HttpStatus.OK)
+  backfillPageCounts() { return this.svc.backfillPageCounts(); }
+
+
   @RequirePermission('study-materials')
   @HttpCode(HttpStatus.OK)
   reject(@Param('id', ParseUUIDPipe) id: string, @Body() b: any) { return this.svc.adminReject(id, b.reason); }

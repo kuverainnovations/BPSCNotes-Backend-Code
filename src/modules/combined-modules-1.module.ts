@@ -649,173 +649,456 @@ class AdminCurrentAffairsController {
 export class CurrentAffairsModule {}
 
 // ════════════════════════════════════════════════════════════
-// JOBS MODULE
+// JOBS MODULE  (restructured)
 // ════════════════════════════════════════════════════════════
+
+const EXPERIENCE_OPTIONS = ['Any', 'Freshers', '0-1 Years', '1-3 Years', '3-5 Years', '5+ Years'] as const;
+
+// Map from FCM category topic key → notification topic
+// Used for targeted push: admin creates a "Central Govt" job →
+// only users who subscribed to "Central Govt" alerts get a push.
+const CATEGORY_TOPIC_MAP: Record<string, string> = {
+  'Central Govt': 'jobs_central_govt',
+  'Bihar Govt':   'jobs_bihar_govt',
+  'BPSC':         'jobs_bpsc',
+  'Railway':      'jobs_railway',
+  'Banking':      'jobs_banking',
+  'SSC':          'jobs_ssc',
+  'Defence':      'jobs_defence',
+  'Private':      'jobs_private',
+  'Teaching':     'jobs_teaching',
+};
+
 @Injectable()
 class JobsService implements OnModuleInit {
+  private readonly logger = new Logger('JobsService');
+  private readonly uploadDir: string;
+
   constructor(
     @InjectDataSource() private readonly db: DataSource,
     @Inject(CACHE_MANAGER) private readonly cache: Cache,
-    @Inject('NOTIFICATION_SERVICE') @Optional() private readonly notifService?: { pushToAll: (title: string, body: string, data?: Record<string, string>) => Promise<void> },
-  ) {}
-
-  async onModuleInit() {
-    await this.ensureColumns();
+    private readonly config: ConfigService,
+  ) {
+    this.uploadDir = this.config.get('UPLOAD_DIR') || './uploads';
   }
 
-  async findAll(query: any, userId: string) {
-    const { page=1, limit=20, status='active', category, exam } = query;
-    const offset = (page-1)*limit;
-    const conditions = [`j.status=$1`], params: any[] = [status];
-    if (category) { conditions.push(`j.category=$${params.length+1}`); params.push(category); }
-    if (exam)     { conditions.push(`$${params.length+1}=ANY(j.exam_tags)`); params.push(exam); }
-    const where = conditions.join(' AND ');
-    const [rows, countResult] = await Promise.all([
-      this.db.query(
-        `SELECT
-           j.id, j.title,
-           j.organization                        AS department,
-           j.category,
-           j.total_posts,
-           COALESCE(j.qualification,'')          AS qualification,
-           COALESCE(j.age_limit,'')              AS age_limit,
-           COALESCE(j.description,'')            AS description,
-           COALESCE(j.brief_description,'')      AS brief_description,
-           COALESCE(j.pdf_url,'')                AS pdf_url,
-           COALESCE(j.application_link,'')       AS official_link,
-           j.status,
-           j.exam_tags,
-           j.notification_date::TEXT             AS notification_date,
-           j.notification_date::TEXT             AS apply_start_date,
-           j.last_date::TEXT                     AS apply_end_date,
-           j.exam_date::TEXT                     AS exam_date,
-           j.created_at,
-           -- Columns that don't exist in table yet — coalesce with safe defaults
-           FALSE                                               AS is_featured,
-FALSE                                               AS is_new,
-CASE WHEN j.last_date <= NOW() + INTERVAL '3 days'
-     THEN TRUE ELSE FALSE END                      AS is_urgent,
-'{}'::TEXT[]                                       AS nearby_districts,
-COALESCE(j.location,'')                                    AS location,
-COALESCE(j.salary_range,'')                                AS salary_range,
-           (SELECT TRUE FROM job_saves js
-            WHERE js.user_id=$${params.length+1} AND js.job_id=j.id) AS is_saved
-         FROM job_vacancies j WHERE ${where}
-         ORDER BY j.last_date ASC LIMIT $${params.length+2} OFFSET $${params.length+3}`,
-        [...params, userId, limit, offset]
-      ),
-      this.db.query(`SELECT COUNT(*) FROM job_vacancies j WHERE ${where}`, params),
-    ]);
-    return successResponse({ jobs: rows }, 'Success', paginationMeta(parseInt(countResult[0].count), page, limit));
+  async onModuleInit() { await this.ensureColumns(); }
+
+  private fileUrl(key: string): string {
+    const base = this.config.get('BASE_URL') || 'http://localhost:3000';
+    return `${base}/uploads/${key}`;
   }
 
-  /** Ensure location + salary_range + brief_description + pdf_url columns exist (run once on startup) */
+  /** ADD ANY MISSING COLUMNS — safe to run multiple times */
   async ensureColumns() {
     await this.db.query(`
-      ALTER TABLE job_vacancies 
+      ALTER TABLE job_vacancies
         ADD COLUMN IF NOT EXISTS location          TEXT DEFAULT '',
         ADD COLUMN IF NOT EXISTS salary_range      TEXT DEFAULT '',
         ADD COLUMN IF NOT EXISTS brief_description TEXT DEFAULT '',
-        ADD COLUMN IF NOT EXISTS pdf_url           TEXT DEFAULT ''
+        ADD COLUMN IF NOT EXISTS pdf_url           TEXT DEFAULT '',
+        ADD COLUMN IF NOT EXISTS experience_required VARCHAR(50) DEFAULT 'Any',
+        ADD COLUMN IF NOT EXISTS advert_pdf_key   TEXT DEFAULT NULL,
+        ADD COLUMN IF NOT EXISTS advert_pdf_url   TEXT DEFAULT NULL,
+        ADD COLUMN IF NOT EXISTS job_state        VARCHAR(100) DEFAULT 'Bihar',
+        ADD COLUMN IF NOT EXISTS job_district     VARCHAR(100) DEFAULT NULL,
+        ADD COLUMN IF NOT EXISTS job_city         VARCHAR(100) DEFAULT NULL,
+        ADD COLUMN IF NOT EXISTS is_remote        BOOLEAN NOT NULL DEFAULT FALSE,
+        ADD COLUMN IF NOT EXISTS is_featured      BOOLEAN NOT NULL DEFAULT FALSE,
+        ADD COLUMN IF NOT EXISTS is_new           BOOLEAN NOT NULL DEFAULT TRUE
     `).catch(() => {});
     await this.db.query(`
-      ALTER TABLE current_affairs
-        ADD COLUMN IF NOT EXISTS read_time INTEGER DEFAULT 1
+      ALTER TABLE current_affairs ADD COLUMN IF NOT EXISTS read_time INTEGER DEFAULT 1
+    `).catch(() => {});
+    // job_alert_prefs for targeted push
+    await this.db.query(`
+      CREATE TABLE IF NOT EXISTS job_alert_prefs (
+        user_id   UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        topic_key VARCHAR(100) NOT NULL,
+        PRIMARY KEY (user_id, topic_key)
+      )
     `).catch(() => {});
   }
 
+  // ── Public: list jobs ─────────────────────────────────────
+  // Sort: featured first → is_new → newest created → last_date
+  async findAll(query: any, userId: string) {
+    const { page=1, limit=20, status='active', category, search, exam } = query;
+    const offset = (page-1)*Number(limit);
+    const conditions: string[] = [`j.status=$1`];
+    const params: any[]        = [status];
+    if (category) { conditions.push(`j.category=$${params.length+1}`); params.push(category); }
+    if (exam)     { conditions.push(`$${params.length+1}=ANY(j.exam_tags)`); params.push(exam); }
+    if (search)   {
+      conditions.push(`(j.title ILIKE $${params.length+1} OR j.organization ILIKE $${params.length+1})`);
+      params.push(`%${search}%`);
+    }
+    const where = conditions.join(' AND ');
+    const [rows, [cnt]] = await Promise.all([
+      this.db.query(
+        `SELECT
+           j.id, j.title,
+           j.organization                               AS department,
+           j.category,
+           j.total_posts,
+           COALESCE(j.qualification,'')                AS qualification,
+           COALESCE(j.age_limit,'')                    AS age_limit,
+           COALESCE(j.experience_required,'Any')       AS experience_required,
+           COALESCE(j.description,'')                  AS description,
+           COALESCE(j.brief_description,'')            AS brief_description,
+           COALESCE(j.pdf_url,'')                      AS pdf_url,
+           COALESCE(j.advert_pdf_key,'')               AS advert_pdf_key,
+           COALESCE(j.advert_pdf_url,'')               AS advert_pdf_url,
+           COALESCE(j.application_link,'')             AS official_link,
+           j.status,
+           j.exam_tags,
+           j.notification_date::TEXT                   AS notification_date,
+           j.notification_date::TEXT                   AS apply_start_date,
+           j.last_date::TEXT                           AS apply_end_date,
+           j.exam_date::TEXT                           AS exam_date,
+           j.created_at,
+           COALESCE(j.is_featured, FALSE)              AS is_featured,
+           COALESCE(j.is_new, TRUE)                    AS is_new,
+           CASE WHEN j.last_date <= NOW() + INTERVAL '3 days'
+                THEN TRUE ELSE FALSE END               AS is_urgent,
+           COALESCE(j.job_state,'Bihar')               AS job_state,
+           COALESCE(j.job_district,'')                 AS job_district,
+           COALESCE(j.job_city,'')                     AS job_city,
+           COALESCE(j.is_remote, FALSE)                AS is_remote,
+           -- Build display location string from hierarchy
+           CASE
+             WHEN COALESCE(j.is_remote, FALSE) = TRUE THEN 'Remote'
+             WHEN COALESCE(j.job_district,'') <> '' AND COALESCE(j.job_city,'') <> ''
+               THEN CONCAT(j.job_city, ', ', j.job_district, ', ', COALESCE(j.job_state,'Bihar'))
+             WHEN COALESCE(j.job_district,'') <> ''
+               THEN CONCAT(j.job_district, ', ', COALESCE(j.job_state,'Bihar'))
+             ELSE COALESCE(NULLIF(j.location,''), COALESCE(j.job_state,'Bihar') || ' (All Districts)')
+           END                                         AS location,
+           COALESCE(j.salary_range,'')                 AS salary_range,
+           '{}'::TEXT[]                                AS nearby_districts,
+           (SELECT TRUE FROM job_saves js
+            WHERE js.user_id=$${params.length+1} AND js.job_id=j.id) AS is_saved
+         FROM job_vacancies j WHERE ${where}
+         ORDER BY
+           COALESCE(j.is_featured, FALSE) DESC,
+           COALESCE(j.is_new, TRUE)       DESC,
+           j.created_at                   DESC,
+           j.last_date                    ASC
+         LIMIT $${params.length+2} OFFSET $${params.length+3}`,
+        [...params, userId, Number(limit), offset]
+      ),
+      this.db.query(`SELECT COUNT(*) FROM job_vacancies j WHERE ${where}`, params),
+    ]);
+    return successResponse({ jobs: rows }, 'Success', paginationMeta(parseInt(cnt.count), Number(page), Number(limit)));
+  }
+
+  // ── Toggle save ───────────────────────────────────────────
   async toggleSave(jobId: string, userId: string) {
     const existing = await this.db.query(`SELECT user_id FROM job_saves WHERE user_id=$1 AND job_id=$2`, [userId, jobId]);
     if (existing.length) {
       await this.db.query(`DELETE FROM job_saves WHERE user_id=$1 AND job_id=$2`, [userId, jobId]);
-      await this.db.query(`UPDATE job_vacancies SET save_count=save_count-1 WHERE id=$1`, [jobId]);
+      await this.db.query(`UPDATE job_vacancies SET save_count=GREATEST(save_count-1,0) WHERE id=$1`, [jobId]);
       return successResponse({ isSaved: false });
     }
-    await this.db.query(`INSERT INTO job_saves VALUES ($1,$2)`, [userId, jobId]);
-    await this.db.query(`UPDATE job_vacancies SET save_count=save_count+1, view_count=view_count+1 WHERE id=$1`, [jobId]);
+    await this.db.query(`INSERT INTO job_saves VALUES ($1,$2) ON CONFLICT DO NOTHING`, [userId, jobId]);
+    await this.db.query(`UPDATE job_vacancies SET save_count=save_count+1 WHERE id=$1`, [jobId]);
     return successResponse({ isSaved: true });
   }
 
+  // ── User: sync alert prefs ────────────────────────────────
+  // Called when user toggles a category in the Alert sheet.
+  // Returns the full current prefs list for the user.
+  async syncAlertPrefs(userId: string, categories: string[]) {
+    // Replace all rows for this user
+    await this.db.query(`DELETE FROM job_alert_prefs WHERE user_id=$1`, [userId]);
+    for (const cat of categories) {
+      if (cat.length > 100) continue;
+      await this.db.query(
+        `INSERT INTO job_alert_prefs (user_id, topic_key) VALUES ($1,$2) ON CONFLICT DO NOTHING`,
+        [userId, cat]
+      );
+    }
+    return successResponse({ subscribed: categories }, 'Alert preferences saved');
+  }
+
+  async getAlertPrefs(userId: string) {
+    const rows = await this.db.query(
+      `SELECT topic_key FROM job_alert_prefs WHERE user_id=$1`,
+      [userId]
+    );
+    return successResponse({ subscribed: rows.map((r: any) => r.topic_key) });
+  }
+
+  // ── Admin: list ───────────────────────────────────────────
   async findAllAdmin(query: any) {
     const { page=1, limit=20, search, category, status, sort } = query;
-    const orderBy = sort === 'last_date_asc' ? 'j.last_date ASC' : sort === 'last_date_desc' ? 'j.last_date DESC' : sort === 'created_asc' ? 'j.created_at ASC' : 'j.created_at DESC';
-    const offset = (page-1)*limit;
+    const orderBy = sort === 'last_date_asc'  ? 'j.last_date ASC'
+                  : sort === 'last_date_desc' ? 'j.last_date DESC'
+                  : sort === 'created_asc'    ? 'j.created_at ASC'
+                  : 'COALESCE(j.is_featured,FALSE) DESC, j.created_at DESC';
+    const offset = (page-1)*Number(limit);
     const conditions: string[] = ['1=1'];
     const params: any[] = [];
     if (search)   { conditions.push(`(j.title ILIKE $${params.length+1} OR j.organization ILIKE $${params.length+1})`); params.push(`%${search}%`); }
     if (category) { conditions.push(`j.category=$${params.length+1}`); params.push(category); }
     if (status)   { conditions.push(`j.status=$${params.length+1}`); params.push(status); }
     const where = conditions.join(' AND ');
-    const [rows, countResult, govtCount, totalAllCount] = await Promise.all([
-      this.db.query(`SELECT j.*, a.name AS created_by_name FROM job_vacancies j LEFT JOIN admin_users a ON j.created_by=a.id WHERE ${where} ORDER BY ${orderBy} LIMIT $${params.length+1} OFFSET $${params.length+2}`, [...params, limit, offset]),
+    const [rows, [cnt], [govtCnt], [allCnt]] = await Promise.all([
+      this.db.query(
+        `SELECT j.*, a.name AS created_by_name FROM job_vacancies j
+         LEFT JOIN admin_users a ON j.created_by=a.id
+         WHERE ${where} ORDER BY ${orderBy}
+         LIMIT $${params.length+1} OFFSET $${params.length+2}`,
+        [...params, Number(limit), offset]
+      ),
       this.db.query(`SELECT COUNT(*) FROM job_vacancies j WHERE ${where}`, params),
       this.db.query(`SELECT COUNT(*) FROM job_vacancies WHERE category NOT IN ('Private','Part-time')`),
       this.db.query(`SELECT COUNT(*) FROM job_vacancies`),
     ]);
     return successResponse({
-      jobs: rows,
-      govtJobsTotal: Number(govtCount[0].count),
-      totalJobsAll: Number(totalAllCount[0].count),
-    }, 'Success', paginationMeta(parseInt(countResult[0].count), page, limit));
+      jobs:          rows,
+      govtJobsTotal: Number(govtCnt.count),
+      totalJobsAll:  Number(allCnt.count),
+    }, 'Success', paginationMeta(parseInt(cnt.count), Number(page), Number(limit)));
   }
 
+  // ── Admin: create ─────────────────────────────────────────
   async adminCreate(data: any, adminId: string) {
-    if (!data.title || !data.organization || !data.lastDate) throw new BadRequestException('Title, organization and last date required');
-    const result = await this.db.query(
-      `INSERT INTO job_vacancies (title, organization, category, total_posts, notification_date, last_date, exam_date, age_limit, qualification, application_link, description, brief_description, pdf_url, location, salary_range, exam_tags, created_by)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) RETURNING *`,
-      [data.title, data.organization, data.category, data.totalPosts||data.totalVacancies||0, data.notificationDate||null, data.lastDate, data.examDate||null, data.ageLimit||'', data.qualification||'', data.applicationLink||data.applicationUrl||'', data.description||'', data.briefDescription||'', data.pdfUrl||'', data.location||'', data.salary||data.salaryRange||'', data.examTags||[], adminId]
-    );
-    // 🔔 New job alert to all users (only if notification service available)
-    this.notifService?.pushToAll(
-      `📋 New Job: ${data.title}`,
-      `${data.organization} · Last date: ${data.lastDate?.split('T')[0] || ''}`,
-      { type: 'new_job', screen: 'jobs' }
-    ).catch(() => {});
+    if (!data.title || !data.organization || !data.lastDate)
+      throw new BadRequestException('Title, organization and last date required');
 
-    return successResponse({ job: result[0] }, 'Job vacancy created — live in app ✅');
+    const locationDisplay = this.buildLocationDisplay(data);
+
+    const [result] = await this.db.query(
+      `INSERT INTO job_vacancies
+         (title, organization, category, total_posts, notification_date, last_date, exam_date,
+          age_limit, qualification, experience_required, application_link, description,
+          brief_description, pdf_url, advert_pdf_key, advert_pdf_url,
+          location, salary_range, exam_tags,
+          job_state, job_district, job_city, is_remote,
+          is_featured, is_new, created_by)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26)
+       RETURNING *`,
+      [
+        data.title, data.organization, data.category || 'BPSC',
+        data.totalPosts || data.totalVacancies || 0,
+        data.notificationDate || null, data.lastDate, data.examDate || null,
+        data.ageLimit || '', data.qualification || '',
+        data.experienceRequired || 'Any',
+        data.applicationLink || data.applicationUrl || '',
+        data.description || '', data.briefDescription || '',
+        data.pdfUrl || '', data.advertPdfKey || null, data.advertPdfUrl || null,
+        locationDisplay, data.salary || data.salaryRange || '',
+        data.examTags || [],
+        data.jobState || 'Bihar', data.jobDistrict || null, data.jobCity || null,
+        data.isRemote || false,
+        data.isFeatured || false, data.isNew !== false,
+        adminId,
+      ]
+    );
+
+    // 🔔 Targeted push: only users who subscribed to this category
+    this.pushJobAlert(result, 'created').catch(() => {});
+
+    return successResponse({ job: result }, 'Job vacancy created — live in app ✅');
   }
 
+  // ── Admin: update ─────────────────────────────────────────
   async adminUpdate(jobId: string, data: any) {
     const fields: string[] = [], vals: any[] = [];
     let i = 1;
-    const map: any = {
-      title:'title', organization:'organization', category:'category',
-      totalPosts:'total_posts', totalVacancies:'total_posts',
-      lastDate:'last_date', examDate:'exam_date', status:'status',
-      applicationLink:'application_link', applicationUrl:'application_link',
-      description:'description', briefDescription:'brief_description', pdfUrl:'pdf_url',
-      location:'location', salary:'salary_range', salaryRange:'salary_range',
-      ageLimit:'age_limit', qualification:'qualification',
+    const map: Record<string, string> = {
+      title: 'title', organization: 'organization', category: 'category',
+      totalPosts: 'total_posts', totalVacancies: 'total_posts',
+      lastDate: 'last_date', examDate: 'exam_date', status: 'status',
+      applicationLink: 'application_link', applicationUrl: 'application_link',
+      description: 'description', briefDescription: 'brief_description',
+      pdfUrl: 'pdf_url',
+      advertPdfKey: 'advert_pdf_key', advertPdfUrl: 'advert_pdf_url',
+      salary: 'salary_range', salaryRange: 'salary_range',
+      ageLimit: 'age_limit', qualification: 'qualification',
+      experienceRequired: 'experience_required',
+      jobState: 'job_state', jobDistrict: 'job_district', jobCity: 'job_city',
+      isRemote: 'is_remote', isFeatured: 'is_featured', isNew: 'is_new',
     };
     for (const [key, col] of Object.entries(map)) {
       if (data[key] !== undefined) { fields.push(`${col}=$${i++}`); vals.push(data[key]); }
     }
-    if (fields.length) { fields.push('updated_at=NOW()'); await this.db.query(`UPDATE job_vacancies SET ${fields.join(',')} WHERE id=$${i}`, [...vals, jobId]); }
+    // Recompute display location if any location field changed
+    if (data.jobState !== undefined || data.jobDistrict !== undefined ||
+        data.jobCity !== undefined || data.isRemote !== undefined || data.location !== undefined) {
+      // Load current row, merge with new data, compute display
+      const [current] = await this.db.query(
+        `SELECT job_state, job_district, job_city, is_remote, location FROM job_vacancies WHERE id=$1`, [jobId]
+      );
+      const merged = { ...current, ...data };
+      const display = this.buildLocationDisplay(merged);
+      fields.push(`location=$${i++}`); vals.push(display);
+    }
+    if (fields.length) {
+      fields.push(`updated_at=NOW()`);
+      await this.db.query(`UPDATE job_vacancies SET ${fields.join(',')} WHERE id=$${i}`, [...vals, jobId]);
+    }
     return successResponse(null, 'Job updated — live in app ✅');
   }
 
+  // ── Admin: delete ─────────────────────────────────────────
   async adminDelete(jobId: string) {
+    const [row] = await this.db.query(`SELECT advert_pdf_key FROM job_vacancies WHERE id=$1`, [jobId]);
+    if (row?.advert_pdf_key) {
+      const path = require('path').join(this.uploadDir, row.advert_pdf_key);
+      try { require('fs').unlinkSync(path); } catch (_) {}
+    }
     await this.db.query(`DELETE FROM job_vacancies WHERE id=$1`, [jobId]);
     return successResponse(null, 'Job vacancy deleted');
   }
+
+  // ── Admin: upload advertisement PDF ──────────────────────
+  async adminUploadAdvertPdf(jobId: string, file: Express.Multer.File) {
+    if (!file) throw new BadRequestException('No file uploaded');
+    // Store under jobs/ subfolder
+    const { join } = require('path');
+    const fs = require('fs');
+    const dest = join(this.uploadDir, 'jobs');
+    fs.mkdirSync(dest, { recursive: true });
+    const ext = require('path').extname(file.originalname).toLowerCase() || '.pdf';
+    const key = `jobs/${jobId}${ext}`;
+    const destPath = join(this.uploadDir, key);
+    fs.copyFileSync(file.path, destPath);
+    try { fs.unlinkSync(file.path); } catch (_) {}
+    const url = this.fileUrl(key);
+    await this.db.query(
+      `UPDATE job_vacancies SET advert_pdf_key=$1, advert_pdf_url=$2, updated_at=NOW() WHERE id=$3`,
+      [key, url, jobId]
+    );
+    return successResponse({ advertPdfKey: key, advertPdfUrl: url }, 'Advertisement PDF uploaded');
+  }
+
+  // ── Helpers ───────────────────────────────────────────────
+  private buildLocationDisplay(data: any): string {
+    if (data.isRemote || data.is_remote) return 'Remote';
+    const state    = data.jobState    || data.job_state    || 'Bihar';
+    const district = data.jobDistrict || data.job_district || '';
+    const city     = data.jobCity     || data.job_city     || '';
+    if (city && district)   return `${city}, ${district}, ${state}`;
+    if (district)           return `${district}, ${state}`;
+    return `${state} (All Districts)`;
+  }
+
+  // ── Targeted push via job_alert_prefs ────────────────────
+  // Sends to users who subscribed to this job's category.
+  // Falls back to broader push if no subscribers found.
+  private async pushJobAlert(job: any, event: 'created' | 'updated') {
+    if (!job?.category) return;
+    const title = `📋 New ${job.category} Job`;
+    const body  = `${job.title} · ${job.organization} · Last date: ${job.last_date?.toString().split('T')[0] || ''}`;
+    const data  = { type: 'new_job', screen: 'jobs', jobId: job.id || '' };
+
+    try {
+      // Get FCM tokens of users subscribed to this category
+      const rows = await this.db.query(
+        `SELECT u.fcm_token
+         FROM job_alert_prefs jap
+         JOIN users u ON u.id = jap.user_id
+         WHERE jap.topic_key = $1
+           AND u.fcm_token IS NOT NULL
+           AND u.notification_enabled = TRUE
+           AND u.status = 'active'`,
+        [job.category]
+      );
+
+      const tokens: string[] = rows.map((r: any) => r.fcm_token).filter(Boolean);
+
+      if (tokens.length === 0) {
+        this.logger.log(`pushJobAlert: no subscribers for category "${job.category}" — skipping`);
+        return;
+      }
+
+      const admin = require('firebase-admin');
+      if (!admin.apps.length) return;
+
+      // Batch in chunks of 500 (FCM multicast limit)
+      for (let i = 0; i < tokens.length; i += 500) {
+        await admin.messaging().sendEachForMulticast({
+          tokens: tokens.slice(i, i + 500),
+          notification: { title, body },
+          data,
+          android: { priority: 'high' },
+        });
+      }
+      this.logger.log(`pushJobAlert: sent to ${tokens.length} subscribers for "${job.category}"`);
+    } catch (err: any) {
+      this.logger.warn(`pushJobAlert failed: ${err.message}`);
+    }
+  }
 }
 
+// ── Public controller ─────────────────────────────────────
 @ApiTags('Jobs') @ApiBearerAuth() @UseGuards(JwtAuthGuard) @Controller('jobs')
 class JobsController {
   constructor(private s: JobsService) {}
-  @Get() findAll(@Query() q: any, @Req() r: any) { return this.s.findAll(q, r.user.id); }
-  @Post(':id/save') @HttpCode(200) toggleSave(@Param('id', ParseUUIDPipe) id: string, @Req() r: any) { return this.s.toggleSave(id, r.user.id); }
+
+  @Get()
+  findAll(@Query() q: any, @Req() r: any) { return this.s.findAll(q, r.user.id); }
+
+  @Post(':id/save')
+  @HttpCode(200)
+  toggleSave(@Param('id', ParseUUIDPipe) id: string, @Req() r: any) {
+    return this.s.toggleSave(id, r.user.id);
+  }
+
+  // User syncs their alert category subscriptions
+  @Post('alert-prefs')
+  @HttpCode(200)
+  syncAlertPrefs(@Body() body: { categories: string[] }, @Req() r: any) {
+    return this.s.syncAlertPrefs(r.user.id, body.categories || []);
+  }
+
+  @Get('alert-prefs')
+  getAlertPrefs(@Req() r: any) { return this.s.getAlertPrefs(r.user.id); }
 }
 
+// ── Admin controller ──────────────────────────────────────
 @ApiTags('Admin — Jobs') @ApiBearerAuth() @Public()
 @UseGuards(AdminJwtGuard, PermissionGuard) @Controller('admin/jobs')
 class AdminJobsController {
   constructor(private s: JobsService) {}
-  @Get() @RequirePermission('jobs') findAll(@Query() q: any) { return this.s.findAllAdmin(q); }
-  @Post() @RequirePermission('jobs') @HttpCode(201) create(@Body() dto: any, @Req() r: any) { return this.s.adminCreate(dto, r.admin.id); }
-  @Put(':id') @RequirePermission('jobs') update(@Param('id', ParseUUIDPipe) id: string, @Body() dto: any) { return this.s.adminUpdate(id, dto); }
-  @Delete(':id') @RequirePermission('jobs') remove(@Param('id', ParseUUIDPipe) id: string) { return this.s.adminDelete(id); }
+
+  @Get()
+  @RequirePermission('jobs')
+  findAll(@Query() q: any) { return this.s.findAllAdmin(q); }
+
+  @Post()
+  @RequirePermission('jobs')
+  @HttpCode(201)
+  create(@Body() dto: any, @Req() r: any) { return this.s.adminCreate(dto, r.admin.id); }
+
+  @Put(':id')
+  @RequirePermission('jobs')
+  update(@Param('id', ParseUUIDPipe) id: string, @Body() dto: any) {
+    return this.s.adminUpdate(id, dto);
+  }
+
+  @Delete(':id')
+  @RequirePermission('jobs')
+  remove(@Param('id', ParseUUIDPipe) id: string) { return this.s.adminDelete(id); }
+
+  // Upload advertisement PDF for a job
+  @Post(':id/advert-pdf')
+  @RequirePermission('jobs')
+  @HttpCode(200)
+  @UseInterceptors(FileInterceptor('file', {
+    dest: '/tmp',
+    limits: { fileSize: 20 * 1024 * 1024 }, // 20 MB
+    fileFilter: (_req: any, file: any, cb: any) => {
+      if (file.mimetype === 'application/pdf') cb(null, true);
+      else cb(new BadRequestException('Only PDF files are accepted'), false);
+    },
+  }))
+  uploadAdvertPdf(
+    @Param('id', ParseUUIDPipe) id: string,
+    @UploadedFile() file: Express.Multer.File,
+  ) { return this.s.adminUploadAdvertPdf(id, file); }
 }
 
 @Module({ controllers:[JobsController, AdminJobsController], providers:[JobsService] })

@@ -1580,9 +1580,14 @@ export class DistrictsModule {}
 
 @Injectable()
 class FlashcardsService {
+  private readonly logger = new Logger('FlashcardsService');
+
   constructor(
     @InjectDataSource() private readonly db: DataSource,
     @Inject(CACHE_MANAGER) private readonly cache: Cache,
+    @Inject('NOTIFICATION_SERVICE') @Optional() private readonly notifSvc?: {
+      pushToAll: (title: string, body: string, data?: Record<string, string>) => Promise<void>;
+    },
   ) {}
 
   async findAll(query: any) {
@@ -1590,39 +1595,23 @@ class FlashcardsService {
     const cacheKey = `flashcards:${subject || 'all'}:${exam || 'all'}`;
     const cached = await this.cache.get(cacheKey);
     if (cached) return cached;
-
     const conditions = [`f.is_active = TRUE`];
     const params: any[] = [];
-
-    if (subject) {
-      conditions.push(`f.subject = $${params.length + 1}`);
-      params.push(subject);
-    }
-    if (exam) {
-      conditions.push(`$${params.length + 1} = ANY(f.exam_tags)`);
-      params.push(exam);
-    }
-
+    if (subject) { conditions.push(`f.subject = $${params.length + 1}`); params.push(subject); }
+    if (exam) { conditions.push(`$${params.length + 1} = ANY(f.exam_tags)`); params.push(exam); }
     const rows = await this.db.query(
-      `SELECT
-         f.id,
-         f.subject,
+      `SELECT f.id, f.subject,
          COALESCE(NULLIF(f.topic,''), f.subject) AS topic,
-         f.front     AS question,
-         f.back      AS answer,
-         COALESCE(f.hint,'')    AS hint,
+         f.front AS question, f.back AS answer,
+         COALESCE(f.hint,'') AS hint,
          COALESCE(f.card_type,'text') AS card_type,
-         f.image_url,
-         f.back_image_url,
-         NULL        AS related_mcq,
-         f.exam_tags
-       FROM flashcards f
-       WHERE ${conditions.join(' AND ')}
+         f.image_url, f.back_image_url,
+         NULL AS related_mcq, f.exam_tags
+       FROM flashcards f WHERE ${conditions.join(' AND ')}
        ORDER BY f.subject, f.created_at ASC
        LIMIT $${params.length + 1}`,
       [...params, limit]
     );
-
     const result = successResponse({ flashcards: rows });
     await this.cache.set(cacheKey, result, 300);
     return result;
@@ -1645,34 +1634,24 @@ class FlashcardsService {
   }
 
   async create(data: any, adminId: string) {
-    console.log('Flashcard create payload:', JSON.stringify(data));
     const front = data.front || data.question;
     const back  = data.back  || data.answer || '';
     const backImageUrl = data.backImageUrl || data.back_image_url || null;
-    // front (question) is always required
-    // back (answer) is required UNLESS a back image is provided
     if (!front) throw new BadRequestException('front (question) is required');
     if (!back && !backImageUrl) throw new BadRequestException('back (answer) or a back image is required');
     const cardType = data.cardType || data.card_type || 'text';
     const imageUrl = cardType === 'image' ? (data.imageUrl || data.image_url || null) : null;
     const result = await this.db.query(
-      `INSERT INTO flashcards
-         (front, back, subject, exam_tags, card_type, image_url, back_image_url, topic, hint, created_by)
+      `INSERT INTO flashcards (front, back, subject, exam_tags, card_type, image_url, back_image_url, topic, hint, created_by)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,
-      [
-        front,
-        back,
-        data.subject || 'General',
-        data.examTags || data.exam_tags || [],
-        cardType,
-        imageUrl,
-        backImageUrl,
-        data.topic || data.subject || 'General',
-        data.hint || '',
-        adminId,
-      ]
+      [front, back, data.subject || 'General', data.examTags || data.exam_tags || [],
+       cardType, imageUrl, backImageUrl, data.topic || data.subject || 'General', data.hint || '', adminId]
     );
     await this.invalidateCache();
+    // Auto-push notification when sendNotification !== false
+    if (data.sendNotification !== false) {
+      this.pushFlashcardNotification(data.subject || 'General').catch(() => {});
+    }
     return successResponse({ flashcard: result[0] }, 'Flashcard created ✅');
   }
 
@@ -1681,26 +1660,16 @@ class FlashcardsService {
     if (!existing.length) throw new NotFoundException('Flashcard not found');
     const fields: string[] = [], vals: any[] = [];
     let i = 1;
-    const map: any = {
-      front: 'front', back: 'back', question: 'front', answer: 'back',
-      subject: 'subject', isActive: 'is_active',
-      topic: 'topic', hint: 'hint',
-    };
-    // Handle back_image_url separately (camelCase from admin, snake_case from API)
-    if (data.backImageUrl !== undefined || data.back_image_url !== undefined) {
-      fields.push(`back_image_url=$${i++}`);
-      vals.push(data.backImageUrl ?? data.back_image_url ?? null);
-    }
+    const map: any = { front:'front', back:'back', question:'front', answer:'back', subject:'subject', isActive:'is_active', topic:'topic', hint:'hint' };
+    if (data.backImageUrl !== undefined || data.back_image_url !== undefined) { fields.push(`back_image_url=$${i++}`); vals.push(data.backImageUrl ?? data.back_image_url ?? null); }
     for (const [key, col] of Object.entries(map)) {
       if (data[key] !== undefined) { fields.push(`${col}=$${i++}`); vals.push(data[key]); }
     }
-    if (data.examTags)  { fields.push(`exam_tags=$${i++}`);  vals.push(data.examTags); }
+    if (data.examTags) { fields.push(`exam_tags=$${i++}`); vals.push(data.examTags); }
     if (data.cardType || data.card_type) {
       const ct = data.cardType || data.card_type;
       fields.push(`card_type=$${i++}`); vals.push(ct);
-      if (ct === 'image' && (data.imageUrl || data.image_url)) {
-        fields.push(`image_url=$${i++}`); vals.push(data.imageUrl || data.image_url);
-      }
+      if (ct === 'image' && (data.imageUrl || data.image_url)) { fields.push(`image_url=$${i++}`); vals.push(data.imageUrl || data.image_url); }
       if (ct === 'text') { fields.push(`image_url=$${i++}`); vals.push(null); }
     }
     if (!fields.length) throw new BadRequestException('No fields to update');
@@ -1717,104 +1686,138 @@ class FlashcardsService {
 
   private async invalidateCache() {
     await this.cache.del('flashcards:all:all');
-    const subjects = ['Polity','History','Geography','Economy','Bihar GK','Science','Environment'];
+    const subjects = ['Polity','History','Geography','Economy','Bihar GK','Science','Environment','General'];
     for (const s of subjects) await this.cache.del(`flashcards:${s}:all`);
   }
 
-  /** GET /flashcards/progress — return user's mastered/weak card IDs */
   async getUserProgress(userId: string) {
     const rows = await this.db.query(
       `SELECT ufp.flashcard_id AS "flashcardId", ufp.status, ufp.streak,
               ufp.ease_factor AS "easeFactor", ufp.repetitions, ufp.next_review AS "nextReview"
        FROM user_flashcard_progress ufp
        INNER JOIN flashcards f ON f.id = ufp.flashcard_id AND f.is_active = TRUE
-       WHERE ufp.user_id = $1`,
-      [userId]
+       WHERE ufp.user_id = $1`, [userId]
     ).catch(() => []);
-
     const mastered = rows.filter((r: any) => r.status === 'mastered').map((r: any) => r.flashcardId);
     const weak     = rows.filter((r: any) => r.status === 'weak').map((r: any) => r.flashcardId);
     return successResponse({ mastered, weak, total: rows.length });
   }
 
-  /** POST /flashcards/progress — upsert card rating for user */
   async saveProgress(userId: string, dto: { flashcardId: string; rating: 'mastered' | 'weak' | 'skipped'; streak?: number }) {
     const { flashcardId, rating } = dto;
     if (rating === 'skipped') return successResponse({ saved: false });
-
-    // SRS streak is per-card and computed server-side from this card's own
-    // history — NOT trusted from the client. The Android app's "streak"
-    // field is a session-local "cards mastered in a row" counter shared
-    // across every card in the session, so using it directly here would
-    // give later cards in a session an inflated next_review interval based
-    // on unrelated cards rated before them.
     await this.db.query(
       `INSERT INTO user_flashcard_progress
          (user_id, flashcard_id, status, streak, repetitions, last_reviewed, next_review)
-       VALUES ($1, $2, $3, CASE WHEN $3='mastered' THEN 1 ELSE 0 END, 1, NOW(),
-         CURRENT_DATE + INTERVAL '1 day')
+       VALUES ($1, $2, $3, CASE WHEN $3='mastered' THEN 1 ELSE 0 END, 1, NOW(), CURRENT_DATE + INTERVAL '1 day')
        ON CONFLICT (user_id, flashcard_id) DO UPDATE SET
-         status       = EXCLUDED.status,
-         streak       = CASE WHEN EXCLUDED.status='mastered' THEN user_flashcard_progress.streak + 1 ELSE 0 END,
-         repetitions  = user_flashcard_progress.repetitions + 1,
+         status = EXCLUDED.status,
+         streak = CASE WHEN EXCLUDED.status='mastered' THEN user_flashcard_progress.streak + 1 ELSE 0 END,
+         repetitions = user_flashcard_progress.repetitions + 1,
          last_reviewed = NOW(),
-         next_review  = CURRENT_DATE + INTERVAL '1 day' * CASE WHEN EXCLUDED.status='mastered'
-                           THEN GREATEST(1, user_flashcard_progress.streak + 1) ELSE 1 END`,
+         next_review = CURRENT_DATE + INTERVAL '1 day' * CASE WHEN EXCLUDED.status='mastered'
+                         THEN GREATEST(1, user_flashcard_progress.streak + 1) ELSE 1 END`,
       [userId, flashcardId, rating]
-    ).catch(async (e: any) => {
-      // Table may not have status/streak columns — add them gracefully
+    ).catch(async () => {
       await this.db.query(`
         DO $$ BEGIN
           ALTER TABLE user_flashcard_progress ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'unseen';
           ALTER TABLE user_flashcard_progress ADD COLUMN IF NOT EXISTS streak INTEGER DEFAULT 0;
-        EXCEPTION WHEN duplicate_column THEN NULL;
-        END $$;
+        EXCEPTION WHEN duplicate_column THEN NULL; END $$;
       `).catch(() => {});
     });
-
     return successResponse({ saved: true, flashcardId, rating });
   }
-}
 
-@ApiTags('Flashcards')
-@ApiBearerAuth()
-@UseGuards(JwtAuthGuard)
-@Controller('flashcards')
-class FlashcardsController {
-  constructor(private s: FlashcardsService) {}
-
-  /** GET /api/v1/flashcards/progress — user's mastered/weak card IDs */
-  @Get('progress')
-  getProgress(@Req() r: any) { return this.s.getUserProgress(r.user.id); }
-
-  /** POST /api/v1/flashcards/progress — save card rating */
-  @Post('progress')
-  @HttpCode(HttpStatus.OK)
-  saveProgress(@Body() dto: any, @Req() r: any) {
-    return this.s.saveProgress(r.user.id, dto);
+  // ── Notification prefs ────────────────────────────────────
+  async syncFlashcardNotifPrefs(userId: string, topics: string[]) {
+    await this.db.query(`
+      CREATE TABLE IF NOT EXISTS flashcard_notif_prefs (
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        topic_key VARCHAR(100) NOT NULL DEFAULT 'all',
+        PRIMARY KEY (user_id, topic_key)
+      )
+    `).catch(() => {});
+    await this.db.query(`DELETE FROM flashcard_notif_prefs WHERE user_id=$1`, [userId]);
+    for (const topic of topics) {
+      if (topic.length > 100) continue;
+      await this.db.query(
+        `INSERT INTO flashcard_notif_prefs (user_id, topic_key) VALUES ($1,$2) ON CONFLICT DO NOTHING`,
+        [userId, topic]
+      );
+    }
+    return successResponse({ subscribed: topics }, 'Flashcard notification preferences saved');
   }
 
-  /** GET /api/v1/flashcards?subject=Polity&limit=200 */
-  @Get()
-  findAll(@Query() q: any) { return this.s.findAll(q); }
+  async getFlashcardNotifPrefs(userId: string) {
+    const rows = await this.db.query(
+      `SELECT topic_key FROM flashcard_notif_prefs WHERE user_id=$1`, [userId]
+    ).catch(() => []);
+    return successResponse({ subscribed: rows.map((r: any) => r.topic_key) });
+  }
+
+  // ── Publish batch + notify ─────────────────────────────────
+  async publishAndNotify(subject: string, count: number) {
+    await this.pushFlashcardNotification(subject, count);
+    return successResponse({ notified: true }, `Notification sent for ${subject} flashcards`);
+  }
+
+  private async pushFlashcardNotification(subject: string, count?: number) {
+    const title = count && count > 1 ? `📚 ${count} New Flashcards: ${subject}` : `📚 New Flashcards Available`;
+    const body  = `New ${subject} flashcards are ready for your Active Recall session!`;
+    const data  = { type: 'new_flashcards', screen: 'flashcards', subject };
+    try {
+      const rows = await this.db.query(
+        `SELECT DISTINCT u.fcm_token
+         FROM flashcard_notif_prefs fnp
+         JOIN users u ON u.id = fnp.user_id
+         WHERE fnp.topic_key IN ($1, 'all')
+           AND u.fcm_token IS NOT NULL AND u.notification_enabled = TRUE AND u.status = 'active'`,
+        [subject]
+      ).catch(() => []);
+      const tokens: string[] = rows.map((r: any) => r.fcm_token).filter(Boolean);
+      if (tokens.length === 0) {
+        this.notifSvc?.pushToAll(title, body, data).catch(() => {});
+        return;
+      }
+      const adminFb = require('firebase-admin');
+      if (!adminFb.apps.length) return;
+      for (let i = 0; i < tokens.length; i += 500) {
+        await adminFb.messaging().sendEachForMulticast({
+          tokens: tokens.slice(i, i + 500),
+          notification: { title, body }, data, android: { priority: 'high' },
+        });
+      }
+      this.logger.log(`pushFlashcard: sent to ${tokens.length} subscribers for "${subject}"`);
+    } catch (err: any) {
+      this.logger.warn(`pushFlashcardNotification: ${err.message}`);
+    }
+  }
 }
 
-@ApiTags('Admin — Flashcards')
-@ApiBearerAuth()
-@Public()
-@UseGuards(AdminJwtGuard, PermissionGuard)
-@Controller('admin/flashcards')
+@ApiTags('Flashcards') @ApiBearerAuth() @UseGuards(JwtAuthGuard) @Controller('flashcards')
+class FlashcardsController {
+  constructor(private s: FlashcardsService) {}
+  @Get('progress')  getProgress(@Req() r: any) { return this.s.getUserProgress(r.user.id); }
+  @Post('progress') @HttpCode(HttpStatus.OK) saveProgress(@Body() dto: any, @Req() r: any) { return this.s.saveProgress(r.user.id, dto); }
+  @Get() findAll(@Query() q: any) { return this.s.findAll(q); }
+  @Post('notif-prefs') @HttpCode(HttpStatus.OK) syncNotifPrefs(@Body() body: { topics: string[] }, @Req() r: any) { return this.s.syncFlashcardNotifPrefs(r.user.id, body.topics || []); }
+  @Get('notif-prefs') getNotifPrefs(@Req() r: any) { return this.s.getFlashcardNotifPrefs(r.user.id); }
+}
+
+@ApiTags('Admin — Flashcards') @ApiBearerAuth() @Public()
+@UseGuards(AdminJwtGuard, PermissionGuard) @Controller('admin/flashcards')
 class AdminFlashcardsController {
   constructor(private s: FlashcardsService) {}
-
-  @Get()                @RequirePermission('library')    findAll(@Query() q: any)  { return this.s.findAllAdmin(q); }
-  @Post()               @RequirePermission('library')    @HttpCode(201) create(@Body() dto: any, @Req() r: any) { return this.s.create(dto, r.admin.id); }
-  @Put(':id')           @RequirePermission('library')    update(@Param('id', ParseUUIDPipe) id: string, @Body() dto: any) { return this.s.update(id, dto); }
-  @Delete(':id')        @RequirePermission('library')    remove(@Param('id', ParseUUIDPipe) id: string) { return this.s.remove(id); }
+  @Get()     @RequirePermission('library') findAll(@Query() q: any) { return this.s.findAllAdmin(q); }
+  @Post()    @RequirePermission('library') @HttpCode(201) create(@Body() dto: any, @Req() r: any) { return this.s.create(dto, r.admin.id); }
+  @Put(':id')  @RequirePermission('library') update(@Param('id', ParseUUIDPipe) id: string, @Body() dto: any) { return this.s.update(id, dto); }
+  @Delete(':id') @RequirePermission('library') remove(@Param('id', ParseUUIDPipe) id: string) { return this.s.remove(id); }
+  @Post('publish-notify') @RequirePermission('library') @HttpCode(HttpStatus.OK)
+  publishNotify(@Body() body: { subject: string; count?: number }) {
+    return this.s.publishAndNotify(body.subject || 'General', body.count ?? 1);
+  }
 }
 
-@Module({
-  controllers: [FlashcardsController, AdminFlashcardsController],
-  providers:   [FlashcardsService],
-})
+@Module({ controllers: [FlashcardsController, AdminFlashcardsController], providers: [FlashcardsService] })
 export class FlashcardsModule {}
