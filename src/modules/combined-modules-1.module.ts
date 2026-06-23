@@ -1698,8 +1698,6 @@ console.log('firebaseInitialized:', this.firebaseInitialized);
 console.log('users count:', users.length);
     if (this.firebaseInitialized) {
       const tokens = users.map((u: any) => u.fcm_token).filter(Boolean);
-      console.log('tokens count:', tokens.length);
-console.log('sample token:', tokens[0]);
       if (tokens.length > 0) {
         for (let i = 0; i < tokens.length; i += 500) {
           try {
@@ -1711,9 +1709,8 @@ console.log('sample token:', tokens[0]);
             });
             pushSuccess += result.successCount;
             pushFail    += result.failureCount;
-          } catch (err) {
-            console.error('FCM FULL ERROR:', err);
-            // console.error('FCM error:', err.message);
+          } catch (err: any) {
+            console.error('FCM multicast failed:', err.message);
           }
         }
       }
@@ -1828,24 +1825,38 @@ console.log('sample token:', tokens[0]);
   }
 
   async pushToAll(title: string, body: string, data: Record<string, string> = {}) {
-    const tokens = await this.db.query(
-      `SELECT fcm_token FROM users WHERE notification_enabled=TRUE AND fcm_token IS NOT NULL AND status='active' LIMIT 2000`
-    );
-    const fcmTokens = tokens.map((t: any) => t.fcm_token).filter(Boolean);
-    if (!fcmTokens.length || !admin.apps.length) return 0;
+    if (!admin.apps.length) return 0;
     let sent = 0;
-    for (let i = 0; i < fcmTokens.length; i += 500) {
-      try {
-        const res = await admin.messaging().sendEachForMulticast({
-          tokens: fcmTokens.slice(i, i + 500),
-          notification: { title, body },
-          data,
-          android: { priority: 'high' },
-        });
-        sent += res.successCount;
-      } catch (err: any) {
-        console.error('FCM multicast failed:', err.message);
+    let offset = 0;
+    const BATCH = 2000;   // DB rows per page
+    // Paginate through ALL eligible users — no arbitrary cap.
+    // Previous version silently dropped users beyond 2000.
+    while (true) {
+      const tokens = await this.db.query(
+        `SELECT fcm_token FROM users
+         WHERE notification_enabled=TRUE AND fcm_token IS NOT NULL AND status='active'
+         ORDER BY id
+         LIMIT $1 OFFSET $2`,
+        [BATCH, offset]
+      );
+      const fcmTokens = tokens.map((t: any) => t.fcm_token).filter(Boolean);
+      if (!fcmTokens.length) break;
+
+      for (let i = 0; i < fcmTokens.length; i += 500) {
+        try {
+          const res = await admin.messaging().sendEachForMulticast({
+            tokens: fcmTokens.slice(i, i + 500),
+            notification: { title, body },
+            data,
+            android: { priority: 'high' },
+          });
+          sent += res.successCount;
+        } catch (err: any) {
+          console.error('FCM multicast failed:', err.message);
+        }
       }
+      offset += BATCH;
+      if (tokens.length < BATCH) break;   // last page
     }
     return sent;
   }
