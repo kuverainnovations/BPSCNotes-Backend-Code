@@ -1070,7 +1070,18 @@ export class StudySessionsService {
     const activeMins     = Math.min(gapSecs / 60, 5);
     const coinMultiplier = +s.coin_multiplier || 1.0;
     const xpMultiplier   = +s.xp_multiplier   || 1.0;
-    let coinsThisBeat    = Math.floor((activeMins / 60) * this.BASE_COINS_PER_HOUR * coinMultiplier);
+
+    // Cumulative coin calculation — avoids the floor-to-zero problem.
+    // With BASE_COINS_PER_HOUR=6 and 5-min heartbeats, the per-beat calc
+    // floor(5/60 * 6) = floor(0.5) = 0 every single beat, so coins would
+    // never accumulate across the session. Instead: compute what the user
+    // SHOULD have earned in total given their running active_minutes, then
+    // award only the diff vs what was already credited.
+    const roundMins        = Math.round(activeMins);
+    const totalMinSoFar    = s.active_minutes + roundMins;
+    const totalCoinsTarget = Math.floor((totalMinSoFar / 60) * this.BASE_COINS_PER_HOUR * coinMultiplier);
+    let coinsThisBeat      = Math.max(0, totalCoinsTarget - (s.coins_earned || 0));
+
     let xpThisBeat       = Math.floor(activeMins * this.BASE_XP_PER_MINUTE * xpMultiplier);
 
     // FIX: this reduction was documented in a comment but never actually
@@ -1092,7 +1103,7 @@ export class StudySessionsService {
     }
     if (xpThisBeat > 0) await this.awardSessionXp(userId, sessionId, xpThisBeat);
 
-    const roundMins = Math.round(activeMins);
+    // roundMins already computed above (moved up for cumulative coin calc)
     await this.db.query(`
       UPDATE study_sessions
       SET active_minutes=active_minutes+$1, coins_earned=coins_earned+$2,
@@ -1151,7 +1162,14 @@ export class StudySessionsService {
       const activeMins     = Math.min(finalGapSecs / 60, 5);
       const coinMultiplier = +s.coin_multiplier || 1.0;
       const xpMultiplier   = +s.xp_multiplier   || 1.0;
-      let coinsThisBeat    = Math.floor((activeMins / 60) * this.BASE_COINS_PER_HOUR * coinMultiplier);
+
+      // Same cumulative approach as heartbeat() — catch any remaining coins
+      // owed for the full session that weren't awarded during heartbeats.
+      const roundMins        = Math.round(activeMins);
+      const totalMinSoFar    = s.active_minutes + roundMins;
+      const totalCoinsTarget = Math.floor((totalMinSoFar / 60) * this.BASE_COINS_PER_HOUR * coinMultiplier);
+      let coinsThisBeat      = Math.max(0, totalCoinsTarget - (s.coins_earned || 0));
+
       let xpThisBeat       = Math.floor(activeMins * this.BASE_XP_PER_MINUTE * xpMultiplier);
 
       if (coinsThisBeat > 0) {
@@ -1164,7 +1182,7 @@ export class StudySessionsService {
       }
       if (xpThisBeat > 0) await this.awardSessionXp(userId, sessionId, xpThisBeat);
 
-      const roundMins = Math.round(activeMins);
+      // roundMins already computed above
       await this.db.query(`
         UPDATE study_sessions
         SET active_minutes=active_minutes+$1, coins_earned=coins_earned+$2,
