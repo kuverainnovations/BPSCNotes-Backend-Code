@@ -218,91 +218,64 @@ function renderBlockquote(doc: any, el: any, ctx: RenderCtx) {
   const w = ctx.contentWidth - 18;
   const blocks = (el.children || []).filter((c: any) => c.type === 'tag' && c.name === 'p');
   const paragraphs = blocks.length ? blocks : [{ children: el.children }];
-
-  // ensureSpace BEFORE capturing startY — if it adds a new page the captured
-  // Y must be on the NEW page, otherwise the background rect draws at the old
-  // page position and the text is invisible over it.
+  // ensureSpace FIRST — if it adds a page, startY must be on the NEW page
   ensureSpace(doc, 40);
   const startY = doc.y;
-
-  // Rough background: draw a generous rectangle now; the left border that
-  // matches exact content height is drawn afterwards.
   const approxH = paragraphs.length * BODY_SIZE * 3.5 + 16;
   doc.save().fillColor(BRAND_LIGHT).fillOpacity(0.55)
     .roundedRect(ctx.contentX, startY - 2, ctx.contentWidth, approxH, 4)
     .fill().restore();
   doc.fillOpacity(1);
-
   for (const p of paragraphs) {
     const runs = trimRuns(flattenRuns(p.children, { italic: true, color: MUTED }));
     if (!runs.length) continue;
     emitRuns(doc, runs, BODY_SIZE, x, w);
     doc.moveDown(0.3);
   }
-
   const endY = doc.y;
-  // Exact-height left accent bar drawn AFTER content so its height is correct
   doc.save().fillColor(BRAND)
     .rect(ctx.contentX, startY - 2, 3.5, Math.max(8, endY - startY + 8))
     .fill().restore();
-
   doc.moveDown(0.5);
   doc.x = ctx.contentX;
 }
 
-// Block-level tags that must NEVER be flattened into inline text runs.
-// When any of these appears as a direct child of <li>, flattenRuns would
-// concatenate their entire text content (including all table cells) into one
-// continuous run — that's the "TesthhhhkkkklllsdnssdsddeeeeE" bug visible
-// when a table sits inside a list item. We exclude them from ownKids and
-// render them properly as block elements after the inline text instead.
-const BLOCK_TAGS_IN_LI = new Set([
-  'ul','ol','table','blockquote','img','figure',
-  'h1','h2','h3','h4','h5','h6','div','p',
-]);
+// Tags that must NOT be flattened into inline text inside a <li>.
+// Without this, a <table> inside <li> causes flattenRuns to concatenate
+// all its cell text into one continuous run → the corrupt line shown in PDFs.
+const BLOCK_IN_LI = new Set(['ul','ol','table','blockquote','img','figure','div','h1','h2','h3','h4','p']);
 
 function renderList(doc: any, items: any[], ctx: RenderCtx, ordered: boolean, depth: number) {
   let idx = 1;
   for (const li of items || []) {
     if (li.type !== 'tag' || li.name !== 'li') continue;
     const indent = depth * 18;
-    const x  = ctx.contentX + indent + 16;
-    const w  = ctx.contentWidth - indent - 16;
+    const x = ctx.contentX + indent + 16;
+    const w = ctx.contentWidth - indent - 16;
     ensureSpace(doc, BODY_SIZE * 2);
     const marker = ordered ? `${idx}.` : '•';
     idx++;
-
-    // Render marker
+    // Bullet / number
     doc.font('Helvetica').fontSize(BODY_SIZE).fillColor(BRAND)
       .text(marker, ctx.contentX + indent, doc.y, { width: 14, continued: false });
     doc.moveUp(1);
-
-    // Inline-only children (text, strong, em, span, a, mark, br, u, s)
+    // Inline-only children — excludes tables, nested lists, blockquotes etc.
     const ownKids = (li.children || []).filter(
-      (c: any) => !(c.type === 'tag' && BLOCK_TAGS_IN_LI.has(c.name))
+      (c: any) => !(c.type === 'tag' && BLOCK_IN_LI.has(c.name))
     );
     const runs = trimRuns(flattenRuns(ownKids, {}));
     if (runs.length) {
       emitRuns(doc, runs, BODY_SIZE, x, w);
     } else {
-      // No inline text — step past the marker line so the first block
-      // element below doesn't overlap the bullet point.
-      doc.moveDown(1);
+      doc.moveDown(1); // step past bullet when <li> has no inline text
     }
     doc.moveDown(0.3);
-
-    // Block-level children (nested lists, tables, blockquotes, images…)
-    // rendered as full block elements so their structure is preserved.
+    // Block-level children rendered as full blocks below the list item text
     for (const sub of li.children || []) {
       if (sub.type !== 'tag') continue;
-      if (sub.name === 'ul') {
-        renderList(doc, sub.children, ctx, false, depth + 1);
-      } else if (sub.name === 'ol') {
-        renderList(doc, sub.children, ctx, true, depth + 1);
-      } else if (BLOCK_TAGS_IN_LI.has(sub.name)) {
-        // Table, blockquote, img, headings etc — render as a block
-        renderNodes(doc, [sub], ctx);
-      }
+      if (sub.name === 'ul') renderList(doc, sub.children, ctx, false, depth + 1);
+      else if (sub.name === 'ol') renderList(doc, sub.children, ctx, true, depth + 1);
+      else if (BLOCK_IN_LI.has(sub.name)) renderNodes(doc, [sub], ctx);
     }
   }
   doc.moveDown(0.2);
@@ -403,16 +376,13 @@ function renderNodes(doc: any, nodes: any[], ctx: RenderCtx) {
       case 'ol': renderList(doc, node.children, ctx, true,  0); break;
       case 'table': renderTable(doc, node, ctx); break;
       case 'img':   renderImage(doc, node, ctx); break;
-      case 'hr': {
-        // TipTap horizontal rule — render as a light divider line
+      case 'hr':
         doc.moveDown(0.4);
-        doc.moveTo(ctx.contentX, doc.y)
-          .lineTo(ctx.contentX + ctx.contentWidth, doc.y)
+        doc.moveTo(ctx.contentX, doc.y).lineTo(ctx.contentX + ctx.contentWidth, doc.y)
           .strokeColor(BORDER).lineWidth(0.75).stroke();
         doc.moveDown(0.6);
         doc.x = ctx.contentX;
         break;
-      }
       default: renderNodes(doc, node.children, ctx);
     }
   }
@@ -455,19 +425,12 @@ async function loadImageBuffer(src: string, uploadDir: string): Promise<Buffer |
 }
 
 // ── Logo cache ────────────────────────────────────────────────────────────
-// Logo look-up order (first match wins):
-//  1. Same dir as the compiled .js (dist/common/utils/logo.png) — populated
-//     by nest-cli.json assetDir config below so it survives docker build.
-//  2. dist/assets/ — alternative nest-cli.json placement.
-//  3. process.cwd()/src/assets/ — works in dev (ts-node) or when the full
-//     source tree is present in the container.
-//  4. uploads/ — user-placed logo on the VPS volume; works in all configs.
 const LOGO_PATHS = [
-  join(__dirname, 'logo.png'),
-  join(__dirname, '../../assets/logo.png'),
-  join(process.cwd(), 'src',     'assets', 'logo.png'),
-  join(process.cwd(), 'src',     'assets', 'logo.jpg'),
-  join(process.cwd(), 'uploads', 'logo.png'),
+  join(__dirname, 'logo.png'),                       // dist/common/utils/logo.png (via nest-cli.json assets)
+  join(__dirname, '../../assets/logo.png'),           // dist/assets/logo.png
+  join(process.cwd(), 'src', 'assets', 'logo.png'),  // dev / ts-node
+  join(process.cwd(), 'src', 'assets', 'logo.jpg'),
+  join(process.cwd(), 'uploads', 'logo.png'),         // VPS volume — always works
   join(process.cwd(), 'uploads', 'logo.jpg'),
 ];
 let _logo: Buffer | null | undefined;
@@ -561,15 +524,26 @@ function drawHeader(doc: any, data: ArticlePdfData, contentWidth: number) {
     .text(meta, x, doc.y, { width: contentWidth });
   doc.moveDown(0.6);
 
-  // Summary — rendered with inline-HTML support so any bold/colour the
-  // admin applied in the TipTap summary field also appears in the PDF.
-  if (data.summary && stripHtmlForPdf(data.summary).trim()) {
-    const summaryDom = parseDocument(data.summary);
-    const summaryRuns = trimRuns(flattenRuns(summaryDom.children as any[], { italic: true, color: MUTED }));
-    if (summaryRuns.length) {
-      emitRuns(doc, summaryRuns, BODY_SIZE, x, contentWidth);
-      doc.moveDown(0.6);
-    }
+  // Summary — shown as a styled lead paragraph below the date line.
+  // Uses plain-text extraction (stripHtmlForPdf) rather than the full
+  // HTML→runs pipeline so it always renders regardless of how TipTap
+  // serialises the inline marks. Rich inline styling is kept for the WebView;
+  // the PDF shows the text content clearly which is what matters here.
+  const plainSummary = stripHtmlForPdf(data.summary || '').trim();
+  if (plainSummary) {
+    const summH = doc.heightOfString(plainSummary, {
+      font: 'Helvetica-Oblique', size: BODY_SIZE, width: contentWidth - 24,
+    }) + 20;
+    doc.save().fillColor(BRAND_LIGHT).fillOpacity(0.55)
+      .roundedRect(x, doc.y, contentWidth, summH, 4)
+      .fill().restore();
+    doc.fillOpacity(1);
+    doc.save().fillColor(BRAND)
+      .rect(x, doc.y, 3, summH)
+      .fill().restore();
+    doc.font('Helvetica-Oblique').fontSize(BODY_SIZE).fillColor(MUTED)
+      .text(plainSummary, x + 12, doc.y + 10, { width: contentWidth - 24 });
+    doc.moveDown(0.6);
   }
 
   // Divider
