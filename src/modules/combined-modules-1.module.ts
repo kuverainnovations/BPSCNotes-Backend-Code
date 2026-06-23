@@ -5,6 +5,7 @@ import {
   UseGuards, ParseUUIDPipe, OnModuleInit, UseInterceptors, UploadedFile,
   Logger,
 } from '@nestjs/common';
+import { Cron } from '@nestjs/schedule';
 import { FileInterceptor } from '@nestjs/platform-express';
 import { InjectDataSource } from '@nestjs/typeorm';
 import { DataSource } from 'typeorm';
@@ -869,7 +870,37 @@ class JobsService implements OnModuleInit {
     return successResponse({ isSaved: true });
   }
 
-  // ── User: sync alert prefs ────────────────────────────────
+  // ── Cron: auto-expire jobs past their last_date ───────────
+  // Runs daily at 00:05 IST (UTC 18:35 prior day) — marks all active jobs
+  // whose last_date has passed as 'expired' so they stop showing in the app.
+  @Cron('35 18 * * *')
+  async expireOverdueJobs() {
+    try {
+      const result = await this.db.query(
+        `UPDATE job_vacancies
+         SET status='expired', updated_at=NOW()
+         WHERE status='active' AND last_date < CURRENT_DATE
+         RETURNING id, title`
+      );
+      if (result.length > 0) {
+        this.logger.log(`expireOverdueJobs: expired ${result.length} jobs — ${result.map((r: any) => r.title).join(', ')}`);
+      }
+    } catch (err: any) {
+      this.logger.warn(`expireOverdueJobs failed: ${err.message}`);
+    }
+  }
+
+  // ── Cron: unset is_new flag after 7 days ─────────────────
+  // "New" badge should only show for the first week after posting.
+  @Cron('0 19 * * *')
+  async clearIsNewFlag() {
+    await this.db.query(
+      `UPDATE job_vacancies SET is_new=FALSE, updated_at=NOW()
+       WHERE is_new=TRUE AND created_at < NOW() - INTERVAL '7 days'`
+    ).catch(() => {});
+  }
+
+
   // Called when user toggles a category in the Alert sheet.
   // Returns the full current prefs list for the user.
   async syncAlertPrefs(userId: string, categories: string[]) {

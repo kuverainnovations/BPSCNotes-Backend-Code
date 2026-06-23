@@ -412,6 +412,12 @@ const percentile = Number(
       }
     } catch (_) {}
 
+    // ── Invalidate leaderboard cache so rank reflects new score ──
+    // Users check the leaderboard after a quiz; stale cache made it
+    // appear their rank hadn't changed even after a high-scoring attempt.
+    await this.cache.del('leaderboard:global:0:coins').catch(() => {});
+    await this.cache.del(`leaderboard:user:${userId}`).catch(() => {});
+
 return successResponse({
   attemptId: attempt[0].id,
   score,
