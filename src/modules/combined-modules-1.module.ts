@@ -1652,10 +1652,18 @@ class SubscriptionsController {
 
 // Cashfree webhook — no JWT guard (Cashfree calls this server-to-server)
 // rawBody populated by global raw-body middleware in main.ts
+// Cashfree webhook — no JWT guard (Cashfree calls this server-to-server)
+@Public()
 @Controller('webhooks')
 class WebhookController {
   constructor(private s: SubscriptionsService) {}
-  @Post('cashfree') @HttpCode(200) cashfree(@Req() req: any, @Body() body: any) { return this.s.handleCashfreeWebhook(req, body); }
+
+  @Public()
+  @Post('cashfree')
+  @HttpCode(200)
+  cashfree(@Req() req: any, @Body() body: any) {
+    return this.s.handleCashfreeWebhook(req, body);
+  }
 }
 
 @ApiTags('Admin — Subscriptions') @ApiBearerAuth() @Public()
