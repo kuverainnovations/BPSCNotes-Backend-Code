@@ -41,11 +41,14 @@ export const jwtConfig = registerAs('jwt', () => ({
 }));
 
 export const otpConfig = registerAs('otp', () => ({
-  msg91AuthKey:    process.env.MSG91_AUTH_KEY,
-  msg91TemplateId: process.env.MSG91_TEMPLATE_ID,
-  msg91SenderId:   process.env.MSG91_SENDER_ID || 'BPSCNT',
-  expiryMinutes:   parseInt(process.env.OTP_EXPIRY_MINUTES, 10) || 10,
-  maxAttempts:     parseInt(process.env.OTP_MAX_ATTEMPTS, 10) || 3,
+  // WhatsApp Cloud API credentials
+  whatsappPhoneNumberId: process.env.WHATSAPP_PHONE_NUMBER_ID,
+  whatsappAccessToken:   process.env.WHATSAPP_ACCESS_TOKEN,
+  whatsappTemplateName:  process.env.WHATSAPP_TEMPLATE_NAME || 'bpscnotes_otp',
+  whatsappTemplateLang:  process.env.WHATSAPP_TEMPLATE_LANG || 'en_US',
+  // OTP behaviour (unchanged)
+  expiryMinutes: parseInt(process.env.OTP_EXPIRY_MINUTES, 10) || 10,
+  maxAttempts:   parseInt(process.env.OTP_MAX_ATTEMPTS,   10) || 3,
 }));
 
 export const cloudinaryConfig = registerAs('cloudinary', () => ({

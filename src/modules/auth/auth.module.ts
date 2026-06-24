@@ -1,6 +1,7 @@
 // ════════════════════════════════════════════════════════════
 // AUTH MODULE — Full implementation
 // ════════════════════════════════════════════════════════════
+import * as WhatsAppUtil from '../common/utils/whatsapp.util';
 import {
   Module, Injectable, Controller, Post, Get, Query, Body, Req,
   HttpCode, HttpStatus, UnauthorizedException, BadRequestException,
@@ -21,7 +22,6 @@ import { Inject } from '@nestjs/common';
 import { CACHE_MANAGER } from '@nestjs/cache-manager';
 import { Cache } from 'cache-manager';
 import * as bcrypt from 'bcryptjs';
-import * as axios from 'axios';
 import {
   IsString, IsOptional, IsEmail, Length, Matches,
   IsNotEmpty,
@@ -123,53 +123,53 @@ export class OtpService {
     private readonly config: ConfigService,
   ) {}
 
-  async send(mobile: string): Promise<{ success: boolean; otp?: string }> {
-    const otpConfig = this.config.get('otp');
-    const otp       = this.generateOtp();
+  async send(mobile: string): Promise<{ success: boolean }> {
+    const otpConfig  = this.config.get('otp');
+    const otp        = this.generateOtp();
     const expiryMins = otpConfig.expiryMinutes;
 
-    // Invalidate previous OTPs for this mobile
-    await this.db.query(`DELETE FROM otps WHERE mobile = $1 AND is_used = FALSE`, [mobile]);
+    // Invalidate all previous unused OTPs for this mobile
+    await this.db.query(
+      `DELETE FROM otps WHERE mobile = $1 AND is_used = FALSE`, [mobile]
+    );
 
-    // Store hashed OTP
+    // Store bcrypt-hashed OTP
     const hash = await bcrypt.hash(otp, 6);
     await this.db.query(
-      `INSERT INTO otps (mobile, otp_hash, expires_at) VALUES ($1, $2, NOW() + $3::INTERVAL)`,
+      `INSERT INTO otps (mobile, otp_hash, expires_at)
+       VALUES ($1, $2, NOW() + $3::INTERVAL)`,
       [mobile, hash, `${expiryMins} minutes`]
     );
 
-
+    // Development: log OTP to console, skip WhatsApp send
     if (this.config.get('app.env') === 'development') {
-      console.log(`📱 DEV OTP for ${mobile}: ${otp}`);
-      return { success: true, otp };
+      console.log(`📲 DEV OTP for ${mobile}: ${otp}`);
+      return { success: true };
     }
 
-    // TEMP: log OTP while DLT registration is pending — remove before launch
-    console.log(`📱 [TEMP] OTP for ${mobile}: ${otp}`);
+    // Production: deliver via WhatsApp Cloud API
+    const cfg = WhatsAppUtil.buildWhatsAppConfig({
+      phoneNumberId: otpConfig.whatsappPhoneNumberId,
+      accessToken:   otpConfig.whatsappAccessToken,
+      templateName:  otpConfig.whatsappTemplateName,
+      templateLang:  otpConfig.whatsappTemplateLang,
+    });
 
-    try {
-      const msg91Response = await axios.default.post(
-        'https://api.msg91.com/api/v5/otp',
-        null,
-        {
-          params: {
-            authkey:     otpConfig.msg91AuthKey,
-            mobile:      `91${mobile.replace('+91', '')}`,
-            template_id: otpConfig.msg91TemplateId,
-            otp,
-          },
-        }
-      );
-      console.log(`📱 MSG91 response for ${mobile}:`, JSON.stringify(msg91Response.data));
-      // TEMP: return OTP in response while DLT registration is pending — remove once SMS delivery is confirmed working
-      return { success: true, otp };
-    } catch (err) {
-      console.error('MSG91 error:', err.response?.data || err.message);
-      console.error('MSG91 status:', err.response?.status);
-      console.error('MSG91 config used — authkey:', otpConfig.msg91AuthKey?.slice(0,8) + '...', 'template:', otpConfig.msg91TemplateId);
-      // TEMP: don't block login on MSG91/DLT failures — OTP is already stored, just wasn't delivered via SMS. Remove once DLT template is approved.
-      return { success: true, otp };
+    if (!cfg.phoneNumberId || !cfg.accessToken) {
+      // Gateway not configured — log and fail loudly in production
+      console.error('WhatsApp OTP: WHATSAPP_PHONE_NUMBER_ID or WHATSAPP_ACCESS_TOKEN not set');
+      throw new Error('OTP delivery service is not configured. Contact support.');
     }
+
+    const result = await WhatsAppUtil.sendWhatsAppOtp(cfg, mobile, otp, expiryMins);
+
+    if (!result.success) {
+      console.error(`WhatsApp OTP delivery failed for ${mobile}:`, result.error);
+      throw new Error('Failed to send OTP via WhatsApp. Please try again.');
+    }
+
+    console.log(`📲 WhatsApp OTP sent to ${mobile} (msgId: ${result.messageId})`);
+    return { success: true };
   }
 
   async verify(mobile: string, otp: string): Promise<void> {
@@ -232,8 +232,8 @@ export class AuthService {
       `SELECT id, name FROM users WHERE mobile = $1 AND deleted_at IS NULL`, [mobile]
     );
     const isNewUser = !result.length;
-    const resp = await this.otpService.send(mobile);
-    return { isNewUser, ...(resp.otp && { otp: resp.otp }) };
+    await this.otpService.send(mobile);
+    return { isNewUser };
   }
 
   async verifyOtp(mobile: string, otp: string) {
@@ -1172,7 +1172,7 @@ export class AuthController {
     return successResponse(data, 'MPIN created successfully! Use it to login next time \u{1F512}');
   }
 
-  /** POST /auth/forgot-mpin — public, triggers MSG91 OTP */
+  /** POST /auth/forgot-mpin — public, sends WhatsApp OTP */
   @Public()
   @Post('forgot-mpin')
   @HttpCode(HttpStatus.OK)
