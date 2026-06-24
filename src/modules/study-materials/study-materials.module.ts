@@ -1099,8 +1099,11 @@ if (query.search)  { conditions.push(`(sm.title ILIKE $${pi} OR sm.subject ILIKE
   }
 
   // ── POST: initiate a marketplace purchase ───────────────────
-  // Purchases are real-money only via Cashfree.
-  // Coins cannot be used to purchase content — they are rewards only.
+  // Hybrid checkout: buyer may apply up to `max_coins_per_purchase`
+  // coins as a discount (1 coin = coin_to_inr_rate ₹). Remaining ₹
+  // balance is paid via Cashfree. If coins fully cover the price,
+  // the purchase completes immediately with no payment step.
+  // FIX Issue 5: coinsToApply removed — real-money Cashfree only
   async initPurchase(materialId: string, userId: string) {
     // Already purchased?
     const [existing] = await this.db.query(
@@ -1117,18 +1120,22 @@ if (query.search)  { conditions.push(`(sm.title ILIKE $${pi} OR sm.subject ILIKE
 
     const price = material.price ?? 0;
 
-    // Free material — no payment needed
+    // Free material — no payment needed at all
     if (price === 0) {
       await this.db.query(
         `INSERT INTO material_purchases (material_id, user_id, price_paid, coins_paid) VALUES ($1,$2,0,0)`,
         [materialId, userId]
       );
       const fileUrl = await this.fileUrlForMaterial(materialId);
-      return successResponse({ purchased: true, alreadyPurchased: false, amountDueInr: 0, fileUrl },
+      return successResponse({ purchased: true, alreadyPurchased: false, coinsSpent: 0, amountDueInr: 0, fileUrl },
         '🎉 Added to your library!');
     }
 
-    // ── Real-money payment via Cashfree ─────────────────────────
+    // FIX Issue 5: Coins cannot be used for purchases.
+    // All paid materials require real-money Cashfree payment.
+    const amountDueInr = price;
+
+    // ── Full price to Cashfree ─────────────────────────────────
     let paymentSessionId: string | null = null;
     let cfOrderId:        string | null = null;
     try {
@@ -1150,7 +1157,7 @@ if (query.search)  { conditions.push(`(sm.title ILIKE $${pi} OR sm.subject ILIKE
       );
       const order = await createCashfreeOrder(creds, {
         orderId:       cashfreeReceiptId('mat', materialId, userId),
-        orderAmount:   price,
+        orderAmount:   amountDueInr,
         orderCurrency: 'INR',
         customerId:    userId,
         customerPhone: userRow?.mobile || '9999999999',
@@ -1253,7 +1260,7 @@ if (query.search)  { conditions.push(`(sm.title ILIKE $${pi} OR sm.subject ILIKE
     );
 
     return await this.finalizeMaterialPurchase(
-      material, userId, order.id, order.coins_applied, order.coin_discount_inr, order.material_price
+      material, userId, order.id, order.material_price
     );
   }
 
@@ -1263,25 +1270,15 @@ if (query.search)  { conditions.push(`(sm.title ILIKE $${pi} OR sm.subject ILIKE
   private async finalizeMaterialPurchase(
     material: { id: string; title: string; price: number; uploader_id: string | null },
     userId: string, purchaseOrderId: string,
-    coinsApplied: number, coinDiscountInr: number, fullPrice: number,
+    fullPrice: number, // FIX Issue 5: coinsApplied/coinDiscountInr removed
   ) {
-    // Deduct applied coins from buyer
-    let updatedCoins: number | null = null;
-    if (coinsApplied > 0) {
-      await this.db.query(`UPDATE users SET coins=coins-$1 WHERE id=$2`, [coinsApplied, userId]);
-      const [u] = await this.db.query(`SELECT coins FROM users WHERE id=$1`, [userId]);
-      updatedCoins = u.coins;
-      await this.db.query(
-        `INSERT INTO coin_transactions (user_id,type,amount,description,action,balance)
-         VALUES ($1,'spent',$2,'Marketplace discount: '||$3,'material_purchase_discount',$4)`,
-        [userId, coinsApplied, material.title, updatedCoins]
-      );
-    }
+    // FIX Issue 5: No coin deduction — coins cannot buy materials
+    const updatedCoins = null;
 
     // ── 60/40 split: compute seller's share and the platform's net fee ──
     // Seller share is 60% of the FULL listed price (coin discounts don't
     // reduce the seller's payout — the platform absorbs that cost).
-    // Platform's net fee = amount actually collected (fullPrice - coinDiscountInr)
+    // Platform's net fee = amount actually collected (fullPrice)
     // minus what was paid out to the seller. This can be less than the
     // "headline" 40% when a coin discount was applied.
     let sellerShare = 0;
@@ -1289,7 +1286,7 @@ if (query.search)  { conditions.push(`(sm.title ILIKE $${pi} OR sm.subject ILIKE
     if (material.uploader_id && material.uploader_id !== userId && fullPrice > 0) {
       const sellerPct = await this.getSettingNumber('seller_commission_pct', 60);
       sellerShare = Math.floor(fullPrice * sellerPct / 100);
-      platformFee = Math.max(0, (fullPrice - coinDiscountInr) - sellerShare);
+      platformFee = Math.max(0, fullPrice - sellerShare);
     }
 
     // Record the purchase (legacy table — kept for "isPurchased" checks elsewhere)
@@ -1297,7 +1294,7 @@ if (query.search)  { conditions.push(`(sm.title ILIKE $${pi} OR sm.subject ILIKE
       `INSERT INTO material_purchases (material_id, user_id, price_paid, coins_paid, platform_fee)
        VALUES ($1,$2,$3,$4,$5)
        ON CONFLICT (material_id, user_id) DO NOTHING`,
-      [material.id, userId, fullPrice, coinsApplied, platformFee]
+      [material.id, userId, fullPrice, 0, platformFee]
     );
 
     if (sellerShare > 0) {
@@ -1312,8 +1309,7 @@ if (query.search)  { conditions.push(`(sm.title ILIKE $${pi} OR sm.subject ILIKE
 
     return successResponse({
       purchased: true, alreadyPurchased: false,
-      coinsSpent: coinsApplied, coinsBalance: updatedCoins,
-      coinDiscountInr, amountPaidInr: fullPrice - coinDiscountInr,
+      amountPaidInr: fullPrice,
       fileUrl,
     }, '🎉 Purchase successful! Full PDF unlocked.');
   }
@@ -1825,8 +1821,10 @@ export class StudyMaterialsController {
     return this.svc.removeDownload(materialId, r.user.id);
   }
 
-  // POST /study-materials/:id/purchase/init  body: {} (coins no longer accepted)
-  // Returns either a completed purchase (free materials) or a Cashfree session.
+  // ── Marketplace purchase — hybrid coins + Cashfree checkout ──
+  // POST /study-materials/:id/purchase/init  body: {} (coins removed, FIX Issue 5)
+  // Returns either a completed purchase (free or fully coin-covered)
+  // or a Cashfree session to pay the remaining ₹ balance.
   @Post(':id/purchase/init')
   @HttpCode(HttpStatus.OK)
   initPurchase(@Param('id', ParseUUIDPipe) id: string, @Req() r: any) {

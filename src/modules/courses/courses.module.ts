@@ -424,8 +424,7 @@ export class CoursesService {
     return successResponse({ course });
   }
 
-  // FIX Issue 3: Coins cannot be used to purchase courses.
-  // Only real-money Cashfree payment is accepted for paid courses.
+  // FIX Issue 5: no coinsToApply — coins cannot be used for purchases
   async enroll(courseId: string, userId: string) {
     const course = await this.db.query(`SELECT id, is_paid, price, title FROM courses WHERE id=$1 AND status='published'`, [courseId]);
     if (!course.length) throw new NotFoundException('Course not found');
@@ -451,79 +450,87 @@ export class CoursesService {
             UNIQUE(user_id, course_id)
           )
         `);
+        // Coin-discount tracking columns — added separately so existing
+        // deployments with the table already created still pick them up.
         await this.db.query(`ALTER TABLE course_purchases ADD COLUMN IF NOT EXISTS coins_applied INTEGER NOT NULL DEFAULT 0`);
         await this.db.query(`ALTER TABLE course_purchases ADD COLUMN IF NOT EXISTS coin_discount_inr INTEGER NOT NULL DEFAULT 0`);
-        await this.db.query(`ALTER TABLE course_purchases ADD COLUMN IF NOT EXISTS provider_order_id VARCHAR(200)`);
-        await this.db.query(`ALTER TABLE course_purchases ADD COLUMN IF NOT EXISTS payment_provider VARCHAR(50)`);
 
         const individualPurchase = await this.db.query(
           `SELECT id, amount FROM course_purchases WHERE user_id=$1 AND course_id=$2 AND status='completed'`,
           [userId, courseId]
         );
         const coursePrice = course[0].price || 0;
+        // A "completed" purchase recorded at ₹0 for a course that now has a
+        // real price is a stale row from before the price-fetch bug was
+        // fixed — it doesn't represent a genuine payment. Treat it as if no
+        // purchase exists so the user is correctly asked to pay.
         const hasValidPurchase = individualPurchase.length > 0 &&
           !(coursePrice > 0 && Number(individualPurchase[0].amount) === 0);
 
         if (!hasValidPurchase) {
-          // ── Create Cashfree order for the full course price (no coin discount) ──
-          let paymentSessionId: string | null = null;
-          let cfOrderId:        string | null = null;
-          try {
-            const { createCashfreeOrder, buildCashfreeCredentials, cashfreeReceiptId } = CashfreeUtil;
-            const rows = await this.db.query(
-              `SELECT key, value FROM payment_settings
-               WHERE key IN ('cashfree_app_id','cashfree_secret_key','payment_mode')
-                 AND value IS NOT NULL AND value != ''`
-            ).catch(() => []);
-            const cfMap: any = {};
-            for (const r of rows) cfMap[r.key] = r.value;
-            const creds = buildCashfreeCredentials({
-              appId:     cfMap['cashfree_app_id'],
-              secretKey: cfMap['cashfree_secret_key'],
-              env:       cfMap['payment_mode'],
-            });
-            const [userRow] = await this.db.query(
-              `SELECT name, email, mobile FROM users WHERE id=$1`, [userId]
-            );
-            const order = await createCashfreeOrder(creds, {
-              orderId:       cashfreeReceiptId('course', courseId, userId),
-              orderAmount:   coursePrice,
-              orderCurrency: 'INR',
-              customerId:    userId,
-              customerPhone: userRow?.mobile || '9999999999',
-              customerEmail: userRow?.email  || `${userId}@bpscnotes.app`,
-              customerName:  userRow?.name   || 'BPSCNotes User',
-              orderNote:     `Course: ${course[0].title}`,
-              orderMeta:     { courseId, type: 'course_purchase' },
-            });
-            paymentSessionId = order.paymentSessionId;
-            cfOrderId        = order.orderId;
+          // FIX Issue 5: No coin purchase. Real-money Cashfree payment only.
+          const amountDueInr = coursePrice;
+          {
+            // ── Create Cashfree order for the full course price ──
+            let paymentSessionId: string | null = null;
+            let cfOrderId:        string | null = null;
+            try {
+              const { createCashfreeOrder, buildCashfreeCredentials, cashfreeReceiptId } = CashfreeUtil;
+              const rows = await this.db.query(
+                `SELECT key, value FROM payment_settings
+                 WHERE key IN ('cashfree_app_id','cashfree_secret_key','payment_mode')
+                   AND value IS NOT NULL AND value != ''`
+              ).catch(() => []);
+              const cfMap: any = {};
+              for (const r of rows) cfMap[r.key] = r.value;
+              const creds = buildCashfreeCredentials({
+                appId:     cfMap['cashfree_app_id'],
+                secretKey: cfMap['cashfree_secret_key'],
+                env:       cfMap['payment_mode'],
+              });
+              const [userRow] = await this.db.query(
+                `SELECT name, email, mobile FROM users WHERE id=$1`, [userId]
+              );
+              const order = await createCashfreeOrder(creds, {
+                orderId:       cashfreeReceiptId('course', courseId, userId),
+                orderAmount:   amountDueInr,
+                orderCurrency: 'INR',
+                customerId:    userId,
+                customerPhone: userRow?.mobile || '9999999999',
+                customerEmail: userRow?.email  || `${userId}@bpscnotes.app`,
+                customerName:  userRow?.name   || 'BPSCNotes User',
+                orderNote:     `Course: ${course[0].title}`,
+                orderMeta:     { courseId, type: 'course_purchase' },
+              });
+              paymentSessionId = order.paymentSessionId;
+              cfOrderId        = order.orderId;
 
-            await this.db.query(
-              `INSERT INTO course_purchases
-                 (user_id, course_id, amount, coins_applied, coin_discount_inr,
-                  provider_order_id, payment_provider, status)
-               VALUES ($1,$2,$3,0,0,$4,'cashfree','pending')
-               ON CONFLICT (user_id, course_id) DO UPDATE
-                 SET amount=$3, coins_applied=0, coin_discount_inr=0,
-                     provider_order_id=$4, payment_provider='cashfree',
-                     status='pending', updated_at=NOW()`,
-              [userId, courseId, coursePrice, cfOrderId]
-            );
-          } catch (err: any) {
-            console.error('Course Cashfree order creation failed:', err.message);
+              await this.db.query(
+                `INSERT INTO course_purchases
+                   (user_id, course_id, amount, coins_applied, coin_discount_inr,
+                    provider_order_id, payment_provider, status)
+                 VALUES ($1,$2,$3,0,0,$4,'cashfree','pending')
+                 ON CONFLICT (user_id, course_id) DO UPDATE
+                   SET amount=$3, coins_applied=0, coin_discount_inr=0,
+                       provider_order_id=$4, payment_provider='cashfree',
+                       status='pending', updated_at=NOW()`,
+                [userId, courseId, amountDueInr, cfOrderId]
+              );
+            } catch (err: any) {
+              console.error('Course Cashfree order creation failed:', err.message);
+            }
+
+            throw new HttpException({
+              message:          'Purchase required to enroll in this course',
+              code:             'PURCHASE_REQUIRED',
+              price:            amountDueInr,
+              coursePrice,
+              paymentSessionId,
+              providerOrderId:  cfOrderId,
+              courseTitle:      course[0].title,
+              courseId,
+            }, HttpStatus.PAYMENT_REQUIRED);
           }
-
-          throw new HttpException({
-            message:          'Purchase required to enroll in this course',
-            code:             'PURCHASE_REQUIRED',
-            price:            coursePrice,
-            coursePrice,
-            paymentSessionId,
-            providerOrderId:  cfOrderId,
-            courseTitle:      course[0].title,
-            courseId,
-          }, HttpStatus.PAYMENT_REQUIRED);
         }
       }
     }
@@ -625,17 +632,8 @@ export class CoursesService {
       [payment.cfPaymentId, payment.paymentMethod || 'upi', purchase.id]
     );
 
-    // 4b. Deduct any coins that were reserved as a discount for this order
-    if (purchase.coins_applied > 0) {
-      await this.db.query(`UPDATE users SET coins = coins - $1 WHERE id=$2`, [purchase.coins_applied, userId]);
-      const [u] = await this.db.query(`SELECT coins FROM users WHERE id=$1`, [userId]);
-      const [courseRow] = await this.db.query(`SELECT title FROM courses WHERE id=$1`, [courseId]);
-      await this.db.query(
-        `INSERT INTO coin_transactions (user_id,type,amount,description,action,balance)
-         VALUES ($1,'spent',$2,'Course purchase discount: '||$3,'course_purchase_discount',$4)`,
-        [userId, purchase.coins_applied, courseRow?.title ?? '', u.coins]
-      );
-    }
+    // FIX Issue 5: coin deduction removed — no coins used for purchases
+          
 
     // 5. Grant enrollment
     await this.db.query(
@@ -1126,7 +1124,7 @@ export class CoursesController {
   @Post(':id/enroll')
   @HttpCode(HttpStatus.CREATED)
   enroll(@Param('id', ParseUUIDPipe) id: string, @Req() req: any) {
-    // FIX Issue 3: coins no longer accepted for course purchases
+    // FIX Issue 5: no coinsToApply in body
     return this.service.enroll(id, req.user.id);
   }
 
