@@ -1,3 +1,4 @@
+import * as CashfreeUtil from '../common/utils/cashfree.util';
 import {
   Module, Injectable, Controller,
   Get, Post, Put, Delete, Patch,
@@ -1160,8 +1161,7 @@ if (query.search)  { conditions.push(`(sm.title ILIKE $${pi} OR sm.subject ILIKE
     let paymentSessionId: string | null = null;
     let cfOrderId:        string | null = null;
     try {
-      const { createCashfreeOrder, buildCashfreeCredentials, cashfreeReceiptId } =
-        await import('../common/utils/cashfree.util');
+      const { createCashfreeOrder, buildCashfreeCredentials, cashfreeReceiptId } = CashfreeUtil;
       const rows = await this.db.query(
         `SELECT key, value FROM payment_settings
          WHERE key IN ('cashfree_app_id','cashfree_secret_key','payment_mode')
@@ -1242,8 +1242,7 @@ if (query.search)  { conditions.push(`(sm.title ILIKE $${pi} OR sm.subject ILIKE
     if (!order) throw new NotFoundException('No pending purchase order found. Please try again.');
 
     // ── Verify payment with Cashfree (server-side) ───────────────
-    const { verifyCashfreePayment, buildCashfreeCredentials } =
-      await import('../common/utils/cashfree.util');
+    const { verifyCashfreePayment, buildCashfreeCredentials } = CashfreeUtil;
     const rows = await this.db.query(
       `SELECT key, value FROM payment_settings
        WHERE key IN ('cashfree_app_id','cashfree_secret_key','payment_mode')

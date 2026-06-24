@@ -1,3 +1,4 @@
+import * as CashfreeUtil from '../common/utils/cashfree.util';
 // ════════════════════════════════════════════════════════════
 // ADMIN MODULE — Login, Dashboard Stats, Settings, Users
 // ════════════════════════════════════════════════════════════
@@ -814,8 +815,7 @@ class PaymentSettingsService {
     const providerOrderId   = sub.provider_order_id;
     if (providerPaymentId && providerOrderId) {
       try {
-        const { refundCashfreePayment, buildCashfreeCredentials } =
-          await import('../common/utils/cashfree.util');
+        const { refundCashfreePayment, buildCashfreeCredentials } = CashfreeUtil;
         const rows = await this.db.query(
           `SELECT key, value FROM payment_settings
            WHERE key IN ('cashfree_app_id','cashfree_secret_key','payment_mode')

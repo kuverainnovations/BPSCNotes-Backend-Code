@@ -1,3 +1,4 @@
+import * as CashfreeUtil from '../common/utils/cashfree.util';
 // ════════════════════════════════════════════════════════════
 // COURSES MODULE — Repository → Service → Controller
 // ════════════════════════════════════════════════════════════
@@ -508,8 +509,7 @@ export class CoursesService {
             let paymentSessionId: string | null = null;
             let cfOrderId:        string | null = null;
             try {
-              const { createCashfreeOrder, buildCashfreeCredentials, cashfreeReceiptId } =
-                await import('../common/utils/cashfree.util');
+              const { createCashfreeOrder, buildCashfreeCredentials, cashfreeReceiptId } = CashfreeUtil;
               const rows = await this.db.query(
                 `SELECT key, value FROM payment_settings
                  WHERE key IN ('cashfree_app_id','cashfree_secret_key','payment_mode')
@@ -630,8 +630,7 @@ export class CoursesService {
     }
 
     // 3. Verify payment with Cashfree (server-side — client cannot tamper)
-    const { verifyCashfreePayment, buildCashfreeCredentials } =
-      await import('../common/utils/cashfree.util');
+    const { verifyCashfreePayment, buildCashfreeCredentials } = CashfreeUtil;
     const rows = await this.db.query(
       `SELECT key, value FROM payment_settings
        WHERE key IN ('cashfree_app_id','cashfree_secret_key','payment_mode')
