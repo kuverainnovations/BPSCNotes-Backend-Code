@@ -56,18 +56,14 @@ export async function sendWhatsAppOtp(
         {
           type: 'body',
           parameters: [
-            { type: 'text', text: otp },
-            { type: 'text', text: String(expiryMinutes) },
-          ],
-        },
-        // AUTHENTICATION templates support an optional button component
-        // for one-tap copy — include it if your template has it.
-        {
-          type:     'button',
-          sub_type: 'url',
-          index:    '0',
-          parameters: [
-            { type: 'text', text: otp },
+            {
+              type: 'text',
+              text: 'User',     // {{1}}
+            },
+            {
+              type: 'text',
+              text: otp,        // {{2}}
+            },
           ],
         },
       ],
@@ -111,7 +107,7 @@ export function buildWhatsAppConfig(overrides: {
   return {
     phoneNumberId: overrides.phoneNumberId || process.env.WHATSAPP_PHONE_NUMBER_ID || '',
     accessToken:   overrides.accessToken   || process.env.WHATSAPP_ACCESS_TOKEN    || '',
-    templateName:  overrides.templateName  || process.env.WHATSAPP_TEMPLATE_NAME   || 'bpscnotes_otp',
+    templateName:  overrides.templateName  || process.env.WHATSAPP_TEMPLATE_NAME   || 'bpsc_account_request',
     templateLang:  overrides.templateLang  || process.env.WHATSAPP_TEMPLATE_LANG   || 'en_US',
   };
 }
