@@ -758,7 +758,6 @@ class PaymentSettingsService {
   constructor(@InjectDataSource() private db: DataSource) {}
 
   async getSettings() {
-    // Create table if not exists
     await this.db.query(`
       CREATE TABLE IF NOT EXISTS payment_settings (
         key VARCHAR(100) PRIMARY KEY,
@@ -770,10 +769,10 @@ class PaymentSettingsService {
     const map: any = {};
     rows.forEach((r: any) => { map[r.key] = r.value; });
     return {
-      razorpayKeyId:        map['razorpay_key_id']        || '',
-      razorpayMode:         map['razorpay_mode']          || 'test',
-      upiDisplayName:       map['upi_display_name']       || 'BPSCNotes',
-      paymentEnabled:       (map['payment_enabled']       || 'true') === 'true',
+      cashfreeAppId:  map['cashfree_app_id']  || '',
+      paymentMode:    map['payment_mode']      || 'sandbox',
+      upiDisplayName: map['upi_display_name']  || 'BPSCNotes',
+      paymentEnabled: (map['payment_enabled']  || 'true') === 'true',
       // Never return secrets
     };
   }
@@ -787,17 +786,13 @@ class PaymentSettingsService {
       )
     `);
     const entries: any[] = [
-      ['razorpay_key_id',        data.razorpayKeyId        || ''],
-      ['razorpay_mode',          data.razorpayMode          || 'test'],
-      ['upi_display_name',       data.upiDisplayName        || 'BPSCNotes'],
-      ['payment_enabled',        String(data.paymentEnabled !== false)],
+      ['cashfree_app_id',  data.cashfreeAppId  || ''],
+      ['payment_mode',     data.paymentMode     || 'sandbox'],
+      ['upi_display_name', data.upiDisplayName  || 'BPSCNotes'],
+      ['payment_enabled',  String(data.paymentEnabled !== false)],
     ];
-    if (data.razorpayKeySecret) {
-      entries.push(['razorpay_key_secret', data.razorpayKeySecret]);
-    }
-    if (data.razorpayWebhookSecret) {
-      entries.push(['razorpay_webhook_secret', data.razorpayWebhookSecret]);
-    }
+    if (data.cashfreeSecretKey)    entries.push(['cashfree_secret_key',    data.cashfreeSecretKey]);
+    if (data.cashfreeWebhookSecret) entries.push(['cashfree_webhook_secret', data.cashfreeWebhookSecret]);
     for (const [k, v] of entries) {
       await this.db.query(
         `INSERT INTO payment_settings(key,value,updated_at) VALUES($1,$2,NOW())
@@ -814,24 +809,32 @@ class PaymentSettingsService {
     );
     if (!sub) throw new NotFoundException('Subscription not found');
 
-    // Get Razorpay credentials
-    const [keyRow]    = await this.db.query(`SELECT value FROM payment_settings WHERE key='razorpay_key_id'`);
-    const [secretRow] = await this.db.query(`SELECT value FROM payment_settings WHERE key='razorpay_key_secret'`);
-    const key    = keyRow?.value || process.env.RAZORPAY_KEY_ID;
-    const secret = secretRow?.value || process.env.RAZORPAY_KEY_SECRET;
-
-    if (sub.razorpay_payment_id && key && secret) {
+    // ── Cashfree refund ───────────────────────────────────────
+    const providerPaymentId = sub.provider_payment_id;
+    const providerOrderId   = sub.provider_order_id;
+    if (providerPaymentId && providerOrderId) {
       try {
-        await fetch(`https://api.razorpay.com/v1/payments/${sub.razorpay_payment_id}/refund`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': 'Basic ' + Buffer.from(`${key}:${secret}`).toString('base64'),
-          },
-          body: JSON.stringify({ amount: sub.final_amount * 100 }),
+        const { refundCashfreePayment, buildCashfreeCredentials } =
+          await import('../../common/utils/cashfree.util');
+        const rows = await this.db.query(
+          `SELECT key, value FROM payment_settings
+           WHERE key IN ('cashfree_app_id','cashfree_secret_key','payment_mode')
+             AND value IS NOT NULL AND value != ''`
+        ).catch(() => []);
+        const cfMap: any = {};
+        for (const r of rows) cfMap[r.key] = r.value;
+        const creds = buildCashfreeCredentials({
+          appId:     cfMap['cashfree_app_id'] || process.env.CASHFREE_APP_ID,
+          secretKey: cfMap['cashfree_secret_key'] || process.env.CASHFREE_SECRET_KEY,
+          env:       cfMap['payment_mode'],
+        });
+        await refundCashfreePayment(creds, providerOrderId, {
+          refundId:     `refund_sub_${subId.substring(0, 16)}`,
+          refundAmount: sub.final_amount,
+          refundNote:   'Admin initiated refund via BPSCNotes admin panel',
         });
       } catch (err: any) {
-        console.error('Razorpay refund failed:', err.message);
+        console.error('Cashfree refund failed:', err.message);
         throw new BadRequestException('Refund API call failed: ' + err.message);
       }
     }
@@ -890,7 +893,7 @@ class PaymentSettingsService {
     );
     const recentPayments = await this.db.query(
       `SELECT s.id, u.name, u.phone, s.plan, s.final_amount, s.payment_method,
-              s.payment_status, s.razorpay_payment_id, s.created_at
+              s.payment_status, s.provider_payment_id, s.payment_provider, s.created_at
        FROM subscriptions s JOIN users u ON u.id=s.user_id
        WHERE s.payment_status IN ('success','failed','refunded')
        ORDER BY s.created_at DESC LIMIT 50`

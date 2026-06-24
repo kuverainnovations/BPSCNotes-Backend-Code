@@ -484,7 +484,7 @@ export class CoursesService {
           const coinDiscountInr = Math.min(coursePrice, Math.floor(coinsApplied * coinToInrRate));
           const amountDueInr    = coursePrice - coinDiscountInr;
 
-          // ── Fully covered by coins — no Razorpay needed ──
+          // ── Fully covered by coins — no gateway call needed ──
           if (amountDueInr <= 0) {
             if (coinsApplied > 0) {
               await this.db.query(`UPDATE users SET coins = coins - $1 WHERE id=$2`, [coinsApplied, userId]);
@@ -504,49 +504,66 @@ export class CoursesService {
             );
             // Fall through to grant enrollment below.
           } else {
-            let razorpayOrderId: string | null = null;
+            // ── Create Cashfree order for the remaining ₹ balance ──
+            let paymentSessionId: string | null = null;
+            let cfOrderId:        string | null = null;
             try {
-              const rpKey    = process.env.RAZORPAY_KEY_ID;
-              const rpSecret = process.env.RAZORPAY_KEY_SECRET;
-              const rpRes = await fetch('https://api.razorpay.com/v1/orders', {
-                method: 'POST',
-                headers: {
-                  'Content-Type': 'application/json',
-                  'Authorization': 'Basic ' + Buffer.from(`${rpKey}:${rpSecret}`).toString('base64'),
-                },
-                body: JSON.stringify({
-                  amount:   amountDueInr * 100,
-                  currency: 'INR',
-                  receipt:  `course_${courseId.substring(0,8)}_${userId.substring(0,8)}`,
-                  notes:    { courseId, userId, type: 'course_purchase', coinsApplied },
-                }),
+              const { createCashfreeOrder, buildCashfreeCredentials, cashfreeReceiptId } =
+                await import('../../common/utils/cashfree.util');
+              const rows = await this.db.query(
+                `SELECT key, value FROM payment_settings
+                 WHERE key IN ('cashfree_app_id','cashfree_secret_key','payment_mode')
+                   AND value IS NOT NULL AND value != ''`
+              ).catch(() => []);
+              const cfMap: any = {};
+              for (const r of rows) cfMap[r.key] = r.value;
+              const creds = buildCashfreeCredentials({
+                appId:     cfMap['cashfree_app_id'],
+                secretKey: cfMap['cashfree_secret_key'],
+                env:       cfMap['payment_mode'],
               });
-              const rpData = await rpRes.json();
-              razorpayOrderId = rpData.id || null;
+              const [userRow] = await this.db.query(
+                `SELECT name, email, mobile FROM users WHERE id=$1`, [userId]
+              );
+              const order = await createCashfreeOrder(creds, {
+                orderId:       cashfreeReceiptId('course', courseId, userId),
+                orderAmount:   amountDueInr,
+                orderCurrency: 'INR',
+                customerId:    userId,
+                customerPhone: userRow?.mobile || '9999999999',
+                customerEmail: userRow?.email  || `${userId}@bpscnotes.app`,
+                customerName:  userRow?.name   || 'BPSCNotes User',
+                orderNote:     `Course: ${course[0].title}`,
+                orderMeta:     { courseId, type: 'course_purchase' },
+              });
+              paymentSessionId = order.paymentSessionId;
+              cfOrderId        = order.orderId;
 
-              if (razorpayOrderId) {
-                await this.db.query(
-                  `INSERT INTO course_purchases (user_id, course_id, amount, coins_applied, coin_discount_inr, razorpay_order_id, status)
-                   VALUES ($1,$2,$3,$4,$5,$6,'pending')
-                   ON CONFLICT (user_id, course_id) DO UPDATE
-                     SET amount=$3, coins_applied=$4, coin_discount_inr=$5, razorpay_order_id=$6, status='pending', updated_at=NOW()`,
-                  [userId, courseId, amountDueInr, coinsApplied, coinDiscountInr, razorpayOrderId]
-                );
-              }
+              await this.db.query(
+                `INSERT INTO course_purchases
+                   (user_id, course_id, amount, coins_applied, coin_discount_inr,
+                    provider_order_id, payment_provider, status)
+                 VALUES ($1,$2,$3,$4,$5,$6,'cashfree','pending')
+                 ON CONFLICT (user_id, course_id) DO UPDATE
+                   SET amount=$3, coins_applied=$4, coin_discount_inr=$5,
+                       provider_order_id=$6, payment_provider='cashfree',
+                       status='pending', updated_at=NOW()`,
+                [userId, courseId, amountDueInr, coinsApplied, coinDiscountInr, cfOrderId]
+              );
             } catch (err: any) {
-              console.error('Course order creation failed:', err.message);
+              console.error('Course Cashfree order creation failed:', err.message);
             }
 
             throw new HttpException({
-              message:         'Purchase required to enroll in this course',
-              code:            'PURCHASE_REQUIRED',
-              price:           amountDueInr,
+              message:          'Purchase required to enroll in this course',
+              code:             'PURCHASE_REQUIRED',
+              price:            amountDueInr,
               coursePrice,
               coinsApplied,
               coinDiscountInr,
-              razorpayOrderId,
-              razorpayKeyId:   process.env.RAZORPAY_KEY_ID,
-              courseTitle:     course[0].title,
+              paymentSessionId,
+              providerOrderId:  cfOrderId,
+              courseTitle:      course[0].title,
               courseId,
             }, HttpStatus.PAYMENT_REQUIRED);
           }
@@ -577,17 +594,15 @@ export class CoursesService {
 
   // ─────────────────────────────────────────────────────────────
   // POST /courses/:id/purchase/confirm
-  // Called by Android after Razorpay payment succeeds.
+  // Called by Android after Cashfree payment succeeds.
   // Verifies signature, marks purchase completed, grants enrollment.
   // ─────────────────────────────────────────────────────────────
   async confirmCoursePurchase(
     courseId: string,
     userId: string,
     dto: {
-      razorpayOrderId:   string;
-      razorpayPaymentId: string;
-      razorpaySignature: string;
-      paymentMethod?:    string;
+      cfPaymentId:   string;   // from Cashfree SDK after payment
+      paymentMethod?: string;
     }
   ) {
     // 1. Idempotency — already completed purchase
@@ -614,30 +629,44 @@ export class CoursesService {
       throw new NotFoundException('No pending purchase found. Please go back and try again.');
     }
 
-    // 3. Verify Razorpay HMAC signature — always required, no bypass
-    const rpSecret = process.env.RAZORPAY_KEY_SECRET;
-    if (!rpSecret) {
+    // 3. Verify payment with Cashfree (server-side — client cannot tamper)
+    const { verifyCashfreePayment, buildCashfreeCredentials } =
+      await import('../../common/utils/cashfree.util');
+    const rows = await this.db.query(
+      `SELECT key, value FROM payment_settings
+       WHERE key IN ('cashfree_app_id','cashfree_secret_key','payment_mode')
+         AND value IS NOT NULL AND value != ''`
+    ).catch(() => []);
+    const cfMap: any = {};
+    for (const r of rows) cfMap[r.key] = r.value;
+    const creds = buildCashfreeCredentials({
+      appId:     cfMap['cashfree_app_id'],
+      secretKey: cfMap['cashfree_secret_key'],
+      env:       cfMap['payment_mode'],
+    });
+    if (!creds.appId || !creds.secretKey) {
       throw new BadRequestException('Payment gateway not configured. Contact support.');
     }
-    const crypto   = require('crypto');
-    const expected = crypto
-      .createHmac('sha256', rpSecret)
-      .update(`${dto.razorpayOrderId}|${dto.razorpayPaymentId}`)
-      .digest('hex');
-    if (expected !== dto.razorpaySignature) {
+    const providerOrderId = purchase.provider_order_id;
+    if (!providerOrderId) {
+      throw new BadRequestException('Missing provider order ID. Contact support.');
+    }
+    const payment = await verifyCashfreePayment(creds, providerOrderId);
+    if (payment.paymentStatus !== 'SUCCESS') {
       console.error(
-        `COURSE PAYMENT TAMPER DETECTED: user=${userId} course=${courseId} ` +
-        `order=${dto.razorpayOrderId} payment=${dto.razorpayPaymentId}`
+        `COURSE PAYMENT NOT SUCCESS: user=${userId} course=${courseId} ` +
+        `order=${providerOrderId} status=${payment.paymentStatus}`
       );
-      throw new BadRequestException('Payment verification failed. Contact support.');
+      throw new BadRequestException(`Payment not successful (status: ${payment.paymentStatus}). Contact support.`);
     }
 
     // 4. Mark purchase as completed
     await this.db.query(
       `UPDATE course_purchases
-       SET status='completed', razorpay_payment_id=$1, payment_method=$2, updated_at=NOW()
+       SET status='completed', provider_payment_id=$1, payment_provider='cashfree',
+           payment_method=$2, updated_at=NOW()
        WHERE id=$3`,
-      [dto.razorpayPaymentId, dto.paymentMethod || 'upi', purchase.id]
+      [payment.cfPaymentId, payment.paymentMethod || 'upi', purchase.id]
     );
 
     // 4b. Deduct any coins that were reserved as a discount for this order
@@ -1150,10 +1179,8 @@ export class CoursesController {
     @Param('id', ParseUUIDPipe) id: string,
     @Req() req: any,
     @Body() dto: {
-      razorpayOrderId:   string;
-      razorpayPaymentId: string;
-      razorpaySignature: string;
-      paymentMethod?:    string;
+      cfPaymentId:   string;   // from Cashfree SDK
+      paymentMethod?: string;
     }
   ) {
     return this.service.confirmCoursePurchase(id, req.user.id, dto);

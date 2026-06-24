@@ -1100,7 +1100,7 @@ if (query.search)  { conditions.push(`(sm.title ILIKE $${pi} OR sm.subject ILIKE
   // ── POST: initiate a marketplace purchase ───────────────────
   // Hybrid checkout: buyer may apply up to `max_coins_per_purchase`
   // coins as a discount (1 coin = coin_to_inr_rate ₹). Remaining ₹
-  // balance is paid via Razorpay. If coins fully cover the price,
+  // balance is paid via Cashfree. If coins fully cover the price,
   // the purchase completes immediately with no payment step.
   async initPurchase(materialId: string, userId: string, coinsToApply: number) {
     // Already purchased?
@@ -1144,7 +1144,7 @@ if (query.search)  { conditions.push(`(sm.title ILIKE $${pi} OR sm.subject ILIKE
     const coinDiscountInr = Math.min(price, Math.floor(coinsApplied * coinToInrRate));
     const amountDueInr    = price - coinDiscountInr;
 
-    // ── Fully covered by coins — complete immediately, no Razorpay ──
+    // ── Fully covered by coins — complete immediately, no gateway ──
     if (amountDueInr <= 0) {
       const [order] = await this.db.query(`
         INSERT INTO material_purchase_orders
@@ -1156,59 +1156,74 @@ if (query.search)  { conditions.push(`(sm.title ILIKE $${pi} OR sm.subject ILIKE
       return await this.finalizeMaterialPurchase(material, userId, order.id, coinsApplied, coinDiscountInr, price);
     }
 
-    // ── Remaining balance needs Razorpay ──
-    let razorpayOrderId: string | null = null;
+    // ── Remaining balance needs Cashfree ─────────────────────────
+    let paymentSessionId: string | null = null;
+    let cfOrderId:        string | null = null;
     try {
-      const rpKey    = process.env.RAZORPAY_KEY_ID;
-      const rpSecret = process.env.RAZORPAY_KEY_SECRET;
-      const rpRes = await fetch('https://api.razorpay.com/v1/orders', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': 'Basic ' + Buffer.from(`${rpKey}:${rpSecret}`).toString('base64'),
-        },
-        body: JSON.stringify({
-          amount:   amountDueInr * 100, // paise
-          currency: 'INR',
-          receipt:  `material_${materialId.substring(0,8)}_${userId.substring(0,8)}_${Date.now()}`,
-          notes:    { materialId, userId, type: 'material_purchase' },
-        }),
+      const { createCashfreeOrder, buildCashfreeCredentials, cashfreeReceiptId } =
+        await import('../../common/utils/cashfree.util');
+      const rows = await this.db.query(
+        `SELECT key, value FROM payment_settings
+         WHERE key IN ('cashfree_app_id','cashfree_secret_key','payment_mode')
+           AND value IS NOT NULL AND value != ''`
+      ).catch(() => []);
+      const cfMap: any = {};
+      for (const r of rows) cfMap[r.key] = r.value;
+      const creds = buildCashfreeCredentials({
+        appId:     cfMap['cashfree_app_id'],
+        secretKey: cfMap['cashfree_secret_key'],
+        env:       cfMap['payment_mode'],
       });
-      const rpData = await rpRes.json();
-      razorpayOrderId = rpData.id || null;
+      const [userRow] = await this.db.query(
+        `SELECT name, email, mobile FROM users WHERE id=$1`, [userId]
+      );
+      const order = await createCashfreeOrder(creds, {
+        orderId:       cashfreeReceiptId('mat', materialId, userId),
+        orderAmount:   amountDueInr,
+        orderCurrency: 'INR',
+        customerId:    userId,
+        customerPhone: userRow?.mobile || '9999999999',
+        customerEmail: userRow?.email  || `${userId}@bpscnotes.app`,
+        customerName:  userRow?.name   || 'BPSCNotes User',
+        orderNote:     `Study material: ${material.title}`,
+        orderMeta:     { materialId, type: 'material_purchase' },
+      });
+      paymentSessionId = order.paymentSessionId;
+      cfOrderId        = order.orderId;
     } catch (err: any) {
-      this.logger.error(`Material order creation failed: ${err.message}`);
+      this.logger.error(`Material Cashfree order creation failed: ${err.message}`);
     }
 
-    if (!razorpayOrderId) {
+    if (!paymentSessionId || !cfOrderId) {
       throw new HttpException('Payment gateway unavailable. Please try again.', HttpStatus.SERVICE_UNAVAILABLE);
     }
 
     const [order] = await this.db.query(`
       INSERT INTO material_purchase_orders
-        (material_id, user_id, material_price, coins_applied, coin_discount_inr, amount_due_inr, razorpay_order_id, status)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,'pending')
+        (material_id, user_id, material_price, coins_applied, coin_discount_inr,
+         amount_due_inr, provider_order_id, payment_provider, status)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,'cashfree','pending')
       RETURNING id
-    `, [materialId, userId, price, coinsApplied, coinDiscountInr, amountDueInr, razorpayOrderId]);
+    `, [materialId, userId, price, coinsApplied, coinDiscountInr, amountDueInr, cfOrderId]);
 
     return successResponse({
-      purchased: false,
-      requiresPayment: true,
-      purchaseOrderId: order.id,
-      materialPrice:   price,
+      purchased:        false,
+      requiresPayment:  true,
+      purchaseOrderId:  order.id,
+      materialPrice:    price,
       coinsApplied,
       coinDiscountInr,
       amountDueInr,
-      razorpayOrderId,
-      razorpayKeyId:   process.env.RAZORPAY_KEY_ID,
-      materialTitle:   material.title,
+      paymentSessionId,
+      providerOrderId:  cfOrderId,
+      materialTitle:    material.title,
     }, `₹${amountDueInr} due — complete payment to unlock`);
   }
 
-  // ── POST: confirm a marketplace purchase after Razorpay payment ──
+  // ── POST: confirm a marketplace purchase after Cashfree payment ──
   async confirmPurchase(
     materialId: string, userId: string,
-    dto: { purchaseOrderId: string; razorpayPaymentId: string; razorpaySignature: string; paymentMethod?: string },
+    dto: { purchaseOrderId: string; cfPaymentId: string; paymentMethod?: string },
   ) {
     // Idempotency
     const [already] = await this.db.query(
@@ -1226,27 +1241,43 @@ if (query.search)  { conditions.push(`(sm.title ILIKE $${pi} OR sm.subject ILIKE
     );
     if (!order) throw new NotFoundException('No pending purchase order found. Please try again.');
 
-    // Verify Razorpay HMAC signature — no bypass
-    const rpSecret = process.env.RAZORPAY_KEY_SECRET;
-    if (!rpSecret) throw new BadRequestException('Payment gateway not configured. Contact support.');
-    const crypto = require('crypto');
-    const expected = crypto
-      .createHmac('sha256', rpSecret)
-      .update(`${order.razorpay_order_id}|${dto.razorpayPaymentId}`)
-      .digest('hex');
-    if (expected !== dto.razorpaySignature) {
+    // ── Verify payment with Cashfree (server-side) ───────────────
+    const { verifyCashfreePayment, buildCashfreeCredentials } =
+      await import('../../common/utils/cashfree.util');
+    const rows = await this.db.query(
+      `SELECT key, value FROM payment_settings
+       WHERE key IN ('cashfree_app_id','cashfree_secret_key','payment_mode')
+         AND value IS NOT NULL AND value != ''`
+    ).catch(() => []);
+    const cfMap: any = {};
+    for (const r of rows) cfMap[r.key] = r.value;
+    const creds = buildCashfreeCredentials({
+      appId:     cfMap['cashfree_app_id'],
+      secretKey: cfMap['cashfree_secret_key'],
+      env:       cfMap['payment_mode'],
+    });
+    if (!creds.appId || !creds.secretKey) {
+      throw new BadRequestException('Payment gateway not configured. Contact support.');
+    }
+    const providerOrderId = order.provider_order_id;
+    if (!providerOrderId) {
+      throw new BadRequestException('Missing provider order ID. Contact support.');
+    }
+    const payment = await verifyCashfreePayment(creds, providerOrderId);
+    if (payment.paymentStatus !== 'SUCCESS') {
       this.logger.error(
-        `MATERIAL PAYMENT TAMPER DETECTED: user=${userId} material=${materialId} ` +
-        `order=${order.razorpay_order_id} payment=${dto.razorpayPaymentId}`
+        `MATERIAL PAYMENT NOT SUCCESS: user=${userId} material=${materialId} ` +
+        `order=${providerOrderId} status=${payment.paymentStatus}`
       );
-      throw new BadRequestException('Payment verification failed. Contact support.');
+      throw new BadRequestException(`Payment not successful (status: ${payment.paymentStatus}). Contact support.`);
     }
 
     await this.db.query(
       `UPDATE material_purchase_orders
-       SET status='completed', razorpay_payment_id=$1, payment_method=$2, updated_at=NOW()
+       SET status='completed', provider_payment_id=$1, payment_provider='cashfree',
+           payment_method=$2, updated_at=NOW()
        WHERE id=$3`,
-      [dto.razorpayPaymentId, dto.paymentMethod || 'upi', order.id]
+      [payment.cfPaymentId, payment.paymentMethod || 'upi', order.id]
     );
 
     const [material] = await this.db.query(
@@ -1260,7 +1291,7 @@ if (query.search)  { conditions.push(`(sm.title ILIKE $${pi} OR sm.subject ILIKE
 
   // ── Shared: finalize a purchase — deduct coins, record purchase, ──
   // credit seller wallet with the seller_commission_pct share, return file URL.
-  // Called for both coin-only (fully covered) and Razorpay-completed purchases.
+  // Called for both coin-only (fully covered) and Cashfree-completed purchases.
   private async finalizeMaterialPurchase(
     material: { id: string; title: string; price: number; uploader_id: string | null },
     userId: string, purchaseOrderId: string,
@@ -1826,10 +1857,10 @@ export class StudyMaterialsController {
     return this.svc.removeDownload(materialId, r.user.id);
   }
 
-  // ── Marketplace purchase — hybrid coins + Razorpay checkout ──
+  // ── Marketplace purchase — hybrid coins + Cashfree checkout ──
   // POST /study-materials/:id/purchase/init  body: { coinsToApply?: number }
   // Returns either a completed purchase (free or fully coin-covered)
-  // or a Razorpay order to pay the remaining ₹ balance.
+  // or a Cashfree session to pay the remaining ₹ balance.
   @Post(':id/purchase/init')
   @HttpCode(HttpStatus.OK)
   initPurchase(@Param('id', ParseUUIDPipe) id: string, @Body() b: any, @Req() r: any) {
@@ -1837,7 +1868,7 @@ export class StudyMaterialsController {
   }
 
   // POST /study-materials/:id/purchase/confirm
-  // body: { purchaseOrderId, razorpayPaymentId, razorpaySignature, paymentMethod? }
+  // body: { purchaseOrderId, cfPaymentId, paymentMethod? }
   @Post(':id/purchase/confirm')
   @HttpCode(HttpStatus.OK)
   confirmPurchase(@Param('id', ParseUUIDPipe) id: string, @Body() b: any, @Req() r: any) {

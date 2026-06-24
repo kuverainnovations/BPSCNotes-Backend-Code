@@ -1292,60 +1292,67 @@ class SubscriptionsService {
     );
     const subscriptionId = subResult[0].id;
 
-    // Create Razorpay order (amount in paise)
-    let razorpayOrder: any = null;
-    let activeRpKey = '';   // track whichever key we actually used for the return
+    // ── Create Cashfree order ────────────────────────────────────
+    let paymentSessionId: string | null = null;
+    let cfOrderId:        string | null = null;
     if (finalAmount > 0) {
       try {
-        // Priority: env vars → payment_settings DB → warn
-        let rpKey    = process.env.RAZORPAY_KEY_ID    || '';
-        let rpSecret = process.env.RAZORPAY_KEY_SECRET || '';
-        if (!rpKey || !rpSecret) {
-          const rows = await this.db.query(
-            `SELECT key, value FROM payment_settings WHERE key IN ('razorpay_key_id','razorpay_key_secret') AND value IS NOT NULL AND value != ''`
-          ).catch(() => []);
-          for (const r of rows) {
-            if (r.key === 'razorpay_key_id')     rpKey    = r.value;
-            if (r.key === 'razorpay_key_secret')  rpSecret = r.value;
-          }
-        }
-        if (!rpKey || !rpSecret) {
-          console.warn('Razorpay keys not configured — razorpayOrderId will be null');
+        // Resolve credentials: env vars first, then payment_settings DB override
+        const rows = await this.db.query(
+          `SELECT key, value FROM payment_settings
+           WHERE key IN ('cashfree_app_id','cashfree_secret_key','payment_mode')
+             AND value IS NOT NULL AND value != ''`
+        ).catch(() => []);
+        const cfMap: any = {};
+        for (const r of rows) cfMap[r.key] = r.value;
+
+        const { createCashfreeOrder, buildCashfreeCredentials, cashfreeReceiptId } =
+          await import('../../common/utils/cashfree.util');
+
+        const creds = buildCashfreeCredentials({
+          appId:     cfMap['cashfree_app_id'],
+          secretKey: cfMap['cashfree_secret_key'],
+          env:       cfMap['payment_mode'],
+        });
+
+        if (!creds.appId || !creds.secretKey) {
+          console.warn('Cashfree keys not configured — paymentSessionId will be null');
         } else {
-          activeRpKey = rpKey;
-          const rpResponse = await fetch('https://api.razorpay.com/v1/orders', {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              'Authorization': 'Basic ' + Buffer.from(`${rpKey}:${rpSecret}`).toString('base64'),
-            },
-            body: JSON.stringify({
-              amount:   finalAmount * 100,
-              currency: 'INR',
-              receipt:  `sub_${subscriptionId.substring(0,8)}`,
-              notes:    { subscriptionId, userId, plan: data.plan },
-            }),
+          // Fetch user info for customer_details (Cashfree requires phone)
+          const [userRow] = await this.db.query(
+            `SELECT name, email, mobile FROM users WHERE id=$1`, [userId]
+          );
+          const order = await createCashfreeOrder(creds, {
+            orderId:       cashfreeReceiptId('sub', subscriptionId),
+            orderAmount:   finalAmount,
+            orderCurrency: 'INR',
+            customerId:    userId,
+            customerPhone: userRow?.mobile || '9999999999',
+            customerEmail: userRow?.email  || `${userId}@bpscnotes.app`,
+            customerName:  userRow?.name   || 'BPSCNotes User',
+            orderNote:     `BPSCNotes ${data.plan} subscription`,
+            orderMeta:     { subscriptionId, plan: data.plan },
           });
-          razorpayOrder = await rpResponse.json();
-          if (razorpayOrder.id) {
-            await this.db.query(
-              `UPDATE subscriptions SET razorpay_order_id=$1 WHERE id=$2`,
-              [razorpayOrder.id, subscriptionId]
-            );
-          } else {
-            // Log Razorpay error for debugging (e.g. bad credentials)
-            console.error('Razorpay order creation error:', JSON.stringify(razorpayOrder));
-          }
+
+          paymentSessionId = order.paymentSessionId;
+          cfOrderId        = order.orderId;
+
+          await this.db.query(
+            `UPDATE subscriptions
+               SET provider_order_id=$1, payment_provider='cashfree'
+             WHERE id=$2`,
+            [cfOrderId, subscriptionId]
+          );
         }
       } catch (err: any) {
-        console.error('Razorpay order creation failed:', err.message);
+        console.error('Cashfree order creation failed:', err.message);
       }
     }
 
     return successResponse({
       subscriptionId,
-      razorpayOrderId: razorpayOrder?.id || null,
-      razorpayKeyId:   activeRpKey || null,   // return the key actually used, not empty env var
+      paymentSessionId,          // → Android Cashfree SDK
+      providerOrderId: cfOrderId,
       breakdown: { baseAmount: price, coinDiscount, couponDiscount, finalAmount, coinsUsed: coinsToUse, couponCode: validCoupon?.code }
     });
   }
@@ -1357,26 +1364,45 @@ class SubscriptionsService {
     const plan = this.PLANS[sub.plan];
     if (!plan) throw new BadRequestException('Invalid plan');
 
-    // Validate no duplicate transaction
-    const dupCheck = await this.db.query(`SELECT id FROM subscriptions WHERE razorpay_payment_id=$1`, [data.transactionId]);
+    // ── Idempotency — check provider_payment_id ─────────────────
+    const dupCheck = await this.db.query(
+      `SELECT id FROM subscriptions WHERE provider_payment_id=$1`, [data.cfPaymentId]
+    );
     if (dupCheck.length) throw new ConflictException('Transaction already processed');
 
-    // Verify Razorpay signature — mandatory, no bypass
-    const rpSecret = process.env.RAZORPAY_KEY_SECRET;
-    if (!rpSecret) {
+    // ── Verify payment with Cashfree ─────────────────────────────
+    // We look up the payment server-side so the client never controls
+    // the payment status — eliminates the entire class of client-side
+    // tamper attacks that plagued the old HMAC approach.
+    const { verifyCashfreePayment, buildCashfreeCredentials } =
+      await import('../../common/utils/cashfree.util');
+
+    const rows = await this.db.query(
+      `SELECT key, value FROM payment_settings
+       WHERE key IN ('cashfree_app_id','cashfree_secret_key','payment_mode')
+         AND value IS NOT NULL AND value != ''`
+    ).catch(() => []);
+    const cfMap: any = {};
+    for (const r of rows) cfMap[r.key] = r.value;
+
+    const creds = buildCashfreeCredentials({
+      appId:     cfMap['cashfree_app_id'],
+      secretKey: cfMap['cashfree_secret_key'],
+      env:       cfMap['payment_mode'],
+    });
+    if (!creds.appId || !creds.secretKey) {
       throw new BadRequestException('Payment gateway not configured. Contact support.');
     }
-    if (!data.razorpaySignature || !sub.razorpay_order_id) {
-      throw new BadRequestException('Missing payment verification data.');
+
+    const providerOrderId = sub.provider_order_id;
+    if (!providerOrderId) {
+      throw new BadRequestException('Missing provider order ID. Contact support.');
     }
-    const crypto = require('crypto');
-    const expectedSig = crypto
-      .createHmac('sha256', rpSecret)
-      .update(`${sub.razorpay_order_id}|${data.transactionId}`)
-      .digest('hex');
-    if (expectedSig !== data.razorpaySignature) {
-      console.error(`PAYMENT TAMPER DETECTED: user=${userId} order=${sub.razorpay_order_id} payment=${data.transactionId}`);
-      throw new BadRequestException('Payment signature verification failed');
+
+    const payment = await verifyCashfreePayment(creds, providerOrderId);
+    if (payment.paymentStatus !== 'SUCCESS') {
+      console.error(`PAYMENT STATUS NOT SUCCESS: user=${userId} order=${providerOrderId} status=${payment.paymentStatus}`);
+      throw new BadRequestException(`Payment not successful (status: ${payment.paymentStatus}). Contact support.`);
     }
 
     const endsAt = new Date();
@@ -1394,8 +1420,8 @@ class SubscriptionsService {
       // 1. Activate subscription
       await this.db.query(
         `UPDATE subscriptions SET payment_status='success', status='active', payment_method=$1, upi_id=$2,
-         razorpay_payment_id=$3, starts_at=NOW(), ends_at=$4, updated_at=NOW() WHERE id=$5`,
-        [data.paymentMethod||'upi', data.upiId||null, data.transactionId, endsAt, subId]
+         provider_payment_id=$3, payment_provider='cashfree', starts_at=NOW(), ends_at=$4, updated_at=NOW() WHERE id=$5`,
+        [payment.paymentMethod || 'upi', payment.upiId || null, payment.cfPaymentId, endsAt, subId]
       );
 
       // 2. Deduct coins used toward discount
@@ -1451,43 +1477,50 @@ class SubscriptionsService {
     return successResponse({ isActive: result.length > 0, subscription: result[0] || null });
   }
 
-  // ── Razorpay Webhook Handler ─────────────────────────────────
-  async handleRazorpayWebhook(req: any, body: any) {
-    const crypto = require('crypto');
+  // ── Cashfree Webhook Handler ─────────────────────────────────
+  async handleCashfreeWebhook(req: any, body: any) {
+    const { verifyCashfreeWebhookSignature } =
+      await import('../../common/utils/cashfree.util');
 
-    // Verify webhook signature
-    const webhookSecret = process.env.RAZORPAY_WEBHOOK_SECRET;
-    const signature     = req.headers['x-razorpay-signature'];
+    // ── Verify webhook signature ──────────────────────────────
+    const webhookSecret = process.env.CASHFREE_WEBHOOK_SECRET
+      || (await this.db.query(`SELECT value FROM payment_settings WHERE key='cashfree_webhook_secret'`).catch(() => []))[0]?.value
+      || '';
+    const signature = req.headers['x-webhook-signature']  || '';
+    const timestamp = req.headers['x-webhook-timestamp']  || '';
+    const rawBody   = req.rawBody || JSON.stringify(body);
+
     if (webhookSecret && signature) {
-      const expected = crypto
-        .createHmac('sha256', webhookSecret)
-        .update(JSON.stringify(body))
-        .digest('hex');
-      if (expected !== signature) {
-        console.error('Razorpay webhook: invalid signature');
+      const valid = verifyCashfreeWebhookSignature(rawBody, timestamp, signature, webhookSecret);
+      if (!valid) {
+        console.error('Cashfree webhook: invalid signature');
         return { status: 'invalid_signature' };
       }
     }
 
-    const event   = body.event;
-    const payment = body.payload?.payment?.entity;
-    const orderId = payment?.order_id;
+    // Cashfree PG v3 webhook shape:
+    //   { type: 'PAYMENT_SUCCESS_WEBHOOK', data: { order: {...}, payment: {...} } }
+    const eventType = body.type;
+    const orderData = body.data?.order;
+    const payData   = body.data?.payment;
+    const orderId   = orderData?.order_id;
 
     if (!orderId) return { status: 'ignored' };
 
-    // payment.captured — successful payment
-    if (event === 'payment.captured') {
+    if (eventType === 'PAYMENT_SUCCESS_WEBHOOK') {
       const [sub] = await this.db.query(
-        `SELECT * FROM subscriptions WHERE razorpay_order_id=$1 AND payment_status='pending'`,
+        `SELECT * FROM subscriptions WHERE provider_order_id=$1 AND payment_status='pending'`,
         [orderId]
       );
       if (!sub) return { status: 'not_found' };
 
-      // Idempotency guard
-      const dup = await this.db.query(
-        `SELECT id FROM subscriptions WHERE razorpay_payment_id=$1`, [payment.id]
-      );
-      if (dup.length) return { status: 'already_processed' };
+      const cfPaymentId = String(payData?.cf_payment_id || '');
+      if (cfPaymentId) {
+        const dup = await this.db.query(
+          `SELECT id FROM subscriptions WHERE provider_payment_id=$1`, [cfPaymentId]
+        );
+        if (dup.length) return { status: 'already_processed' };
+      }
 
       const plan   = this.PLANS[sub.plan];
       const endsAt = new Date();
@@ -1501,9 +1534,16 @@ class SubscriptionsService {
           `UPDATE subscriptions
            SET payment_status='success', status='active',
                payment_method=$1, upi_id=$2,
-               razorpay_payment_id=$3, starts_at=NOW(), ends_at=$4, updated_at=NOW()
+               provider_payment_id=$3, payment_provider='cashfree',
+               starts_at=NOW(), ends_at=$4, updated_at=NOW()
            WHERE id=$5`,
-          [payment.method || 'upi', payment.vpa || null, payment.id, endsAt, sub.id]
+          [
+            payData?.payment_group || 'upi',
+            payData?.payment_method?.upi?.upi_id || null,
+            cfPaymentId,
+            endsAt,
+            sub.id,
+          ]
         );
 
         if (plan?.bonusCoins > 0 && await this.isCoinSystemEnabled()) {
@@ -1519,7 +1559,7 @@ class SubscriptionsService {
         await this.db.query('COMMIT');
       } catch (err) {
         await this.db.query('ROLLBACK');
-        console.error(`Webhook: transaction rollback for sub ${sub.id}:`, err);
+        console.error(`Webhook: rollback for sub ${sub.id}:`, err);
         return { status: 'error' };
       }
 
@@ -1527,11 +1567,10 @@ class SubscriptionsService {
       console.log(`Webhook: subscription ${sub.id} activated for user ${sub.user_id}`);
     }
 
-    // payment.failed
-    if (event === 'payment.failed') {
+    if (eventType === 'PAYMENT_FAILED_WEBHOOK') {
       await this.db.query(
         `UPDATE subscriptions SET payment_status='failed', status='failed', updated_at=NOW()
-         WHERE razorpay_order_id=$1 AND payment_status='pending'`,
+         WHERE provider_order_id=$1 AND payment_status='pending'`,
         [orderId]
       );
     }
@@ -1607,10 +1646,18 @@ class SubscriptionsController {
   constructor(private s: SubscriptionsService) {}
   @Get('plans') @HttpCode(200) getPlans() { return this.s.getPlans(); }
   @Post('initiate') @HttpCode(200) initiate(@Req() r: any, @Body() dto: any) { return this.s.initiate(r.user.id, dto); }
-  @Post('create')   @HttpCode(200) create(@Req() r: any, @Body() dto: any)   { return this.s.initiate(r.user.id, dto); }  // alias for Razorpay flow
+  @Post('create')   @HttpCode(200) create(@Req() r: any, @Body() dto: any)   { return this.s.initiate(r.user.id, dto); }  // backwards-compat alias
   @Post(':id/confirm') @HttpCode(200) confirm(@Param('id', ParseUUIDPipe) id: string, @Req() r: any, @Body() dto: any) { return this.s.confirm(id, r.user.id, dto); }
   @Get('status') getStatus(@Req() r: any) { return this.s.getStatus(r.user.id); }
   @Post('coupons/validate') @HttpCode(200) validateCoupon(@Body() body: any) { return this.s.validateCoupon(body.code, body.type||'subscription'); }
+}
+
+// Cashfree webhook — no JWT guard (Cashfree calls this server-to-server)
+// rawBody populated by global raw-body middleware in main.ts
+@Controller('webhooks')
+class WebhookController {
+  constructor(private s: SubscriptionsService) {}
+  @Post('cashfree') @HttpCode(200) cashfree(@Req() req: any, @Body() body: any) { return this.s.handleCashfreeWebhook(req, body); }
 }
 
 @ApiTags('Admin — Subscriptions') @ApiBearerAuth() @Public()
@@ -1624,7 +1671,7 @@ class AdminSubscriptionsController {
   @Delete('coupons/:id') @RequirePermission('subscriptions') deleteCoupon(@Param('id', ParseUUIDPipe) id: string) { return this.s.deleteCoupon(id); }
 }
 
-@Module({ imports:[ConfigModule], controllers:[SubscriptionsController, AdminSubscriptionsController], providers:[SubscriptionsService] })
+@Module({ imports:[ConfigModule], controllers:[SubscriptionsController, WebhookController, AdminSubscriptionsController], providers:[SubscriptionsService] })
 export class SubscriptionsModule {}
 
 // ════════════════════════════════════════════════════════════
