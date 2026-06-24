@@ -1,7 +1,7 @@
 // ════════════════════════════════════════════════════════════
 // AUTH MODULE — Full implementation
 // ════════════════════════════════════════════════════════════
-import * as WhatsAppUtil from '../common/utils/whatsapp.util';
+import * as WhatsAppUtil from '../../common/utils/whatsapp.util';
 import {
   Module, Injectable, Controller, Post, Get, Query, Body, Req,
   HttpCode, HttpStatus, UnauthorizedException, BadRequestException,
