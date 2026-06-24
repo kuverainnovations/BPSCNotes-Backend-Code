@@ -509,7 +509,7 @@ export class CoursesService {
             let cfOrderId:        string | null = null;
             try {
               const { createCashfreeOrder, buildCashfreeCredentials, cashfreeReceiptId } =
-                await import('../../common/utils/cashfree.util');
+                await import('../common/utils/cashfree.util');
               const rows = await this.db.query(
                 `SELECT key, value FROM payment_settings
                  WHERE key IN ('cashfree_app_id','cashfree_secret_key','payment_mode')
@@ -631,7 +631,7 @@ export class CoursesService {
 
     // 3. Verify payment with Cashfree (server-side — client cannot tamper)
     const { verifyCashfreePayment, buildCashfreeCredentials } =
-      await import('../../common/utils/cashfree.util');
+      await import('../common/utils/cashfree.util');
     const rows = await this.db.query(
       `SELECT key, value FROM payment_settings
        WHERE key IN ('cashfree_app_id','cashfree_secret_key','payment_mode')

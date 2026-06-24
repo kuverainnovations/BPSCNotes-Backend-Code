@@ -1307,7 +1307,7 @@ class SubscriptionsService {
         for (const r of rows) cfMap[r.key] = r.value;
 
         const { createCashfreeOrder, buildCashfreeCredentials, cashfreeReceiptId } =
-          await import('../../common/utils/cashfree.util');
+          await import('../common/utils/cashfree.util');
 
         const creds = buildCashfreeCredentials({
           appId:     cfMap['cashfree_app_id'],
@@ -1375,7 +1375,7 @@ class SubscriptionsService {
     // the payment status — eliminates the entire class of client-side
     // tamper attacks that plagued the old HMAC approach.
     const { verifyCashfreePayment, buildCashfreeCredentials } =
-      await import('../../common/utils/cashfree.util');
+      await import('../common/utils/cashfree.util');
 
     const rows = await this.db.query(
       `SELECT key, value FROM payment_settings
@@ -1480,7 +1480,7 @@ class SubscriptionsService {
   // ── Cashfree Webhook Handler ─────────────────────────────────
   async handleCashfreeWebhook(req: any, body: any) {
     const { verifyCashfreeWebhookSignature } =
-      await import('../../common/utils/cashfree.util');
+      await import('../common/utils/cashfree.util');
 
     // ── Verify webhook signature ──────────────────────────────
     const webhookSecret = process.env.CASHFREE_WEBHOOK_SECRET

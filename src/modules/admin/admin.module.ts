@@ -815,7 +815,7 @@ class PaymentSettingsService {
     if (providerPaymentId && providerOrderId) {
       try {
         const { refundCashfreePayment, buildCashfreeCredentials } =
-          await import('../../common/utils/cashfree.util');
+          await import('../common/utils/cashfree.util');
         const rows = await this.db.query(
           `SELECT key, value FROM payment_settings
            WHERE key IN ('cashfree_app_id','cashfree_secret_key','payment_mode')

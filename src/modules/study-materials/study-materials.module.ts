@@ -1161,7 +1161,7 @@ if (query.search)  { conditions.push(`(sm.title ILIKE $${pi} OR sm.subject ILIKE
     let cfOrderId:        string | null = null;
     try {
       const { createCashfreeOrder, buildCashfreeCredentials, cashfreeReceiptId } =
-        await import('../../common/utils/cashfree.util');
+        await import('../common/utils/cashfree.util');
       const rows = await this.db.query(
         `SELECT key, value FROM payment_settings
          WHERE key IN ('cashfree_app_id','cashfree_secret_key','payment_mode')
@@ -1243,7 +1243,7 @@ if (query.search)  { conditions.push(`(sm.title ILIKE $${pi} OR sm.subject ILIKE
 
     // ── Verify payment with Cashfree (server-side) ───────────────
     const { verifyCashfreePayment, buildCashfreeCredentials } =
-      await import('../../common/utils/cashfree.util');
+      await import('../common/utils/cashfree.util');
     const rows = await this.db.query(
       `SELECT key, value FROM payment_settings
        WHERE key IN ('cashfree_app_id','cashfree_secret_key','payment_mode')
