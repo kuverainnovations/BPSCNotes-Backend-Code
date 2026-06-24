@@ -1099,11 +1099,9 @@ if (query.search)  { conditions.push(`(sm.title ILIKE $${pi} OR sm.subject ILIKE
   }
 
   // ── POST: initiate a marketplace purchase ───────────────────
-  // Hybrid checkout: buyer may apply up to `max_coins_per_purchase`
-  // coins as a discount (1 coin = coin_to_inr_rate ₹). Remaining ₹
-  // balance is paid via Cashfree. If coins fully cover the price,
-  // the purchase completes immediately with no payment step.
-  async initPurchase(materialId: string, userId: string, coinsToApply: number) {
+  // Purchases are real-money only via Cashfree.
+  // Coins cannot be used to purchase content — they are rewards only.
+  async initPurchase(materialId: string, userId: string) {
     // Already purchased?
     const [existing] = await this.db.query(
       `SELECT id FROM material_purchases WHERE material_id=$1 AND user_id=$2`,
@@ -1119,45 +1117,18 @@ if (query.search)  { conditions.push(`(sm.title ILIKE $${pi} OR sm.subject ILIKE
 
     const price = material.price ?? 0;
 
-    // Free material — no payment needed at all
+    // Free material — no payment needed
     if (price === 0) {
       await this.db.query(
         `INSERT INTO material_purchases (material_id, user_id, price_paid, coins_paid) VALUES ($1,$2,0,0)`,
         [materialId, userId]
       );
       const fileUrl = await this.fileUrlForMaterial(materialId);
-      return successResponse({ purchased: true, alreadyPurchased: false, coinsSpent: 0, amountDueInr: 0, fileUrl },
+      return successResponse({ purchased: true, alreadyPurchased: false, amountDueInr: 0, fileUrl },
         '🎉 Added to your library!');
     }
 
-    // ── Validate coin discount ──
-    const maxCoins      = await this.getSettingNumber('max_coins_per_purchase', 50);
-    const coinToInrRate = await this.getSettingNumber('coin_to_inr_rate', 1);
-
-    const coinsApplied = Math.max(0, Math.min(Math.floor(coinsToApply || 0), maxCoins));
-    if (coinsApplied > 0) {
-      const [userRow] = await this.db.query(`SELECT coins FROM users WHERE id=$1`, [userId]);
-      if (!userRow || userRow.coins < coinsApplied) {
-        throw new BadRequestException(`You only have ${userRow?.coins ?? 0} coins.`);
-      }
-    }
-
-    const coinDiscountInr = Math.min(price, Math.floor(coinsApplied * coinToInrRate));
-    const amountDueInr    = price - coinDiscountInr;
-
-    // ── Fully covered by coins — complete immediately, no gateway ──
-    if (amountDueInr <= 0) {
-      const [order] = await this.db.query(`
-        INSERT INTO material_purchase_orders
-          (material_id, user_id, material_price, coins_applied, coin_discount_inr, amount_due_inr, status)
-        VALUES ($1,$2,$3,$4,$5,0,'completed')
-        RETURNING id
-      `, [materialId, userId, price, coinsApplied, coinDiscountInr]);
-
-      return await this.finalizeMaterialPurchase(material, userId, order.id, coinsApplied, coinDiscountInr, price);
-    }
-
-    // ── Remaining balance needs Cashfree ─────────────────────────
+    // ── Real-money payment via Cashfree ─────────────────────────
     let paymentSessionId: string | null = null;
     let cfOrderId:        string | null = null;
     try {
@@ -1179,7 +1150,7 @@ if (query.search)  { conditions.push(`(sm.title ILIKE $${pi} OR sm.subject ILIKE
       );
       const order = await createCashfreeOrder(creds, {
         orderId:       cashfreeReceiptId('mat', materialId, userId),
-        orderAmount:   amountDueInr,
+        orderAmount:   price,
         orderCurrency: 'INR',
         customerId:    userId,
         customerPhone: userRow?.mobile || '9999999999',
@@ -1202,22 +1173,20 @@ if (query.search)  { conditions.push(`(sm.title ILIKE $${pi} OR sm.subject ILIKE
       INSERT INTO material_purchase_orders
         (material_id, user_id, material_price, coins_applied, coin_discount_inr,
          amount_due_inr, provider_order_id, payment_provider, status)
-      VALUES ($1,$2,$3,$4,$5,$6,$7,'cashfree','pending')
+      VALUES ($1,$2,$3,0,0,$3,$4,'cashfree','pending')
       RETURNING id
-    `, [materialId, userId, price, coinsApplied, coinDiscountInr, amountDueInr, cfOrderId]);
+    `, [materialId, userId, price, cfOrderId]);
 
     return successResponse({
       purchased:        false,
       requiresPayment:  true,
       purchaseOrderId:  order.id,
       materialPrice:    price,
-      coinsApplied,
-      coinDiscountInr,
-      amountDueInr,
+      amountDueInr:     price,
       paymentSessionId,
       providerOrderId:  cfOrderId,
       materialTitle:    material.title,
-    }, `₹${amountDueInr} due — complete payment to unlock`);
+    }, `₹${price} due — complete payment to unlock`);
   }
 
   // ── POST: confirm a marketplace purchase after Cashfree payment ──
@@ -1856,14 +1825,12 @@ export class StudyMaterialsController {
     return this.svc.removeDownload(materialId, r.user.id);
   }
 
-  // ── Marketplace purchase — hybrid coins + Cashfree checkout ──
-  // POST /study-materials/:id/purchase/init  body: { coinsToApply?: number }
-  // Returns either a completed purchase (free or fully coin-covered)
-  // or a Cashfree session to pay the remaining ₹ balance.
+  // POST /study-materials/:id/purchase/init  body: {} (coins no longer accepted)
+  // Returns either a completed purchase (free materials) or a Cashfree session.
   @Post(':id/purchase/init')
   @HttpCode(HttpStatus.OK)
-  initPurchase(@Param('id', ParseUUIDPipe) id: string, @Body() b: any, @Req() r: any) {
-    return this.svc.initPurchase(id, r.user.id, +(b?.coinsToApply ?? 0));
+  initPurchase(@Param('id', ParseUUIDPipe) id: string, @Req() r: any) {
+    return this.svc.initPurchase(id, r.user.id);
   }
 
   // POST /study-materials/:id/purchase/confirm

@@ -4,7 +4,7 @@ import * as CashfreeUtil from '../../common/utils/cashfree.util';
 // ════════════════════════════════════════════════════════════
 import {
   Module, Injectable, Controller, Get, Post, Put, Delete,
-  Body, Param, Query, Req, HttpCode, HttpStatus,
+  Body, Param, Query, Req, Res, HttpCode, HttpStatus, Logger,
   UnauthorizedException, NotFoundException, BadRequestException,
   UseGuards, ParseUUIDPipe,
 } from '@nestjs/common';
@@ -1006,6 +1006,288 @@ class CategoriesController {
   }
 }
 
+// ════════════════════════════════════════════════════════════
+// ADMIN PAYMENTS — Issue 4
+// Full transaction tracking for all purchase types
+// ════════════════════════════════════════════════════════════
+@Injectable()
+class AdminPaymentsService {
+  private readonly logger = new Logger('AdminPaymentsService');
+
+  constructor(@InjectDataSource() private readonly db: DataSource) {}
+
+  // ── Dashboard metrics — total revenue across all purchase types ──
+  async getDashboard() {
+    const [subRevenue] = await this.db.query(`
+      SELECT
+        COALESCE(SUM(CASE WHEN payment_status='success' THEN final_amount ELSE 0 END), 0)::int  AS total_revenue,
+        COALESCE(SUM(CASE WHEN payment_status='success' AND created_at::date=CURRENT_DATE THEN final_amount ELSE 0 END), 0)::int AS revenue_today,
+        COALESCE(SUM(CASE WHEN payment_status='success' AND date_trunc('month',created_at)=date_trunc('month',NOW()) THEN final_amount ELSE 0 END), 0)::int AS revenue_this_month,
+        COUNT(*) FILTER (WHERE payment_status='success')::int  AS successful_payments,
+        COUNT(*) FILTER (WHERE payment_status='failed')::int   AS failed_payments,
+        COUNT(*) FILTER (WHERE payment_status='refunded')::int AS refunds
+      FROM subscriptions
+    `).catch(() => [{ total_revenue:0,revenue_today:0,revenue_this_month:0,successful_payments:0,failed_payments:0,refunds:0 }]);
+
+    const [courseRevenue] = await this.db.query(`
+      SELECT
+        COALESCE(SUM(CASE WHEN status='completed' THEN amount ELSE 0 END), 0)::int  AS total_revenue,
+        COALESCE(SUM(CASE WHEN status='completed' AND created_at::date=CURRENT_DATE THEN amount ELSE 0 END), 0)::int AS revenue_today,
+        COALESCE(SUM(CASE WHEN status='completed' AND date_trunc('month',created_at)=date_trunc('month',NOW()) THEN amount ELSE 0 END), 0)::int AS revenue_this_month,
+        COUNT(*) FILTER (WHERE status='completed')::int AS successful_payments,
+        COUNT(*) FILTER (WHERE status='failed')::int    AS failed_payments,
+        COUNT(*) FILTER (WHERE status='refunded')::int  AS refunds
+      FROM course_purchases
+    `).catch(() => [{ total_revenue:0,revenue_today:0,revenue_this_month:0,successful_payments:0,failed_payments:0,refunds:0 }]);
+
+    const [materialRevenue] = await this.db.query(`
+      SELECT
+        COALESCE(SUM(price_paid), 0)::int AS total_revenue,
+        COALESCE(SUM(CASE WHEN created_at::date=CURRENT_DATE THEN price_paid ELSE 0 END), 0)::int AS revenue_today,
+        COALESCE(SUM(CASE WHEN date_trunc('month',created_at)=date_trunc('month',NOW()) THEN price_paid ELSE 0 END), 0)::int AS revenue_this_month,
+        COUNT(*)::int                     AS successful_payments
+      FROM material_purchases WHERE price_paid > 0
+    `).catch(() => [{ total_revenue:0,revenue_today:0,revenue_this_month:0,successful_payments:0 }]);
+
+    const totalRevenue     = (subRevenue.total_revenue     || 0) + (courseRevenue.total_revenue     || 0) + (materialRevenue.total_revenue     || 0);
+    const revenueToday     = (subRevenue.revenue_today     || 0) + (courseRevenue.revenue_today     || 0) + (materialRevenue.revenue_today     || 0);
+    const revenueThisMonth = (subRevenue.revenue_this_month|| 0) + (courseRevenue.revenue_this_month|| 0) + (materialRevenue.revenue_this_month|| 0);
+
+    return successResponse({
+      totalRevenue,
+      revenueToday,
+      revenueThisMonth,
+      courseRevenue:          courseRevenue.total_revenue    || 0,
+      studyMaterialRevenue:   materialRevenue.total_revenue  || 0,
+      subscriptionRevenue:    subRevenue.total_revenue       || 0,
+      successfulPayments:    (subRevenue.successful_payments || 0) + (courseRevenue.successful_payments || 0) + (materialRevenue.successful_payments || 0),
+      failedPayments:        (subRevenue.failed_payments     || 0) + (courseRevenue.failed_payments     || 0),
+      refunds:               (subRevenue.refunds             || 0) + (courseRevenue.refunds             || 0),
+    });
+  }
+
+  // ── Course purchases list ────────────────────────────────────
+  async getCoursePurchases(query: any) {
+    const page   = Math.max(1, +(query.page  ?? 1));
+    const limit  = Math.min(100, +(query.limit ?? 20));
+    const offset = (page - 1) * limit;
+
+    const conditions: string[] = ['1=1'];
+    const params: any[] = [];
+    let pi = 1;
+
+    if (query.status)    { conditions.push(`cp.status = $${pi++}`);          params.push(query.status); }
+    if (query.search)    { conditions.push(`(u.name ILIKE $${pi} OR u.mobile ILIKE $${pi} OR c.title ILIKE $${pi})`); params.push(`%${query.search}%`); pi++; }
+    if (query.dateFrom)  { conditions.push(`cp.created_at >= $${pi++}`);     params.push(query.dateFrom); }
+    if (query.dateTo)    { conditions.push(`cp.created_at <= $${pi++}`);     params.push(query.dateTo); }
+
+    const where = conditions.join(' AND ');
+    const [rows, [cnt]] = await Promise.all([
+      this.db.query(
+        `SELECT cp.id, cp.status, cp.amount, cp.coins_applied, cp.coin_discount_inr,
+                cp.provider_order_id, cp.payment_provider,
+                cp.created_at, cp.updated_at,
+                u.id AS user_id, u.name AS user_name, u.mobile AS user_mobile, u.email AS user_email,
+                c.id AS course_id, c.title AS course_title, c.price AS course_price
+         FROM course_purchases cp
+         JOIN users u  ON u.id  = cp.user_id
+         JOIN courses c ON c.id = cp.course_id
+         WHERE ${where}
+         ORDER BY cp.created_at DESC
+         LIMIT $${pi++} OFFSET $${pi++}`,
+        [...params, limit, offset]
+      ).catch(() => []),
+      this.db.query(
+        `SELECT COUNT(*) FROM course_purchases cp JOIN users u ON u.id=cp.user_id JOIN courses c ON c.id=cp.course_id WHERE ${where}`,
+        params
+      ).catch(() => [{ count: 0 }]),
+    ]);
+
+    return successResponse({
+      purchases: rows,
+      meta: paginationMeta(parseInt(cnt?.count ?? '0', 10), page, limit),
+    });
+  }
+
+  // ── Study material purchases list ────────────────────────────
+  async getMaterialPurchases(query: any) {
+    const page   = Math.max(1, +(query.page  ?? 1));
+    const limit  = Math.min(100, +(query.limit ?? 20));
+    const offset = (page - 1) * limit;
+
+    const conditions: string[] = ['mp.price_paid >= 0'];
+    const params: any[] = [];
+    let pi = 1;
+
+    if (query.search)   { conditions.push(`(u.name ILIKE $${pi} OR u.mobile ILIKE $${pi} OR sm.title ILIKE $${pi})`); params.push(`%${query.search}%`); pi++; }
+    if (query.dateFrom) { conditions.push(`mp.created_at >= $${pi++}`); params.push(query.dateFrom); }
+    if (query.dateTo)   { conditions.push(`mp.created_at <= $${pi++}`); params.push(query.dateTo); }
+
+    const where = conditions.join(' AND ');
+    const [rows, [cnt], [totals]] = await Promise.all([
+      this.db.query(
+        `SELECT mp.id, mp.price_paid, mp.coins_paid, mp.platform_fee,
+                mp.created_at,
+                u.id AS user_id, u.name AS user_name, u.mobile AS user_mobile, u.email AS user_email,
+                sm.id AS material_id, sm.title AS material_title, sm.price AS material_price,
+                mpo.provider_order_id, mpo.provider_payment_id, mpo.payment_provider, mpo.status AS order_status
+         FROM material_purchases mp
+         JOIN users u ON u.id = mp.user_id
+         JOIN study_materials sm ON sm.id = mp.material_id
+         LEFT JOIN material_purchase_orders mpo ON mpo.material_id=mp.material_id AND mpo.user_id=mp.user_id AND mpo.status='completed'
+         WHERE ${where}
+         ORDER BY mp.created_at DESC
+         LIMIT $${pi++} OFFSET $${pi++}`,
+        [...params, limit, offset]
+      ).catch(() => []),
+      this.db.query(
+        `SELECT COUNT(*) FROM material_purchases mp JOIN users u ON u.id=mp.user_id JOIN study_materials sm ON sm.id=mp.material_id WHERE ${where}`,
+        params
+      ).catch(() => [{ count: 0 }]),
+      this.db.query(
+        `SELECT COALESCE(SUM(mp.price_paid),0)::int AS total_collected,
+                COALESCE(SUM(mp.platform_fee),0)::int AS total_platform_fee
+         FROM material_purchases mp JOIN users u ON u.id=mp.user_id JOIN study_materials sm ON sm.id=mp.material_id WHERE ${where}`,
+        params
+      ).catch(() => [{ total_collected: 0, total_platform_fee: 0 }]),
+    ]);
+
+    return successResponse({
+      purchases: rows,
+      totals,
+      meta: paginationMeta(parseInt(cnt?.count ?? '0', 10), page, limit),
+    });
+  }
+
+  // ── Subscription payments list ────────────────────────────────
+  async getSubscriptionPayments(query: any) {
+    const page   = Math.max(1, +(query.page  ?? 1));
+    const limit  = Math.min(100, +(query.limit ?? 20));
+    const offset = (page - 1) * limit;
+
+    const conditions: string[] = ['1=1'];
+    const params: any[] = [];
+    let pi = 1;
+
+    if (query.status)   { conditions.push(`s.payment_status = $${pi++}`); params.push(query.status); }
+    if (query.search)   { conditions.push(`(u.name ILIKE $${pi} OR u.mobile ILIKE $${pi})`); params.push(`%${query.search}%`); pi++; }
+    if (query.dateFrom) { conditions.push(`s.created_at >= $${pi++}`); params.push(query.dateFrom); }
+    if (query.dateTo)   { conditions.push(`s.created_at <= $${pi++}`); params.push(query.dateTo); }
+
+    const where = conditions.join(' AND ');
+    const [rows, [cnt]] = await Promise.all([
+      this.db.query(
+        `SELECT s.id, s.plan, s.final_amount, s.payment_status, s.payment_method,
+                s.provider_order_id, s.provider_payment_id, s.payment_provider,
+                s.created_at, s.ends_at,
+                u.id AS user_id, u.name AS user_name, u.mobile AS user_mobile, u.email AS user_email
+         FROM subscriptions s
+         JOIN users u ON u.id = s.user_id
+         WHERE ${where}
+         ORDER BY s.created_at DESC
+         LIMIT $${pi++} OFFSET $${pi++}`,
+        [...params, limit, offset]
+      ).catch(() => []),
+      this.db.query(
+        `SELECT COUNT(*) FROM subscriptions s JOIN users u ON u.id=s.user_id WHERE ${where}`,
+        params
+      ).catch(() => [{ count: 0 }]),
+    ]);
+
+    return successResponse({
+      payments: rows,
+      meta: paginationMeta(parseInt(cnt?.count ?? '0', 10), page, limit),
+    });
+  }
+
+  // ── CSV Export ───────────────────────────────────────────────
+  async exportCsv(type: 'courses' | 'materials' | 'subscriptions', query: any) {
+    let rows: any[] = [];
+    let headers: string[] = [];
+
+    if (type === 'courses') {
+      rows = await this.db.query(
+        `SELECT cp.created_at, u.name AS user, u.mobile, c.title AS course,
+                cp.amount, cp.status, cp.provider_order_id, cp.payment_provider
+         FROM course_purchases cp
+         JOIN users u ON u.id=cp.user_id JOIN courses c ON c.id=cp.course_id
+         ORDER BY cp.created_at DESC LIMIT 5000`
+      ).catch(() => []);
+      headers = ['Date','User','Mobile','Course','Amount','Status','Order ID','Provider'];
+    } else if (type === 'materials') {
+      rows = await this.db.query(
+        `SELECT mp.created_at, u.name AS user, u.mobile, sm.title AS material,
+                mp.price_paid AS amount, 'completed' AS status,
+                mpo.provider_order_id, mpo.payment_provider
+         FROM material_purchases mp
+         JOIN users u ON u.id=mp.user_id JOIN study_materials sm ON sm.id=mp.material_id
+         LEFT JOIN material_purchase_orders mpo ON mpo.material_id=mp.material_id AND mpo.user_id=mp.user_id AND mpo.status='completed'
+         ORDER BY mp.created_at DESC LIMIT 5000`
+      ).catch(() => []);
+      headers = ['Date','User','Mobile','Material','Amount','Status','Order ID','Provider'];
+    } else {
+      rows = await this.db.query(
+        `SELECT s.created_at, u.name AS user, u.mobile, s.plan, s.final_amount AS amount,
+                s.payment_status AS status, s.provider_order_id, s.provider_payment_id, s.payment_provider
+         FROM subscriptions s
+         JOIN users u ON u.id=s.user_id
+         ORDER BY s.created_at DESC LIMIT 5000`
+      ).catch(() => []);
+      headers = ['Date','User','Mobile','Plan','Amount','Status','Order ID','Payment ID','Provider'];
+    }
+
+    const csvLines = [
+      headers.join(','),
+      ...rows.map((r: any) =>
+        Object.values(r).map((v: any) =>
+          v == null ? '' : `"${String(v).replace(/"/g, '""')}"`
+        ).join(',')
+      ),
+    ];
+
+    return { csv: csvLines.join('\n'), filename: `payments_${type}_${new Date().toISOString().slice(0,10)}.csv` };
+  }
+}
+
+@ApiTags('Admin — Payments')
+@ApiBearerAuth()
+@Public()
+@UseGuards(AdminJwtGuard, PermissionGuard)
+@Controller('admin/payments')
+class AdminPaymentsController {
+  constructor(private readonly svc: AdminPaymentsService) {}
+
+  // GET /admin/payments/dashboard — unified revenue metrics
+  @Get('dashboard')
+  @RequirePermission('subscriptions')
+  getDashboard() { return this.svc.getDashboard(); }
+
+  // GET /admin/payments/courses — course purchase history
+  @Get('courses')
+  @RequirePermission('subscriptions')
+  getCoursePurchases(@Query() q: any) { return this.svc.getCoursePurchases(q); }
+
+  // GET /admin/payments/materials — study material purchase history
+  @Get('materials')
+  @RequirePermission('subscriptions')
+  getMaterialPurchases(@Query() q: any) { return this.svc.getMaterialPurchases(q); }
+
+  // GET /admin/payments/subscriptions — subscription payment history
+  @Get('subscriptions')
+  @RequirePermission('subscriptions')
+  getSubscriptionPayments(@Query() q: any) { return this.svc.getSubscriptionPayments(q); }
+
+  // GET /admin/payments/export?type=courses|materials|subscriptions — CSV download
+  @Get('export')
+  @RequirePermission('subscriptions')
+  async exportCsv(@Query('type') type: 'courses' | 'materials' | 'subscriptions' = 'courses', @Query() q: any, @Res() res: any) {
+    const { csv, filename } = await this.svc.exportCsv(type, q);
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    res.send(csv);
+  }
+}
+
 @Module({
   imports: [
     ConfigModule,
@@ -1026,6 +1308,7 @@ class CategoriesController {
     AppConfigController,
     CategoriesController,
     AdminPaymentSettingsController,
+    AdminPaymentsController,
   ],
   providers: [
     AdminAuthService,
@@ -1033,6 +1316,7 @@ class CategoriesController {
     AdminSettingsService,
     AdminUsersService,
     PaymentSettingsService,
+    AdminPaymentsService,
   ],
   exports: [AdminSettingsService, AdminAuthService],
 })
