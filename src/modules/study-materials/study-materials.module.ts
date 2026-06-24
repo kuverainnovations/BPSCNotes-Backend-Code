@@ -1,4 +1,4 @@
-import * as CashfreeUtil from '../common/utils/cashfree.util';
+import * as CashfreeUtil from '../../common/utils/cashfree.util';
 import {
   Module, Injectable, Controller,
   Get, Post, Put, Delete, Patch,
