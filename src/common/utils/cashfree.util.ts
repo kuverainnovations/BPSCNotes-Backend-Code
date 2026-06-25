@@ -264,16 +264,38 @@ export async function refundCashfreePayment(
  * 
  */
 
-
 export function buildCashfreeCredentials(overrides: {
-  appId?:     string;
+  appId?: string;
   secretKey?: string;
-  env?:       string;
+  env?: string;
 }): CashfreeCredentials {
-  const appId     = overrides.appId     || process.env.CASHFREE_APP_ID     || '';
-  const secretKey = overrides.secretKey || process.env.CASHFREE_SECRET_KEY || '';
-  const env       = (overrides.env      || process.env.CASHFREE_ENV        || 'sandbox') as 'sandbox' | 'production';
-  return { appId, secretKey, env };
+
+  console.log("========== BUILD CASHFREE CREDS ==========");
+  console.log("OVERRIDES:", overrides);
+  console.log("ENV FILE APP_ID:", process.env.CASHFREE_APP_ID);
+  console.log("ENV FILE SECRET:", process.env.CASHFREE_SECRET_KEY?.substring(0, 10));
+  console.log("ENV FILE ENV:", process.env.CASHFREE_ENV);
+
+  const appId =
+    overrides.appId || process.env.CASHFREE_APP_ID || "";
+
+  const secretKey =
+    overrides.secretKey || process.env.CASHFREE_SECRET_KEY || "";
+
+  const env =
+    (overrides.env || process.env.CASHFREE_ENV || "sandbox") as
+      "sandbox" | "production";
+
+  console.log("FINAL APP_ID:", appId);
+  console.log("FINAL SECRET:", secretKey.substring(0, 10));
+  console.log("FINAL ENV:", env);
+  console.log("=========================================");
+
+  return {
+    appId,
+    secretKey,
+    env,
+  };
 }
 
 /**
