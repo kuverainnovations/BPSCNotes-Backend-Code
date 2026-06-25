@@ -1222,13 +1222,30 @@ if (query.search)  { conditions.push(`(sm.title ILIKE $${pi} OR sm.subject ILIKE
     let cfOrderId:        string | null = null;
     try {
       const { createCashfreeOrder, buildCashfreeCredentials, cashfreeReceiptId } = CashfreeUtil;
-      const rows = await this.db.query(
-        `SELECT key, value FROM payment_settings
-         WHERE key IN ('cashfree_app_id','cashfree_secret_key','payment_mode')
-           AND value IS NOT NULL AND value != ''`
-      ).catch(() => []);
-      const cfMap: any = {};
-      for (const r of rows) cfMap[r.key] = r.value;
+      let rows: any[] = [];
+
+try {
+  rows = await this.db.query(
+    `SELECT key, value FROM payment_settings
+     WHERE key IN ('cashfree_app_id','cashfree_secret_key','payment_mode')
+       AND value IS NOT NULL AND value != ''`
+  );
+} catch (e) {
+  console.error("PAYMENT_SETTINGS QUERY FAILED:", e);
+}
+
+console.log("ROWS =", rows);
+
+const cfMap: any = {};
+for (const r of rows) {
+  cfMap[r.key] = r.value;
+}
+
+console.log("CFMAP =", cfMap);
+console.log("PAYMENT MODE =", cfMap["payment_mode"]);
+console.log("APP ID =", cfMap["cashfree_app_id"]);
+console.log("SECRET =", cfMap["cashfree_secret_key"]?.substring(0, 10));
+
       const creds = buildCashfreeCredentials({
         appId:     cfMap['cashfree_app_id'],
         secretKey: cfMap['cashfree_secret_key'],
@@ -1303,13 +1320,29 @@ if (query.search)  { conditions.push(`(sm.title ILIKE $${pi} OR sm.subject ILIKE
 
     // ── Verify payment with Cashfree (server-side) ───────────────
     const { verifyCashfreePayment, buildCashfreeCredentials } = CashfreeUtil;
-    const rows = await this.db.query(
-      `SELECT key, value FROM payment_settings
-       WHERE key IN ('cashfree_app_id','cashfree_secret_key','payment_mode')
-         AND value IS NOT NULL AND value != ''`
-    ).catch(() => []);
-    const cfMap: any = {};
-    for (const r of rows) cfMap[r.key] = r.value;
+    let rows: any[] = [];
+
+try {
+  rows = await this.db.query(
+    `SELECT key, value FROM payment_settings
+     WHERE key IN ('cashfree_app_id','cashfree_secret_key','payment_mode')
+       AND value IS NOT NULL AND value != ''`
+  );
+} catch (e) {
+  console.error("PAYMENT_SETTINGS QUERY FAILED:", e);
+}
+
+console.log("ROWS =", rows);
+
+const cfMap: any = {};
+for (const r of rows) {
+  cfMap[r.key] = r.value;
+}
+
+console.log("CFMAP =", cfMap);
+console.log("PAYMENT MODE =", cfMap["payment_mode"]);
+console.log("APP ID =", cfMap["cashfree_app_id"]);
+console.log("SECRET =", cfMap["cashfree_secret_key"]?.substring(0, 10));
     const creds = buildCashfreeCredentials({
       appId:     cfMap['cashfree_app_id'],
       secretKey: cfMap['cashfree_secret_key'],
