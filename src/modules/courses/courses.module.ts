@@ -508,6 +508,7 @@ export class CoursesService {
             // ── Create Cashfree order for the remaining ₹ balance ──
             let paymentSessionId: string | null = null;
             let cfOrderId:        string | null = null;
+            let paymentEnvironment: 'sandbox' | 'production' = 'sandbox';
             try {
               const { createCashfreeOrder, buildCashfreeCredentials, cashfreeReceiptId } = CashfreeUtil;
               const rows = await this.db.query(
@@ -522,6 +523,8 @@ export class CoursesService {
                 secretKey: cfMap['cashfree_secret_key'],
                 env:       cfMap['payment_mode'],
               });
+              // Expose environment so Android SDK uses the matching endpoint
+              paymentEnvironment = creds.env;
               const [userRow] = await this.db.query(
                 `SELECT name, email, mobile FROM users WHERE id=$1`, [userId]
               );
@@ -563,6 +566,7 @@ export class CoursesService {
               coinDiscountInr,
               paymentSessionId,
               providerOrderId:  cfOrderId,
+              paymentEnvironment,           // → Android SDK: 'sandbox' | 'production'
               courseTitle:      course[0].title,
               courseId,
             }, HttpStatus.PAYMENT_REQUIRED);

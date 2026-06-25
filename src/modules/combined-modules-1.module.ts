@@ -1296,6 +1296,7 @@ class SubscriptionsService {
     // ── Create Cashfree order ────────────────────────────────────
     let paymentSessionId: string | null = null;
     let cfOrderId:        string | null = null;
+    let paymentEnvironment: 'sandbox' | 'production' = 'sandbox'; // returned to Android SDK
     if (finalAmount > 0) {
       try {
         // Resolve credentials: env vars first, then payment_settings DB override
@@ -1314,6 +1315,9 @@ class SubscriptionsService {
           secretKey: cfMap['cashfree_secret_key'],
           env:       cfMap['payment_mode'],
         });
+
+        // Expose the resolved environment so Android SDK uses the matching endpoint
+        paymentEnvironment = creds.env;
 
         if (!creds.appId || !creds.secretKey) {
           console.warn('Cashfree keys not configured — paymentSessionId will be null');
@@ -1353,6 +1357,7 @@ class SubscriptionsService {
       subscriptionId,
       paymentSessionId,          // → Android Cashfree SDK
       providerOrderId: cfOrderId,
+      paymentEnvironment,        // → Android SDK: 'sandbox' | 'production'
       breakdown: { baseAmount: price, coinDiscount, couponDiscount, finalAmount, coinsUsed: coinsToUse, couponCode: validCoupon?.code }
     });
   }
