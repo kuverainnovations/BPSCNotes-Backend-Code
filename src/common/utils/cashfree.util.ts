@@ -85,13 +85,24 @@ export async function createCashfreeOrder(
     ...(req.notifyUrl ? { order_meta: { notify_url: req.notifyUrl, ...req.orderMeta } } : {}),
   };
 
-  const res = await fetch(`${baseUrl(creds.env)}/orders`, {
+  console.log("========== CASHFREE ==========");
+console.log("URL:", `${baseUrl(creds.env)}/orders`);
+console.log("ENV:", creds.env);
+console.log("APP_ID:", creds.appId);
+console.log("SECRET_PREFIX:", creds.secretKey.substring(0, 10));
+console.log("BODY:", JSON.stringify(body, null, 2));
+console.log("==============================");
+
+const res = await fetch(`${baseUrl(creds.env)}/orders`, {
     method:  'POST',
     headers: headers(creds),
     body:    JSON.stringify(body),
   });
 
   const data = await res.json();
+
+  console.log("STATUS:", res.status);
+console.log("RESPONSE:", JSON.stringify(data, null, 2));
 
   if (!res.ok || !data.payment_session_id) {
     const msg = data?.message || data?.error_detail?.error_reason || JSON.stringify(data);
@@ -249,7 +260,11 @@ export async function refundCashfreePayment(
 /**
  * Build credentials from env vars, with DB overrides applied on top.
  * Call pattern: resolve env defaults first, then overlay payment_settings rows.
+ * 
+ * 
  */
+
+
 export function buildCashfreeCredentials(overrides: {
   appId?:     string;
   secretKey?: string;
