@@ -303,7 +303,7 @@ if (q.scheduled_for) {
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW(),$9,$10,$11,$12,$13)
        RETURNING id, attempted_at`,
       [
-        userId, quizId, score, total, correct, timeTakenSecs, isFirstAttempt ? coinsReward : 0, JSON.stringify(allAnswers),
+        userId, quizId, score, total, correct, timeTakenSecs, (isFirstAttempt && total > 0 && correct === total) ? coinsReward : 0, JSON.stringify(allAnswers),
         wrongCount, unansweredCount, marksObtained, negativeMarks, finalScore,
       ]
     );
@@ -341,16 +341,19 @@ if (q.scheduled_for) {
     // values until that cache happened to expire on its own.
     await this.cache.del(`user_tier:${userId}`);
 
-    // ANTI-CHEAT: Only award coins on the FIRST completed attempt for this quiz
+    // FIX Issue 1: Coins ONLY awarded when:
+    //   1. This is the user's FIRST completed attempt for this quiz (anti-farming)
+    //   2. The user scored 100% (all answers correct)
+    // Scoring 0% or any partial score does NOT earn coins.
     let coinsEarned = 0;
-    if (isFirstAttempt) {
+    const isPerfectScore = total > 0 && correct === total;
+    if (isFirstAttempt && isPerfectScore) {
         const quizType = q.type || 'daily';
         const coinAction = quizType === 'mock'  ? 'mock_quiz'
                          : quizType === 'topic' ? 'topic_quiz'
                          : 'daily_quiz';
-        const quizCoinsReward = coinsReward;
         coinsEarned = await this.authService.awardCoins(
-          userId, coinAction, attempt[0].id, quizCoinsReward
+          userId, coinAction, attempt[0].id, coinsReward
         );
     }
 

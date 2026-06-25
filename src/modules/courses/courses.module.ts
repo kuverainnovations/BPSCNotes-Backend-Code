@@ -424,9 +424,8 @@ export class CoursesService {
     return successResponse({ course });
   }
 
-  // FIX Issue 5: no coinsToApply — coins cannot be used for purchases
-  async enroll(courseId: string, userId: string) {
-    const course = await this.db.query(`SELECT id, is_paid, price, title FROM courses WHERE id=$1 AND status='published'`, [courseId]);
+  async enroll(courseId: string, userId: string, coinsToApply = 0) {
+    const course = await this.db.query(`SELECT id, is_paid, price, title, max_coins_redeemable FROM courses WHERE id=$1 AND status='published'`, [courseId]);
     if (!course.length) throw new NotFoundException('Course not found');
 
     if (course[0].is_paid) {
@@ -468,10 +467,45 @@ export class CoursesService {
           !(coursePrice > 0 && Number(individualPurchase[0].amount) === 0);
 
         if (!hasValidPurchase) {
-          // FIX Issue 5: No coin purchase. Real-money Cashfree payment only.
-          const amountDueInr = coursePrice;
-          {
-            // ── Create Cashfree order for the full course price ──
+          // ── Coin discount (1 coin = coin_to_inr_rate ₹, capped) ──
+          // Per-course override (admin-set max_coins_redeemable) takes
+          // priority over the global app_settings default.
+          const globalMaxCoins = await this.getSettingNumber('max_coins_per_purchase', 50);
+          const maxCoins       = course[0].max_coins_redeemable ?? globalMaxCoins;
+          const coinToInrRate  = await this.getSettingNumber('coin_to_inr_rate', 1);
+          const coinsApplied   = Math.max(0, Math.min(Math.floor(coinsToApply || 0), maxCoins));
+
+          if (coinsApplied > 0) {
+            const [userRow] = await this.db.query(`SELECT coins FROM users WHERE id=$1`, [userId]);
+            if (!userRow || userRow.coins < coinsApplied) {
+              throw new BadRequestException(`You only have ${userRow?.coins ?? 0} coins.`);
+            }
+          }
+
+          const coinDiscountInr = Math.min(coursePrice, Math.floor(coinsApplied * coinToInrRate));
+          const amountDueInr    = coursePrice - coinDiscountInr;
+
+          // ── Fully covered by coins — no gateway call needed ──
+          if (amountDueInr <= 0) {
+            if (coinsApplied > 0) {
+              await this.db.query(`UPDATE users SET coins = coins - $1 WHERE id=$2`, [coinsApplied, userId]);
+              const [u] = await this.db.query(`SELECT coins FROM users WHERE id=$1`, [userId]);
+              await this.db.query(
+                `INSERT INTO coin_transactions (user_id,type,amount,description,action,balance)
+                 VALUES ($1,'spent',$2,'Course purchase discount: '||$3,'course_purchase_discount',$4)`,
+                [userId, coinsApplied, course[0].title, u.coins]
+              );
+            }
+            await this.db.query(
+              `INSERT INTO course_purchases (user_id, course_id, amount, coins_applied, coin_discount_inr, status)
+               VALUES ($1,$2,$3,$4,$5,'completed')
+               ON CONFLICT (user_id, course_id) DO UPDATE
+                 SET amount=$3, coins_applied=$4, coin_discount_inr=$5, status='completed', updated_at=NOW()`,
+              [userId, courseId, coursePrice, coinsApplied, coinDiscountInr]
+            );
+            // Fall through to grant enrollment below.
+          } else {
+            // ── Create Cashfree order for the remaining ₹ balance ──
             let paymentSessionId: string | null = null;
             let cfOrderId:        string | null = null;
             try {
@@ -509,12 +543,12 @@ export class CoursesService {
                 `INSERT INTO course_purchases
                    (user_id, course_id, amount, coins_applied, coin_discount_inr,
                     provider_order_id, payment_provider, status)
-                 VALUES ($1,$2,$3,0,0,$4,'cashfree','pending')
+                 VALUES ($1,$2,$3,$4,$5,$6,'cashfree','pending')
                  ON CONFLICT (user_id, course_id) DO UPDATE
-                   SET amount=$3, coins_applied=0, coin_discount_inr=0,
-                       provider_order_id=$4, payment_provider='cashfree',
+                   SET amount=$3, coins_applied=$4, coin_discount_inr=$5,
+                       provider_order_id=$6, payment_provider='cashfree',
                        status='pending', updated_at=NOW()`,
-                [userId, courseId, amountDueInr, cfOrderId]
+                [userId, courseId, amountDueInr, coinsApplied, coinDiscountInr, cfOrderId]
               );
             } catch (err: any) {
               console.error('Course Cashfree order creation failed:', err.message);
@@ -525,6 +559,8 @@ export class CoursesService {
               code:             'PURCHASE_REQUIRED',
               price:            amountDueInr,
               coursePrice,
+              coinsApplied,
+              coinDiscountInr,
               paymentSessionId,
               providerOrderId:  cfOrderId,
               courseTitle:      course[0].title,
@@ -632,8 +668,17 @@ export class CoursesService {
       [payment.cfPaymentId, payment.paymentMethod || 'upi', purchase.id]
     );
 
-    // FIX Issue 5: coin deduction removed — no coins used for purchases
-          
+    // 4b. Deduct any coins that were reserved as a discount for this order
+    if (purchase.coins_applied > 0) {
+      await this.db.query(`UPDATE users SET coins = coins - $1 WHERE id=$2`, [purchase.coins_applied, userId]);
+      const [u] = await this.db.query(`SELECT coins FROM users WHERE id=$1`, [userId]);
+      const [courseRow] = await this.db.query(`SELECT title FROM courses WHERE id=$1`, [courseId]);
+      await this.db.query(
+        `INSERT INTO coin_transactions (user_id,type,amount,description,action,balance)
+         VALUES ($1,'spent',$2,'Course purchase discount: '||$3,'course_purchase_discount',$4)`,
+        [userId, purchase.coins_applied, courseRow?.title ?? '', u.coins]
+      );
+    }
 
     // 5. Grant enrollment
     await this.db.query(
@@ -1012,6 +1057,31 @@ export class CoursesService {
 
   private async sendCourseNotification(courseId: string, title: string, subject: string, isPaid: boolean) {
     try {
+      const notifTitle = `📚 New Course: ${title}`;
+      const notifBody  = `${subject} course now available! ${isPaid ? 'Premium' : 'Free'}.`;
+
+      // FIX Issue 2: Save to notifications + user_notifications tables so the
+      // in-app notification list shows the course notification.
+      const [notifRow] = await this.db.query(
+        `INSERT INTO notifications (title, body, type, target, data, status, sent_at, created_by)
+         VALUES ($1,$2,'new_course','all',$3,'sent',NOW(),'system') RETURNING id`,
+        [notifTitle, notifBody, JSON.stringify({ courseId, screen: 'courses' })]
+      ).catch(() => [null]);
+
+      if (notifRow?.id) {
+        // Insert user_notifications rows in chunks of 1000
+        const users = await this.db.query(
+          `SELECT id FROM users WHERE notification_enabled=TRUE AND status='active'`
+        ).catch(() => []);
+        for (let i = 0; i < users.length; i += 1000) {
+          const chunk = users.slice(i, i + 1000);
+          const vals  = chunk.map((_: any, j: number) => `($${j*4+1},$${j*4+2},$${j*4+3},$${j*4+4})`).join(',');
+          const flat  = chunk.flatMap((u: any) => [u.id, notifRow.id, notifTitle, notifBody]);
+          await this.db.query(`INSERT INTO user_notifications (user_id, notification_id, title, body) VALUES ${vals}`, flat).catch(() => {});
+        }
+      }
+
+      // FCM push with courseId in data payload for deep-link
       const adminSdk = await import('firebase-admin');
       if (!adminSdk.apps.length) return;
       const rows = await this.db.query(
@@ -1022,7 +1092,8 @@ export class CoursesService {
       for (let i = 0; i < tokens.length; i += 500) {
         await adminSdk.messaging().sendEachForMulticast({
           tokens: tokens.slice(i, i + 500),
-          notification: { title: `📚 New Course: ${title}`, body: `${subject} course now available! ${isPaid ? 'Premium' : 'Free'}.` },
+          notification: { title: notifTitle, body: notifBody },
+          // FIX Issue 2: include courseId so tapping the notification deep-links to the course
           data: { type: 'new_course', courseId, screen: 'courses' },
           android: { priority: 'high' },
         }).catch(() => {});
@@ -1123,9 +1194,8 @@ export class CoursesController {
 
   @Post(':id/enroll')
   @HttpCode(HttpStatus.CREATED)
-  enroll(@Param('id', ParseUUIDPipe) id: string, @Req() req: any) {
-    // FIX Issue 5: no coinsToApply in body
-    return this.service.enroll(id, req.user.id);
+  enroll(@Param('id', ParseUUIDPipe) id: string, @Body() body: { coinsToApply?: number }, @Req() req: any) {
+    return this.service.enroll(id, req.user.id, body?.coinsToApply ?? 0);
   }
 
   @Post(':id/purchase/confirm')
