@@ -1061,6 +1061,66 @@ if (query.search)  { conditions.push(`(sm.title ILIKE $${pi} OR sm.subject ILIKE
     return successResponse({ downloads });
   }
 
+  // ── Rating: submit / upsert a star rating ───────────────────
+  async rateMaterial(materialId: string, userId: string, stars: number, review?: string) {
+    const s = Math.round(stars);
+    if (s < 1 || s > 5) throw new BadRequestException('Stars must be between 1 and 5.');
+
+    await this.db.query(`
+      CREATE TABLE IF NOT EXISTS material_ratings (
+        id          UUID        PRIMARY KEY DEFAULT gen_random_uuid(),
+        material_id UUID        NOT NULL REFERENCES study_materials(id) ON DELETE CASCADE,
+        user_id     UUID        NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        stars       SMALLINT    NOT NULL CHECK (stars BETWEEN 1 AND 5),
+        review      TEXT,
+        created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        UNIQUE(material_id, user_id)
+      )
+    `).catch(() => {});
+
+    const [access] = await this.db.query(`
+      SELECT 1 FROM material_purchases WHERE material_id=$1 AND user_id=$2
+      UNION ALL
+      SELECT 1 FROM download_history   WHERE material_id=$1 AND user_id=$2
+      LIMIT 1
+    `, [materialId, userId]).catch(() => [null]);
+    if (!access) throw new BadRequestException('You can only rate materials you have accessed.');
+
+    await this.db.query(`
+      INSERT INTO material_ratings (material_id, user_id, stars, review)
+      VALUES ($1,$2,$3,$4)
+      ON CONFLICT (material_id, user_id)
+      DO UPDATE SET stars=$3, review=$4, updated_at=NOW()
+    `, [materialId, userId, s, review ?? null]);
+
+    await this.db.query(`
+      UPDATE study_materials
+      SET rating = (SELECT ROUND(AVG(stars)::numeric,1) FROM material_ratings WHERE material_id=$1)
+      WHERE id=$1
+    `, [materialId]);
+
+    const [mat] = await this.db.query(`SELECT rating FROM study_materials WHERE id=$1`, [materialId]);
+    return successResponse({ stars: s, avgRating: parseFloat(mat?.rating ?? '0') }, 'Rating saved \u2B50');
+  }
+
+  async getMyRating(materialId: string, userId: string) {
+    await this.db.query(`
+      CREATE TABLE IF NOT EXISTS material_ratings (
+        id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        material_id UUID NOT NULL, user_id UUID NOT NULL,
+        stars SMALLINT NOT NULL, review TEXT,
+        created_at TIMESTAMPTZ DEFAULT NOW(), updated_at TIMESTAMPTZ DEFAULT NOW(),
+        UNIQUE(material_id, user_id)
+      )
+    `).catch(() => {});
+    const [row] = await this.db.query(
+      `SELECT stars, review FROM material_ratings WHERE material_id=$1 AND user_id=$2`,
+      [materialId, userId]
+    ).catch(() => [null]);
+    return successResponse({ stars: row?.stars ?? 0, review: row?.review ?? null });
+  }
+
   // ── Shared: read a numeric app_settings value with fallback ─
   private async getSettingNumber(key: string, fallback: number): Promise<number> {
     const [row] = await this.db.query(
@@ -1103,8 +1163,7 @@ if (query.search)  { conditions.push(`(sm.title ILIKE $${pi} OR sm.subject ILIKE
   // coins as a discount (1 coin = coin_to_inr_rate ₹). Remaining ₹
   // balance is paid via Cashfree. If coins fully cover the price,
   // the purchase completes immediately with no payment step.
-  // FIX Issue 5: coinsToApply removed — real-money Cashfree only
-  async initPurchase(materialId: string, userId: string) {
+  async initPurchase(materialId: string, userId: string, coinsToApply: number) {
     // Already purchased?
     const [existing] = await this.db.query(
       `SELECT id FROM material_purchases WHERE material_id=$1 AND user_id=$2`,
@@ -1131,11 +1190,34 @@ if (query.search)  { conditions.push(`(sm.title ILIKE $${pi} OR sm.subject ILIKE
         '🎉 Added to your library!');
     }
 
-    // FIX Issue 5: Coins cannot be used for purchases.
-    // All paid materials require real-money Cashfree payment.
-    const amountDueInr = price;
+    // ── Validate coin discount ──
+    const maxCoins      = await this.getSettingNumber('max_coins_per_purchase', 50);
+    const coinToInrRate = await this.getSettingNumber('coin_to_inr_rate', 1);
 
-    // ── Full price to Cashfree ─────────────────────────────────
+    const coinsApplied = Math.max(0, Math.min(Math.floor(coinsToApply || 0), maxCoins));
+    if (coinsApplied > 0) {
+      const [userRow] = await this.db.query(`SELECT coins FROM users WHERE id=$1`, [userId]);
+      if (!userRow || userRow.coins < coinsApplied) {
+        throw new BadRequestException(`You only have ${userRow?.coins ?? 0} coins.`);
+      }
+    }
+
+    const coinDiscountInr = Math.min(price, Math.floor(coinsApplied * coinToInrRate));
+    const amountDueInr    = price - coinDiscountInr;
+
+    // ── Fully covered by coins — complete immediately, no gateway ──
+    if (amountDueInr <= 0) {
+      const [order] = await this.db.query(`
+        INSERT INTO material_purchase_orders
+          (material_id, user_id, material_price, coins_applied, coin_discount_inr, amount_due_inr, status)
+        VALUES ($1,$2,$3,$4,$5,0,'completed')
+        RETURNING id
+      `, [materialId, userId, price, coinsApplied, coinDiscountInr]);
+
+      return await this.finalizeMaterialPurchase(material, userId, order.id, coinsApplied, coinDiscountInr, price);
+    }
+
+    // ── Remaining balance needs Cashfree ─────────────────────────
     let paymentSessionId: string | null = null;
     let cfOrderId:        string | null = null;
     try {
@@ -1180,20 +1262,22 @@ if (query.search)  { conditions.push(`(sm.title ILIKE $${pi} OR sm.subject ILIKE
       INSERT INTO material_purchase_orders
         (material_id, user_id, material_price, coins_applied, coin_discount_inr,
          amount_due_inr, provider_order_id, payment_provider, status)
-      VALUES ($1,$2,$3,0,0,$3,$4,'cashfree','pending')
+      VALUES ($1,$2,$3,$4,$5,$6,$7,'cashfree','pending')
       RETURNING id
-    `, [materialId, userId, price, cfOrderId]);
+    `, [materialId, userId, price, coinsApplied, coinDiscountInr, amountDueInr, cfOrderId]);
 
     return successResponse({
       purchased:        false,
       requiresPayment:  true,
       purchaseOrderId:  order.id,
       materialPrice:    price,
-      amountDueInr:     price,
+      coinsApplied,
+      coinDiscountInr,
+      amountDueInr,
       paymentSessionId,
       providerOrderId:  cfOrderId,
       materialTitle:    material.title,
-    }, `₹${price} due — complete payment to unlock`);
+    }, `₹${amountDueInr} due — complete payment to unlock`);
   }
 
   // ── POST: confirm a marketplace purchase after Cashfree payment ──
@@ -1260,7 +1344,7 @@ if (query.search)  { conditions.push(`(sm.title ILIKE $${pi} OR sm.subject ILIKE
     );
 
     return await this.finalizeMaterialPurchase(
-      material, userId, order.id, order.material_price
+      material, userId, order.id, order.coins_applied, order.coin_discount_inr, order.material_price
     );
   }
 
@@ -1270,15 +1354,25 @@ if (query.search)  { conditions.push(`(sm.title ILIKE $${pi} OR sm.subject ILIKE
   private async finalizeMaterialPurchase(
     material: { id: string; title: string; price: number; uploader_id: string | null },
     userId: string, purchaseOrderId: string,
-    fullPrice: number, // FIX Issue 5: coinsApplied/coinDiscountInr removed
+    coinsApplied: number, coinDiscountInr: number, fullPrice: number,
   ) {
-    // FIX Issue 5: No coin deduction — coins cannot buy materials
-    const updatedCoins = null;
+    // Deduct applied coins from buyer
+    let updatedCoins: number | null = null;
+    if (coinsApplied > 0) {
+      await this.db.query(`UPDATE users SET coins=coins-$1 WHERE id=$2`, [coinsApplied, userId]);
+      const [u] = await this.db.query(`SELECT coins FROM users WHERE id=$1`, [userId]);
+      updatedCoins = u.coins;
+      await this.db.query(
+        `INSERT INTO coin_transactions (user_id,type,amount,description,action,balance)
+         VALUES ($1,'spent',$2,'Marketplace discount: '||$3,'material_purchase_discount',$4)`,
+        [userId, coinsApplied, material.title, updatedCoins]
+      );
+    }
 
     // ── 60/40 split: compute seller's share and the platform's net fee ──
     // Seller share is 60% of the FULL listed price (coin discounts don't
     // reduce the seller's payout — the platform absorbs that cost).
-    // Platform's net fee = amount actually collected (fullPrice)
+    // Platform's net fee = amount actually collected (fullPrice - coinDiscountInr)
     // minus what was paid out to the seller. This can be less than the
     // "headline" 40% when a coin discount was applied.
     let sellerShare = 0;
@@ -1286,7 +1380,7 @@ if (query.search)  { conditions.push(`(sm.title ILIKE $${pi} OR sm.subject ILIKE
     if (material.uploader_id && material.uploader_id !== userId && fullPrice > 0) {
       const sellerPct = await this.getSettingNumber('seller_commission_pct', 60);
       sellerShare = Math.floor(fullPrice * sellerPct / 100);
-      platformFee = Math.max(0, fullPrice - sellerShare);
+      platformFee = Math.max(0, (fullPrice - coinDiscountInr) - sellerShare);
     }
 
     // Record the purchase (legacy table — kept for "isPurchased" checks elsewhere)
@@ -1294,7 +1388,7 @@ if (query.search)  { conditions.push(`(sm.title ILIKE $${pi} OR sm.subject ILIKE
       `INSERT INTO material_purchases (material_id, user_id, price_paid, coins_paid, platform_fee)
        VALUES ($1,$2,$3,$4,$5)
        ON CONFLICT (material_id, user_id) DO NOTHING`,
-      [material.id, userId, fullPrice, 0, platformFee]
+      [material.id, userId, fullPrice, coinsApplied, platformFee]
     );
 
     if (sellerShare > 0) {
@@ -1309,7 +1403,8 @@ if (query.search)  { conditions.push(`(sm.title ILIKE $${pi} OR sm.subject ILIKE
 
     return successResponse({
       purchased: true, alreadyPurchased: false,
-      amountPaidInr: fullPrice,
+      coinsSpent: coinsApplied, coinsBalance: updatedCoins,
+      coinDiscountInr, amountPaidInr: fullPrice - coinDiscountInr,
       fileUrl,
     }, '🎉 Purchase successful! Full PDF unlocked.');
   }
@@ -1822,13 +1917,13 @@ export class StudyMaterialsController {
   }
 
   // ── Marketplace purchase — hybrid coins + Cashfree checkout ──
-  // POST /study-materials/:id/purchase/init  body: {} (coins removed, FIX Issue 5)
+  // POST /study-materials/:id/purchase/init  body: { coinsToApply?: number }
   // Returns either a completed purchase (free or fully coin-covered)
   // or a Cashfree session to pay the remaining ₹ balance.
   @Post(':id/purchase/init')
   @HttpCode(HttpStatus.OK)
-  initPurchase(@Param('id', ParseUUIDPipe) id: string, @Req() r: any) {
-    return this.svc.initPurchase(id, r.user.id);
+  initPurchase(@Param('id', ParseUUIDPipe) id: string, @Body() b: any, @Req() r: any) {
+    return this.svc.initPurchase(id, r.user.id, +(b?.coinsToApply ?? 0));
   }
 
   // POST /study-materials/:id/purchase/confirm
@@ -1837,6 +1932,21 @@ export class StudyMaterialsController {
   @HttpCode(HttpStatus.OK)
   confirmPurchase(@Param('id', ParseUUIDPipe) id: string, @Body() b: any, @Req() r: any) {
     return this.svc.confirmPurchase(id, r.user.id, b);
+  }
+
+  // POST /study-materials/:id/rate  body: { stars: 1-5, review?: string }
+  @Post(':id/rate')
+  @HttpCode(HttpStatus.OK)
+  rateMaterial(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() b: { stars: number; review?: string },
+    @Req() r: any
+  ) { return this.svc.rateMaterial(id, r.user.id, b.stars, b.review); }
+
+  // GET /study-materials/:id/my-rating
+  @Get(':id/my-rating')
+  getMyRating(@Param('id', ParseUUIDPipe) id: string, @Req() r: any) {
+    return this.svc.getMyRating(id, r.user.id);
   }
 
   // ── GET: seller's ₹ wallet balance + transaction history ─────
