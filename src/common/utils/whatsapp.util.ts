@@ -34,11 +34,10 @@ export interface WhatsAppSendResult {
  * Returns { success: true } on delivery acceptance by Meta.
  * Throws on network failure so caller can decide fallback behaviour.
  */
-export async function sendWhatsAppOtp(
-  cfg:          WhatsAppOtpConfig,
-  mobile:       string,   // E.164 format, e.g. +919876543210
-  otp:          string,
-  expiryMinutes: number = 10,
+export async function sendWhatsAppRequest(
+  cfg: WhatsAppOtpConfig,
+  mobile: string,
+  requestId: string,
 ): Promise<WhatsAppSendResult> {
   // Normalise mobile → E.164 without leading +
   const to = mobile.replace(/^\+/, '');
@@ -58,11 +57,11 @@ export async function sendWhatsAppOtp(
           parameters: [
             {
               type: 'text',
-              text: 'User',     // {{1}}
+              text: "User",      // {{1}}
             },
             {
               type: 'text',
-              text: otp,        // {{2}}
+              text: requestId,   // {{2}}
             },
           ],
         },
