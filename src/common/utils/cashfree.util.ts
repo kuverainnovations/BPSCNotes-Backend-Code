@@ -136,15 +136,26 @@ export interface CashfreePaymentDetail {
 }
 
 export async function verifyCashfreePayment(
-  creds:   CashfreeCredentials,
+  creds: CashfreeCredentials,
   orderId: string,
 ): Promise<CashfreePaymentDetail> {
+
+  console.log("========== VERIFY PAYMENT ==========");
+  console.log("VERIFY URL:", `${baseUrl(creds.env)}/orders/${orderId}/payments`);
+  console.log("ENV:", creds.env);
+  console.log("ORDER ID:", orderId);
+
   const res = await fetch(`${baseUrl(creds.env)}/orders/${orderId}/payments`, {
-    method:  'GET',
+    method: "GET",
     headers: headers(creds),
   });
 
+  console.log("VERIFY HTTP STATUS:", res.status);
+
   const data = await res.json();
+
+  console.log("VERIFY RESPONSE:");
+  console.log(JSON.stringify(data, null, 2));
 
   if (!res.ok) {
     const msg = data?.message || JSON.stringify(data);

@@ -1351,18 +1351,41 @@ console.log("SECRET =", cfMap["cashfree_secret_key"]?.substring(0, 10));
     if (!creds.appId || !creds.secretKey) {
       throw new BadRequestException('Payment gateway not configured. Contact support.');
     }
+    
     const providerOrderId = order.provider_order_id;
-    if (!providerOrderId) {
-      throw new BadRequestException('Missing provider order ID. Contact support.');
-    }
-    const payment = await verifyCashfreePayment(creds, providerOrderId);
-    if (payment.paymentStatus !== 'SUCCESS') {
-      this.logger.error(
-        `MATERIAL PAYMENT NOT SUCCESS: user=${userId} material=${materialId} ` +
-        `order=${providerOrderId} status=${payment.paymentStatus}`
-      );
-      throw new BadRequestException(`Payment not successful (status: ${payment.paymentStatus}). Contact support.`);
-    }
+if (!providerOrderId) {
+  throw new BadRequestException('Missing provider order ID. Contact support.');
+}
+
+console.log("========== CASHFREE VERIFY ==========");
+console.log("providerOrderId =", providerOrderId);
+console.log("purchaseOrderId =", dto.purchaseOrderId);
+console.log("cfPaymentId(from Android) =", dto.cfPaymentId);
+
+let payment;
+
+try {
+    payment = await verifyCashfreePayment(creds, providerOrderId);
+
+    console.log("Cashfree Response =", payment);
+    console.log("paymentStatus =", payment.paymentStatus);
+    console.log("cfPaymentId =", payment.cfPaymentId);
+
+} catch (e) {
+    console.error("verifyCashfreePayment FAILED");
+    console.error(e);
+    throw e;
+}
+
+if (payment.paymentStatus !== 'SUCCESS') {
+    this.logger.error(
+        `MATERIAL PAYMENT NOT SUCCESS: ${payment.paymentStatus}`
+    );
+
+    throw new BadRequestException(
+        `Payment not successful (${payment.paymentStatus})`
+    );
+}
 
     await this.db.query(
       `UPDATE material_purchase_orders
@@ -1372,6 +1395,7 @@ console.log("SECRET =", cfMap["cashfree_secret_key"]?.substring(0, 10));
       [payment.cfPaymentId, payment.paymentMethod || 'upi', order.id]
     );
 
+    console.log("Order updated successfully.");
     const [material] = await this.db.query(
       `SELECT id, title, price, uploader_id FROM study_materials WHERE id=$1`, [materialId]
     );
