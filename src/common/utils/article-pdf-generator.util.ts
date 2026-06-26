@@ -19,6 +19,11 @@ export interface ArticlePdfData {
   source?: string | null;
   tags?: string[];
   fullContentHtml: string;
+  // Optional pre-parsed sections — when present, rendered as colour-coded
+  // boxes that mirror the Android WebView section-block style.
+  keyPointsHtml?:     string | null;
+  examRelevanceHtml?: string | null;
+  importantFactsHtml?: string | null;
 }
 
 // ── Palette (mirrors RichContentView.tsx admin + app WebView CSS) ──────
@@ -388,7 +393,82 @@ function renderNodes(doc: any, nodes: any[], ctx: RenderCtx) {
   }
 }
 
-// ── Image pre-fetching ────────────────────────────────────────────────────
+// ── Section-block renderer ────────────────────────────────────────────────
+// Mirrors the Android WebView .section-block CSS:
+//   key-points      → blue   #1565C0 / bg #F0F7FF
+//   exam-relevance  → orange #E65100 / bg #FFF8E6
+//   important-facts → green  #2E7D32 / bg #F3F9F3
+interface SectionBlockSpec {
+  label: string;
+  accentColor: string;   // border + label text
+  bgColor:     string;   // background fill
+}
+const SECTION_SPECS: Record<string, SectionBlockSpec> = {
+  keyPoints:     { label: '🔑  KEY POINTS',              accentColor: '#1565C0', bgColor: '#F0F7FF' },
+  examRelevance: { label: '🎯  EXAM RELEVANCE',           accentColor: '#E65100', bgColor: '#FFF8E6' },
+  importantFacts:{ label: '📊  IMPORTANT FACTS & FIGURES',accentColor: '#2E7D32', bgColor: '#F3F9F3' },
+};
+
+function renderSectionBlock(
+  doc: any,
+  html: string,
+  specKey: keyof typeof SECTION_SPECS,
+  ctx: RenderCtx,
+) {
+  if (!html?.trim()) return;
+  const spec = SECTION_SPECS[specKey];
+  const innerX = ctx.contentX + 14;
+  const innerW = ctx.contentWidth - 14;
+
+  ensureSpace(doc, 60);
+
+  // Snapshot Y before rendering content so we can draw the background box behind it
+  const blockStartY = doc.y;
+  const LABEL_H = 20;
+
+  // ── Label ──
+  doc.moveDown(0.15);
+  const labelY = doc.y;
+  doc.font('Helvetica-Bold').fontSize(8)
+    .fillColor(spec.accentColor)
+    .text(spec.label, innerX, labelY + 4, { width: innerW, lineBreak: false });
+  doc.y = labelY + LABEL_H;
+  doc.x = innerX;
+
+  // ── Content ──
+  const contentStartY = doc.y;
+  const dom = parseDocument(html);
+  renderNodes(doc, dom.children as any[], { ...ctx, contentX: innerX, contentWidth: innerW });
+  const contentEndY = doc.y;
+  const totalH = contentEndY - blockStartY + 10;
+
+  // ── Draw background box + left accent bar BEHIND content (via save/restore) ──
+  // PDFKit doesn't support true z-index; we use a second draw pass in place.
+  // Because bufferPages is true, we can draw on the current page directly.
+  doc.save()
+    .fillColor(spec.bgColor).fillOpacity(0.7)
+    .roundedRect(ctx.contentX, blockStartY - 4, ctx.contentWidth, totalH, 4)
+    .fill()
+    .restore();
+  doc.save()
+    .fillColor(spec.accentColor).fillOpacity(1)
+    .rect(ctx.contentX, blockStartY - 4, 3.5, totalH)
+    .fill()
+    .restore();
+
+  // Re-draw label + content on TOP of the background (PDFKit streams sequentially,
+  // so the earlier text got covered — repeat it).
+  doc.font('Helvetica-Bold').fontSize(8).fillColor(spec.accentColor)
+    .text(spec.label, innerX, labelY + 4, { width: innerW, lineBreak: false });
+  doc.y = contentStartY;
+  doc.x = innerX;
+  renderNodes(doc, dom.children as any[], { ...ctx, contentX: innerX, contentWidth: innerW });
+
+  doc.moveDown(0.6);
+  doc.x = ctx.contentX;
+}
+
+
 function collectImageSrcs(nodes: any[], acc: string[] = []): string[] {
   for (const node of nodes || []) {
     if (node.type !== 'tag') continue;
@@ -614,7 +694,20 @@ export async function streamArticlePdf(
   doc.pipe(res);
 
   drawHeader(doc, { ...data, title: plainTitle, source: plainSource }, cw);
-  renderNodes(doc, dom.children as any[], { contentX: PAGE_MARGIN, contentWidth: cw, imageMap });
+
+  const ctx: RenderCtx = { contentX: PAGE_MARGIN, contentWidth: cw, imageMap };
+
+  // ── Render in the same order as the Android WebView buildArticleHtml() ──
+  // summary (lead) is already in the header; sections follow this order:
+  //   1. Key Points box
+  //   2. Main article body (fullContent)
+  //   3. Exam Relevance box
+  //   4. Important Facts box
+  if (data.keyPointsHtml)      renderSectionBlock(doc, data.keyPointsHtml,      'keyPoints',      ctx);
+  renderNodes(doc, dom.children as any[], ctx);
+  if (data.examRelevanceHtml)  renderSectionBlock(doc, data.examRelevanceHtml,  'examRelevance',  ctx);
+  if (data.importantFactsHtml) renderSectionBlock(doc, data.importantFactsHtml, 'importantFacts', ctx);
+
   drawTagsFooter(doc, data, cw);
 
   // Post-process: watermark + page numbers on every buffered page

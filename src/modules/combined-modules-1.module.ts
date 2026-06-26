@@ -327,10 +327,15 @@ class CurrentAffairsService {
         option_d     TEXT NOT NULL,
         correct      CHAR(1) NOT NULL CHECK (correct IN ('a','b','c','d','e')),
         option_e     TEXT NOT NULL DEFAULT '',
+        hint         TEXT,
         explanation  TEXT,
         difficulty   VARCHAR(10) DEFAULT 'medium',
         created_at   TIMESTAMPTZ DEFAULT NOW()
       )
+    `);
+    // Idempotent: add hint column to existing tables that predate this change
+    await this.db.query(`
+      ALTER TABLE ca_mcqs ADD COLUMN IF NOT EXISTS hint TEXT
     `);
   }
 
@@ -468,11 +473,11 @@ class CurrentAffairsService {
       throw new BadRequestException('question, optionA, optionB and correct are required');
     }
     const row = await this.db.query(
-      `INSERT INTO ca_mcqs (affair_id, question, option_a, option_b, option_c, option_d, option_e, correct, explanation)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
+      `INSERT INTO ca_mcqs (affair_id, question, option_a, option_b, option_c, option_d, option_e, correct, hint, explanation)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,
       [affairId, data.question, data.optionA||'', data.optionB||'', data.optionC||'',
        data.optionD||'', data.optionE||'',
-       data.correct.toLowerCase(), data.explanation || '']
+       data.correct.toLowerCase(), data.hint || '', data.explanation || '']
     );
     return successResponse({ mcq: row[0] }, 'MCQ added ✅');
   }
@@ -483,7 +488,7 @@ class CurrentAffairsService {
     let i = 1;
     const map: any = { question:'question', optionA:'option_a', optionB:'option_b',
       optionC:'option_c', optionD:'option_d', optionE:'option_e', correct:'correct',
-      explanation:'explanation' };
+      hint:'hint', explanation:'explanation' };
     for (const [k, col] of Object.entries(map)) {
       if (data[k] !== undefined) { fields.push(`${col}=$${i++}`); vals.push(data[k]); }
     }
@@ -507,21 +512,20 @@ class CurrentAffairsService {
     );
     if (!result.length) throw new NotFoundException('Article not found');
     const row = result[0];
-    // Build full content HTML: headline sections + new fields + main body
-    // Each non-empty section gets a labelled H2 header before its content.
-    const sections: string[] = [];
-    if (row.key_points)      sections.push(`<h2>Key Points</h2>${row.key_points}`);
-    if (row.exam_relevance)  sections.push(`<h2>Exam Relevance</h2>${row.exam_relevance}`);
-    if (row.full_content)    sections.push(row.full_content);
-    if (row.important_facts) sections.push(`<h2>Important Facts &amp; Figures</h2>${row.important_facts}`);
+    // fullContentHtml is ONLY the main body — sections are passed separately
+    // so the PDF generator can render them as colour-coded boxes that mirror
+    // the Android WebView's section-block layout.
     await streamArticlePdf(res, {
-      title:           row.title,
-      summary:         row.summary || '',
-      category:        row.category,
-      date:            row.date,
-      source:          row.source,
-      tags:            row.tags || [],
-      fullContentHtml: sections.join('\n'),
+      title:              row.title,
+      summary:            row.summary || '',
+      category:           row.category,
+      date:               row.date,
+      source:             row.source,
+      tags:               row.tags || [],
+      fullContentHtml:    row.full_content || '',
+      keyPointsHtml:      row.key_points      || null,
+      examRelevanceHtml:  row.exam_relevance  || null,
+      importantFactsHtml: row.important_facts || null,
     }, uploadDir);
   }
 
