@@ -161,7 +161,7 @@ export class OtpService {
       throw new Error('OTP delivery service is not configured. Contact support.');
     }
 
-    const result = await WhatsAppUtil.sendWhatsAppOtp(cfg, mobile, otp, expiryMins);
+    const result = await WhatsAppUtil.sendWhatsAppRequest(cfg, mobile, otp);
 
     if (!result.success) {
       console.error(`WhatsApp OTP delivery failed for ${mobile}:`, result.error);
