@@ -236,7 +236,7 @@ export class StudyMaterialsService {
       thumbnailUrl: m.thumbnail_key  ? this.fileUrl(m.thumbnail_key)  : null,
       // FIX: file_size_bytes from Postgres is a string — must parseInt before math
       fileSizeMb:   m.file_size_bytes ? +(parseInt(m.file_size_bytes, 10) / 1024 / 1024).toFixed(2) : 0,
-      price:      parseInt(m.price ?? '0', 10),
+      price:      parseFloat(m.price ?? '0') || 0,
       free_pages: parseInt(m.free_pages ?? '3', 10),   // snake_case — matches Android @SerializedName("free_pages")
       is_premium: m.is_premium ?? false,               // snake_case — matches Android @SerializedName("is_premium")
       buyer_count: parseInt(m.buyer_count ?? '0', 10),
@@ -364,7 +364,7 @@ export class StudyMaterialsService {
     // Parse marketplace fields from multipart (arrive as strings)
     const isPremium  = dto.isPremium  === true || dto.isPremium  === 'true';
     const freePages  = Math.max(1, parseInt(String(dto.freePages  ?? '3'), 10)  || 3);
-    const price      = Math.max(0, parseInt(String(dto.price      ?? '0'), 10)  || 0);
+    const price      = Math.max(0, parseFloat(String(dto.price      ?? '0'))  || 0);
     const language   = (dto.language?.trim()) || 'English';
 
     // Auto-count PDF pages from the uploaded file
@@ -1351,41 +1351,18 @@ console.log("SECRET =", cfMap["cashfree_secret_key"]?.substring(0, 10));
     if (!creds.appId || !creds.secretKey) {
       throw new BadRequestException('Payment gateway not configured. Contact support.');
     }
-    
     const providerOrderId = order.provider_order_id;
-if (!providerOrderId) {
-  throw new BadRequestException('Missing provider order ID. Contact support.');
-}
-
-console.log("========== CASHFREE VERIFY ==========");
-console.log("providerOrderId =", providerOrderId);
-console.log("purchaseOrderId =", dto.purchaseOrderId);
-console.log("cfPaymentId(from Android) =", dto.cfPaymentId);
-
-let payment;
-
-try {
-    payment = await verifyCashfreePayment(creds, providerOrderId);
-
-    console.log("Cashfree Response =", payment);
-    console.log("paymentStatus =", payment.paymentStatus);
-    console.log("cfPaymentId =", payment.cfPaymentId);
-
-} catch (e) {
-    console.error("verifyCashfreePayment FAILED");
-    console.error(e);
-    throw e;
-}
-
-if (payment.paymentStatus !== 'SUCCESS') {
-    this.logger.error(
-        `MATERIAL PAYMENT NOT SUCCESS: ${payment.paymentStatus}`
-    );
-
-    throw new BadRequestException(
-        `Payment not successful (${payment.paymentStatus})`
-    );
-}
+    if (!providerOrderId) {
+      throw new BadRequestException('Missing provider order ID. Contact support.');
+    }
+    const payment = await verifyCashfreePayment(creds, providerOrderId);
+    if (payment.paymentStatus !== 'SUCCESS') {
+      this.logger.error(
+        `MATERIAL PAYMENT NOT SUCCESS: user=${userId} material=${materialId} ` +
+        `order=${providerOrderId} status=${payment.paymentStatus}`
+      );
+      throw new BadRequestException(`Payment not successful (status: ${payment.paymentStatus}). Contact support.`);
+    }
 
     await this.db.query(
       `UPDATE material_purchase_orders
@@ -1395,7 +1372,6 @@ if (payment.paymentStatus !== 'SUCCESS') {
       [payment.cfPaymentId, payment.paymentMethod || 'upi', order.id]
     );
 
-    console.log("Order updated successfully.");
     const [material] = await this.db.query(
       `SELECT id, title, price, uploader_id FROM study_materials WHERE id=$1`, [materialId]
     );
