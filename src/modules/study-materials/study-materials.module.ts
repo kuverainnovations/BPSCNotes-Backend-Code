@@ -1177,6 +1177,14 @@ if (query.search)  { conditions.push(`(sm.title ILIKE $${pi} OR sm.subject ILIKE
     );
     if (!material) throw new NotFoundException('Material not found');
 
+    // DEBUG
+console.log("========== MATERIAL ==========");
+console.log(material);
+console.log("price =", material.price);
+console.log("typeof price =", typeof material.price);
+console.log("==============================");
+
+
     const price = material.price ?? 0;
 
     // Free material — no payment needed at all
@@ -1205,6 +1213,8 @@ if (query.search)  { conditions.push(`(sm.title ILIKE $${pi} OR sm.subject ILIKE
     const coinDiscountInr = Math.min(price, Math.floor(coinsApplied * coinToInrRate));
     const amountDueInr    = price - coinDiscountInr;
 
+    
+
     // ── Fully covered by coins — complete immediately, no gateway ──
     if (amountDueInr <= 0) {
       const [order] = await this.db.query(`
@@ -1216,6 +1226,7 @@ if (query.search)  { conditions.push(`(sm.title ILIKE $${pi} OR sm.subject ILIKE
 
       return await this.finalizeMaterialPurchase(material, userId, order.id, coinsApplied, coinDiscountInr, price);
     }
+    
 
     // ── Remaining balance needs Cashfree ─────────────────────────
     let paymentSessionId: string | null = null;
@@ -1223,6 +1234,19 @@ if (query.search)  { conditions.push(`(sm.title ILIKE $${pi} OR sm.subject ILIKE
     try {
       const { createCashfreeOrder, buildCashfreeCredentials, cashfreeReceiptId } = CashfreeUtil;
       let rows: any[] = [];
+
+      console.log("========== INSERT VALUES ==========");
+console.log({
+    materialId,
+    userId,
+    price,
+    priceType: typeof price,
+    coinsApplied,
+    coinDiscountInr,
+    amountDueInr,
+    cfOrderId
+});
+console.log("==================================");
 
 try {
   rows = await this.db.query(
