@@ -1151,15 +1151,22 @@ export class StudySessionsService {
     let s = sessions[0];
 
     // ── Credit the final partial interval ──────────────────────
-    // The heartbeat (every 5 min) is what normally awards coins/XP and
-    // increments active_minutes. A session ended before its first
-    // heartbeat (e.g. a 3-minute session) would otherwise show 0m / 0
-    // coins / 0 XP even though the user was actively studying. Apply the
-    // same calculation heartbeat() uses for the time since last_heartbeat,
-    // as long as it doesn't look like an AFK gap.
-    const finalGapSecs = (Date.now() - new Date(s.last_heartbeat).getTime()) / 1000;
-    if (finalGapSecs > 0 && finalGapSecs <= this.AFK_THRESHOLD_S) {
-      const activeMins     = Math.min(finalGapSecs / 60, 5);
+    // The heartbeat (every 5 min) awards coins/XP and increments active_minutes.
+    // If the user ends a session where:
+    //   a) They studied < 5 min (no heartbeat fired yet), OR
+    //   b) They had screen-off / went offline, missing the last heartbeat
+    // …we must credit the remaining active time from last_heartbeat to NOW,
+    // capped at AFK_THRESHOLD_S so a user who paused for hours doesn't get
+    // credited for idle time.
+    //
+    // KEY FIX: we no longer skip the block when finalGapSecs > AFK_THRESHOLD_S.
+    // Instead we cap the creditable gap at AFK_THRESHOLD_S (7 min max per gap).
+    // This means a user who had screen-off for 20 min still gets the pre-gap
+    // active time (up to 7 min) credited — better than always getting 0.
+    const finalGapSecs     = (Date.now() - new Date(s.last_heartbeat).getTime()) / 1000;
+    const creditableGapSecs = Math.min(finalGapSecs, this.AFK_THRESHOLD_S); // cap at AFK window
+    if (creditableGapSecs > 30) { // only credit if meaningful (>30 sec)
+      const activeMins     = Math.min(creditableGapSecs / 60, 7); // max 7 min per gap
       const coinMultiplier = +s.coin_multiplier || 1.0;
       const xpMultiplier   = +s.xp_multiplier   || 1.0;
 
