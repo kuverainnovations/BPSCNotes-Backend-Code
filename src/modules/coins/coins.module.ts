@@ -802,6 +802,66 @@ export class AdminCoinsService {
     return successResponse({ stats: { ...row, coin_system_enabled: economy.enabled } });
   }
 
+  async getAdminStoreItems() {
+    const items = await this.db.query(`
+      SELECT id, title, description, coin_cost, item_type, item_value, icon_url,
+             stock, sort_order, is_active, created_at,
+             (SELECT COUNT(*)::int FROM coin_redemptions WHERE item_id = csi.id) AS redemption_count
+      FROM coin_store_items csi ORDER BY sort_order ASC, created_at DESC
+    `);
+    return successResponse({ items });
+  }
+
+  async createStoreItem(dto: any) {
+    const { title, coinCost, description, itemType, itemValue, iconUrl, stock, sortOrder, isActive } = dto;
+    if (!title || coinCost === undefined) throw new BadRequestException('title and coinCost are required');
+    await this.db.query(`
+      INSERT INTO coin_store_items (title, description, coin_cost, item_type, item_value, icon_url, stock, sort_order, is_active)
+      VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+    `, [title, description ?? null, +coinCost, itemType ?? 'badge', itemValue ?? null, iconUrl ?? null,
+        stock !== undefined && stock !== null ? +stock : null, +(sortOrder ?? 0), isActive !== false]);
+    return successResponse(null, 'Store item created ✅');
+  }
+
+  async updateStoreItem(id: string, dto: any) {
+    const fields: string[] = []; const vals: any[] = []; let i = 1;
+    if (dto.title       !== undefined) { fields.push(`title=$${i++}`);       vals.push(dto.title); }
+    if (dto.description !== undefined) { fields.push(`description=$${i++}`); vals.push(dto.description ?? null); }
+    if (dto.coinCost    !== undefined) { fields.push(`coin_cost=$${i++}`);   vals.push(+dto.coinCost); }
+    if (dto.itemType    !== undefined) { fields.push(`item_type=$${i++}`);   vals.push(dto.itemType); }
+    if (dto.itemValue   !== undefined) { fields.push(`item_value=$${i++}`);  vals.push(dto.itemValue ?? null); }
+    if (dto.iconUrl     !== undefined) { fields.push(`icon_url=$${i++}`);    vals.push(dto.iconUrl ?? null); }
+    if (dto.stock       !== undefined) { fields.push(`stock=$${i++}`);       vals.push(dto.stock === null ? null : +dto.stock); }
+    if (dto.sortOrder   !== undefined) { fields.push(`sort_order=$${i++}`);  vals.push(+dto.sortOrder); }
+    if (dto.isActive    !== undefined) { fields.push(`is_active=$${i++}`);   vals.push(dto.isActive); }
+    if (!fields.length) return successResponse(null, 'Nothing to update');
+    await this.db.query(`UPDATE coin_store_items SET ${fields.join(',')} WHERE id=$${i}`, [...vals, id]);
+    return successResponse(null, 'Store item updated ✅');
+  }
+
+  async deleteStoreItem(id: string) {
+    const [item] = await this.db.query(`SELECT id FROM coin_store_items WHERE id=$1`, [id]);
+    if (!item) throw new NotFoundException('Item not found');
+    await this.db.query(`DELETE FROM coin_store_items WHERE id=$1`, [id]);
+    return successResponse(null, 'Item deleted');
+  }
+
+  async getRedemptions(page = 1, limit = 20) {
+    const offset = (page - 1) * limit;
+    const rows = await this.db.query(`
+      SELECT cr.id, cr.coins_spent, cr.created_at,
+             u.name AS user_name, u.id AS user_id,
+             si.title AS item_title, si.item_type
+      FROM coin_redemptions cr
+      JOIN users u ON u.id = cr.user_id
+      JOIN coin_store_items si ON si.id = cr.item_id
+      ORDER BY cr.created_at DESC
+      LIMIT $1 OFFSET $2
+    `, [limit, offset]);
+    const [{ total }] = await this.db.query(`SELECT COUNT(*)::int AS total FROM coin_redemptions`);
+    return successResponse({ redemptions: rows, total, page, limit });
+  }
+
   async getTopEarners(limit = 20) {
     const rows = await this.db.query(`
       SELECT
@@ -935,6 +995,25 @@ export class AdminCoinsController {
 
   @Put('ad-config')
   updateAdConfig(@Body() dto: any) { return this.svc.updateAdConfig(dto); }
+
+  @Get('store-items')
+  getStoreItems() { return this.svc.getAdminStoreItems(); }
+
+  @Post('store-items')
+  @HttpCode(HttpStatus.CREATED)
+  createStoreItem(@Body() dto: any) { return this.svc.createStoreItem(dto); }
+
+  @Put('store-items/:id')
+  updateStoreItem(@Param('id') id: string, @Body() dto: any) { return this.svc.updateStoreItem(id, dto); }
+
+  @Delete('store-items/:id')
+  @HttpCode(HttpStatus.OK)
+  deleteStoreItem(@Param('id') id: string) { return this.svc.deleteStoreItem(id); }
+
+  @Get('redemptions')
+  getRedemptions(@Query('page') page = 1, @Query('limit') limit = 20) {
+    return this.svc.getRedemptions(+page, +limit);
+  }
 }
 
 @Module({
