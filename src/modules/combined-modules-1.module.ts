@@ -1079,13 +1079,11 @@ class JobsService implements OnModuleInit {
   async findOne(jobId: string, userId: string) {
     const [rows, saved] = await Promise.all([
       this.db.query(
-        `SELECT j.*, a.name AS created_by_name FROM job_vacancies j
-         LEFT JOIN admins a ON a.id = j.created_by
-         WHERE j.id = $1`,
+        `SELECT j.* FROM job_vacancies j WHERE j.id = $1`,
         [jobId]
       ),
       this.db.query(
-        `SELECT 1 FROM saved_jobs WHERE user_id=$1 AND job_id=$2`,
+        `SELECT 1 FROM job_saves WHERE user_id=$1 AND job_id=$2`,
         [userId, jobId]
       ),
     ]);
@@ -1160,14 +1158,9 @@ class JobsController {
   @Get()
   findAll(@Query() q: any, @Req() r: any) { return this.s.findAll(q, r.user.id); }
 
-  @Get(':id')
-  findOne(@Param('id', ParseUUIDPipe) id: string, @Req() r: any) { return this.s.findOne(id, r.user.id); }
-
-  @Post(':id/save')
-  @HttpCode(200)
-  toggleSave(@Param('id', ParseUUIDPipe) id: string, @Req() r: any) {
-    return this.s.toggleSave(id, r.user.id);
-  }
+  // Static routes MUST come before parameterised :id routes
+  @Get('alert-prefs')
+  getAlertPrefs(@Req() r: any) { return this.s.getAlertPrefs(r.user.id); }
 
   // User syncs their alert category subscriptions
   @Post('alert-prefs')
@@ -1176,8 +1169,14 @@ class JobsController {
     return this.s.syncAlertPrefs(r.user.id, body.categories || []);
   }
 
-  @Get('alert-prefs')
-  getAlertPrefs(@Req() r: any) { return this.s.getAlertPrefs(r.user.id); }
+  @Get(':id')
+  findOne(@Param('id', ParseUUIDPipe) id: string, @Req() r: any) { return this.s.findOne(id, r.user.id); }
+
+  @Post(':id/save')
+  @HttpCode(200)
+  toggleSave(@Param('id', ParseUUIDPipe) id: string, @Req() r: any) {
+    return this.s.toggleSave(id, r.user.id);
+  }
 }
 
 // ── Admin controller ──────────────────────────────────────
@@ -2536,7 +2535,7 @@ class BookmarksService {
 
     const [rows, countResult] = await Promise.all([
       this.db.query(
-        `SELECT qq.id, qq.question, qq.option_a, qq.option_b, qq.option_c, qq.option_d, qq.option_e,
+        `SELECT qq.id, qq.question_text AS question, qq.option_a, qq.option_b, qq.option_c, qq.option_d, qq.option_e,
                 qq.correct, qq.explanation, qq.hint, qq.subject, qq.difficulty, qq.topic_tag,
                 q.id AS quiz_id, q.title AS quiz_title, bq.created_at AS bookmarked_at
          FROM bookmarked_questions bq
