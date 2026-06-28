@@ -10,8 +10,8 @@ import { MigrationInterface, QueryRunner } from 'typeorm';
  *   subscription_plans price, original_price  (if exists)
  *   material_purchase_orders  price_paid (keep precision)
  */
-export class PriceToDecimal1783000000000 implements MigrationInterface {
-  name = 'PriceToDecimal1783000000000';
+export class PriceToDecimal1783000000001 implements MigrationInterface {
+  name = 'PriceToDecimal1783000000001';
 
   public async up(queryRunner: QueryRunner): Promise<void> {
     // courses

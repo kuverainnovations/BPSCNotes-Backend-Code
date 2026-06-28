@@ -19,6 +19,7 @@ import { ApiTags, ApiBearerAuth, ApiOperation } from '@nestjs/swagger';
 import { IsString, IsEmail, IsNotEmpty, IsOptional, IsArray, IsObject } from 'class-validator';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import * as bcrypt from 'bcryptjs';
+import { Response } from 'express';
 
 import { AdminJwtGuard, PermissionGuard, RequirePermission, Public } from '../../common/guards';
 import { successResponse, paginationMeta } from '../../common/utils/response.util';
@@ -329,7 +330,10 @@ export class AdminSettingsService {
                     'daily_quiz_limit','leaderboard_enabled','ads_enabled',
                     'coin_system_enabled','coin_to_inr_rate',
                     'rank_tier_0','rank_tier_1','rank_tier_2','rank_tier_3',
-                    'rank_tier_4','rank_tier_5')
+                    'rank_tier_4','rank_tier_5',
+                    'screen_capture_protection','quiz_shuffle_questions','quiz_shuffle_options',
+                    'streak_warning_hour',
+                    'notif_daily_quiz_enabled','notif_streak_risk_enabled','notif_target_reminder_enabled')
     `);
     const rawConfig = Object.fromEntries(result.map(r => [r.key, r.value]));
     // Provide defaults for keys not yet set by admin
@@ -343,8 +347,15 @@ export class AdminSettingsService {
       rank_tier_1:           '1500',  // Explorer threshold
       rank_tier_2:           '3000',  // Achiever threshold
       rank_tier_3:           '6000',  // Expert threshold
-      rank_tier_4:           '12000', // Champion threshold
-      rank_tier_5:           '20000', // Legend threshold
+      rank_tier_4:              '12000', // Champion threshold
+      rank_tier_5:              '20000', // Legend threshold
+      screen_capture_protection:     'true',
+      quiz_shuffle_questions:        'true',
+      quiz_shuffle_options:          'true',
+      streak_warning_hour:           '20',
+      notif_daily_quiz_enabled:      'true',
+      notif_streak_risk_enabled:     'true',
+      notif_target_reminder_enabled: 'true',
     };
     const config: Record<string, string> = { ...defaults, ...rawConfig };
     // Back/forward-compat aliases:
@@ -510,9 +521,27 @@ export class AdminAuthController {
   @Public()
   @Post('login')
   @HttpCode(HttpStatus.OK)
-  async login(@Body() dto: AdminLoginDto) {
+  async login(
+    @Body() dto: AdminLoginDto,
+    @Res({ passthrough: true }) res: Response,
+  ) {
     const data = await this.adminAuthService.login(dto.email, dto.password);
+    res.cookie('adminToken', data.token, {
+      httpOnly: true,
+      secure:   process.env.NODE_ENV === 'production',
+      sameSite: 'lax',
+      maxAge:   24 * 60 * 60 * 1000,
+      path:     '/',
+    });
     return successResponse(data, 'Welcome back!');
+  }
+
+  @Public()
+  @Post('logout')
+  @HttpCode(HttpStatus.OK)
+  logout(@Res({ passthrough: true }) res: Response) {
+    res.clearCookie('adminToken', { httpOnly: true, secure: true, sameSite: 'lax', path: '/' });
+    return successResponse(null, 'Logged out');
   }
 }
 

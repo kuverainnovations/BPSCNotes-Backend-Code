@@ -4,8 +4,8 @@
 import * as WhatsAppUtil from '../../common/utils/whatsapp.util';
 import {
   Module, Injectable, Controller, Post, Get, Query, Body, Req,
-  HttpCode, HttpStatus, UnauthorizedException, BadRequestException,
-  ConflictException,
+  HttpCode, HttpStatus, HttpException,
+  UnauthorizedException, BadRequestException, ConflictException,
   Patch,
   Delete,
 } from '@nestjs/common';
@@ -124,6 +124,35 @@ export class OtpService {
   ) {}
 
   async send(mobile: string): Promise<{ success: boolean }> {
+    // Per-phone cooldown: 2-minute wait between OTP sends (check BEFORE deleting old OTPs)
+    const [lastOtp] = await this.db.query(
+      `SELECT created_at FROM otps WHERE mobile = $1 ORDER BY created_at DESC LIMIT 1`,
+      [mobile]
+    );
+    if (lastOtp) {
+      const ageSeconds = (Date.now() - new Date(lastOtp.created_at).getTime()) / 1000;
+      if (ageSeconds < 120) {
+        const retryAfterSeconds = Math.ceil(120 - ageSeconds);
+        throw new HttpException(
+          { message: 'Please wait before requesting another OTP.', retryAfterSeconds },
+          HttpStatus.TOO_MANY_REQUESTS
+        );
+      }
+    }
+
+    // Daily cap: max 5 OTPs per phone per day (count before deletion so we see all today's records)
+    const [dailyRow] = await this.db.query(
+      `SELECT COUNT(*)::int AS cnt FROM otps
+       WHERE mobile = $1 AND created_at::date = CURRENT_DATE`,
+      [mobile]
+    );
+    if (Number(dailyRow?.cnt) >= 5) {
+      throw new BadRequestException({
+        message: 'Daily OTP limit reached. Please try again tomorrow.',
+        retryAfterSeconds: null,
+      });
+    }
+
     const otpConfig  = this.config.get('otp');
     const otp        = this.generateOtp();
     const expiryMins = otpConfig.expiryMinutes;
@@ -302,8 +331,8 @@ export class AuthService {
 
     const newUser = await this.db.transaction(async (em) => {
       const result = await em.query(
-        `INSERT INTO users (name, email, mobile, mobile_verified, district, referral_code, referred_by)
-         VALUES ($1,$2,$3,TRUE,$4,$5,$6) RETURNING *`,
+        `INSERT INTO users (name, email, mobile, mobile_verified, district, referral_code, referred_by, onboarding_completed)
+         VALUES ($1,$2,$3,TRUE,$4,$5,$6,FALSE) RETURNING *`,
         [dto.name, dto.email || null, mobile, dto.district || null, refCode, referrerId]
       );
       return result[0];
@@ -372,6 +401,7 @@ export class AuthService {
   async updateProfile(userId: string, dto: {
     name?: string; email?: string; bio?: string;
     district?: string; state?: string; target_year?: number; prep_level?: string;
+    onboarding_completed?: boolean; daily_goal_mins?: number;
   }) {
     const sets: string[] = [];
     const vals: any[]    = [];
@@ -384,6 +414,8 @@ export class AuthService {
     if (dto.state !== undefined){ sets.push(`state=$${i++}`);       vals.push(dto.state?.trim()   || null); }
     if (dto.target_year)        { sets.push(`target_year=$${i++}`); vals.push(dto.target_year); }
     if (dto.prep_level)         { sets.push(`prep_level=$${i++}`);  vals.push(dto.prep_level); }
+    if (dto.onboarding_completed !== undefined) { sets.push(`onboarding_completed=$${i++}`); vals.push(dto.onboarding_completed); }
+    if (dto.daily_goal_mins != null) { sets.push(`daily_goal_mins=$${i++}`); vals.push(dto.daily_goal_mins); }
 
     if (!sets.length) throw new BadRequestException('No fields to update');
 
@@ -721,26 +753,17 @@ export class AuthService {
 
   async awardCoins(userId: string, action: string, refId?: string, coinsOverride?: number): Promise<number> {
     try {
-      // Master switch — admin can disable the entire coin economy from
-      // the Coins page (Economy settings).
       if (!(await this.isCoinSystemEnabled())) return 0;
 
-      // Try DB first — admin can override amounts via admin panel
       const dbRules = await this.db.query(
         `SELECT coins_awarded, max_per_day FROM coin_rules WHERE action = $1 AND is_active = TRUE`,
         [action]
       );
 
-      const defaults = AuthService.COIN_DEFAULTS[action];
-
-      // Use DB rule if present, otherwise fall back to code defaults
-      // If neither exists, log a warning and return 0
-      // FIX: Safe parsing — parseInt(null) or parseInt(undefined) = NaN which crashes Postgres
-      // Always fall back to COIN_DEFAULTS when DB value is missing/null/NaN
+      const defaults    = AuthService.COIN_DEFAULTS[action];
       const dbCoins     = dbRules.length > 0 ? Number(dbRules[0].coins_awarded) : NaN;
       const dbMaxPerDay = dbRules.length > 0 ? Number(dbRules[0].max_per_day)   : NaN;
 
-      // Priority: coinsOverride (per-quiz admin value) > DB rule > COIN_DEFAULTS
       const coinsToAward =
         (coinsOverride !== undefined && coinsOverride > 0) ? coinsOverride
         : (!isNaN(dbCoins) && dbCoins >= 0)               ? dbCoins
@@ -755,56 +778,75 @@ export class AuthService {
         return 0;
       }
 
-      // Idempotency — respect daily cap
-      const todayCount = await this.db.query(
-        `SELECT COUNT(*) FROM coin_transactions
-         WHERE user_id=$1 AND action=$2 AND created_at::date = CURRENT_DATE`,
-        [userId, action]
-      );
-      if (parseInt(todayCount[0].count) >= maxPerDay) return 0;
+      // Reject non-UUID strings before they reach Postgres (avoids "invalid UUID" error)
+      const safeRefId = refId && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(refId)
+        ? refId : null;
 
-      // Award coins — UPDATE first, then record transaction separately
-      // IMPORTANT: return coinsToAward as soon as UPDATE succeeds.
-      // A failed transaction INSERT must NOT cause return 0 — that leaves the
-      // user with added coins but a response claiming coinsEarned=0.
-      const balResult = await this.db.query(
-        `UPDATE users
-         SET coins = COALESCE(coins,0) + $1,
-             total_coins_earned = COALESCE(total_coins_earned,0) + $1
-         WHERE id = $2 RETURNING coins`,
-        [coinsToAward, userId]
-      );
+      // Idempotency key prevents double-award for the same logical event:
+      // - per-reference: quiz completion, referral (unique refId per event)
+      // - per-day: once-per-day actions (daily_login, profile_complete)
+      // - null: multi-per-day actions (ad_watch) — count-based cap handles these
+      const today = new Date().toISOString().slice(0, 10);
+      const idempotencyKey: string | null =
+        safeRefId       ? `${action}:${safeRefId}` :
+        maxPerDay === 1 ? `${action}:${today}` :
+        null;
 
-      if (!balResult.length) return 0;
-      const newBalance = Number(balResult[0].coins) || 0;
-
-      // Record transaction — non-blocking: failure here must NOT roll back coins
-      // or return 0. Fire and wait, but catch independently.
-      try {
-        // Validate refId is a proper UUID before inserting — non-UUID strings cause "invalid UUID" error
-        const safeRefId = refId && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(refId)
-          ? refId : null;
-        await this.db.query(
-          `INSERT INTO coin_transactions
-             (user_id, type, amount, description, action, ref_id, balance)
-           VALUES ($1,'earned',$2,$3,$4,$5,$6)`,
-          [userId, coinsToAward, `${action} reward`, action, safeRefId, newBalance]
+      return await this.db.transaction(async (em) => {
+        // Lock the user row for the duration of this transaction.
+        // Concurrent awardCoins() calls for the same user serialize here —
+        // the second call sees the first call's committed idempotency record.
+        const [user] = await em.query(
+          `SELECT id FROM users WHERE id = $1 FOR UPDATE`, [userId]
         );
-      } catch (txErr: any) {
-        // Log but do NOT rethrow — coins were already awarded, just missing the history row
-        console.error(`coin_transactions INSERT failed for action=${action}:`, txErr.message);
-        // Attempt a simpler INSERT without ref_id to at least record it
-        this.db.query(
-          `INSERT INTO coin_transactions (user_id, type, amount, description, action, balance)
-           VALUES ($1,'earned',$2,$3,$4,$5)`,
-          [userId, coinsToAward, `${action} reward`, action, newBalance]
-        ).catch(() => {}); // truly non-blocking fallback
-      }
+        if (!user) return 0;
 
-      await this.cache.del(`user:${userId}`);
-      return coinsToAward;
+        // Idempotency check — inside the lock so concurrent requests can't
+        // both pass the check before either commits
+        if (idempotencyKey) {
+          const [exists] = await em.query(
+            `SELECT 1 FROM coin_transactions
+             WHERE user_id = $1 AND idempotency_key = $2 LIMIT 1`,
+            [userId, idempotencyKey]
+          );
+          if (exists) return 0;
+        }
 
-    } catch (err) {
+        // Daily cap check (safe under row lock)
+        const [countRow] = await em.query(
+          `SELECT COUNT(*)::int AS cnt FROM coin_transactions
+           WHERE user_id = $1 AND action = $2 AND created_at::date = CURRENT_DATE`,
+          [userId, action]
+        );
+        if (Number(countRow.cnt) >= maxPerDay) return 0;
+
+        const [updated] = await em.query(
+          `UPDATE users
+             SET coins              = COALESCE(coins, 0) + $1,
+                 total_coins_earned = COALESCE(total_coins_earned, 0) + $1
+           WHERE id = $2 RETURNING coins`,
+          [coinsToAward, userId]
+        );
+        if (!updated) return 0;
+        const newBalance = Number(updated.coins) || 0;
+
+        // ON CONFLICT DO NOTHING is a secondary safety net only — the idempotency
+        // check above already prevents duplicates under normal operation
+        await em.query(
+          `INSERT INTO coin_transactions
+             (user_id, type, amount, description, action, ref_id, balance, idempotency_key)
+           VALUES ($1, 'earned', $2, $3, $4, $5, $6, $7)
+           ON CONFLICT (user_id, idempotency_key)
+             WHERE idempotency_key IS NOT NULL
+           DO NOTHING`,
+          [userId, coinsToAward, `${action} reward`, action, safeRefId, newBalance, idempotencyKey]
+        );
+
+        await this.cache.del(`user:${userId}`);
+        return coinsToAward;
+      });
+
+    } catch (err: any) {
       console.error('awardCoins error:', err.message);
       return 0;
     }
@@ -1053,7 +1095,12 @@ export class AdminJwtStrategy extends PassportStrategy(Strategy as any, 'admin-j
     @InjectDataSource() private readonly db: DataSource,
   ) {
     super({
-      jwtFromRequest:   ExtractJwt.fromAuthHeaderAsBearerToken(),
+      jwtFromRequest: ExtractJwt.fromExtractors([
+        // Cookie first (httpOnly — set by POST /admin/login)
+        (req: any) => req?.cookies?.adminToken ?? null,
+        // Authorization header fallback (Swagger, Postman, legacy clients)
+        ExtractJwt.fromAuthHeaderAsBearerToken(),
+      ]),
       ignoreExpiration: false,
       secretOrKey:      config.get('jwt.adminSecret'),
     });

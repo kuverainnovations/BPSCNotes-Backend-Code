@@ -7,6 +7,7 @@ import { ConfigService } from '@nestjs/config';
 import * as helmet from 'helmet';
 import * as compression from 'compression';
 import * as morgan from 'morgan';
+import * as cookieParser from 'cookie-parser';
 import { AppModule } from './app.module';
 
 // ════════════════════════════════════════════════════════════
@@ -59,6 +60,9 @@ async function bootstrap() {
     bufferLogs: true,
   });
 
+  // ── Cookie parser — required for httpOnly admin JWT cookie ──
+  app.use(cookieParser());
+
   // ── Increase body size limit for video/file uploads (200MB) ─
   // Default NestJS/Express limit is 100KB — way too small for videos
   app.use(require('express').json({ limit: '10mb' }));
@@ -109,7 +113,7 @@ async function bootstrap() {
       }
     },
     methods:              ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-    allowedHeaders:       ['Content-Type', 'Authorization', 'Accept', 'Origin', 'X-Requested-With'],
+    allowedHeaders:       ['Content-Type', 'Authorization', 'Accept', 'Origin', 'X-Requested-With', 'Cookie'],
     credentials:          true,
     preflightContinue:    false,   // NestJS handles OPTIONS, returns 204
     optionsSuccessStatus: 204,

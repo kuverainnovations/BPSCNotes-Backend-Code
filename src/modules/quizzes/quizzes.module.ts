@@ -36,7 +36,7 @@ class QuizzesService {
   async findAll(query: PaginationDto & any, userId: string) {
     const { page = 1, limit = 20, type, subject, exam } = query;
     const offset = (page - 1) * limit;
-    const conditions = [`q.status = 'published'`];
+    const conditions = [`q.status = 'published'`, `q.total_questions > 0`];
     const params: any[] = [];
 
     if (type)    { conditions.push(`q.type=$${params.length + 1}`);            params.push(type); }
@@ -123,7 +123,7 @@ class QuizzesService {
     return result;
   }
 
-  // ── POST /quizzes/:id/start — creates attempt, returns questions ──
+  // ── POST /quizzes/:id/start — creates session, returns shuffled questions ──
   async startQuiz(quizId: string, userId: string) {
     const quiz = await this.db.query(
       `SELECT * FROM quizzes WHERE id=$1 AND status='published'`,
@@ -133,55 +133,119 @@ class QuizzesService {
 
     const q = quiz[0];
 
-    // Validate scheduled_for (quiz should be available now)
-    // if (q.scheduled_for && new Date(q.scheduled_for) > new Date()) {
-    //   throw new BadRequestException('This quiz is not yet available');
-    // }
+    if (q.scheduled_for) {
+      const today     = new Date().toISOString().split('T')[0];
+      const scheduled = new Date(q.scheduled_for).toISOString().split('T')[0];
+      if (scheduled > today) {
+        throw new BadRequestException('This quiz is not yet available');
+      }
+    }
 
-    const now = new Date();
+    // Read global shuffle settings from app_settings
+    const settingRows = await this.db.query(
+      `SELECT key, value FROM app_settings WHERE key IN ('quiz_shuffle_questions','quiz_shuffle_options')`
+    );
+    const settingsMap: Record<string, string> = Object.fromEntries(
+      settingRows.map((r: any) => [r.key, r.value])
+    );
+    const shuffleQuestions = (settingsMap['quiz_shuffle_questions'] ?? 'true') === 'true'
+      && q.shuffle_questions !== false;
+    const shuffleOptions   = (settingsMap['quiz_shuffle_options'] ?? 'true') === 'true'
+      && q.shuffle_options !== false;
 
-if (q.scheduled_for) {
-  // Use ISO date-string comparison — completely timezone-safe
-  // Compares 'YYYY-MM-DD' strings which are lexicographically ordered
-  const today     = new Date().toISOString().split('T')[0];
-  const scheduled = new Date(q.scheduled_for).toISOString().split('T')[0];
-  if (scheduled > today) {
-    throw new BadRequestException('This quiz is not yet available');
-  }
-}
-
-    // Fetch questions — correct_option and explanation deliberately excluded
-    // to prevent cheating. They are only returned in the /submit response.
-    const questions = await this.db.query(
+    // Fetch questions — correct_option excluded to prevent cheating
+    const rawQuestions = await this.db.query(
       `SELECT id, question_text, option_a, option_b, option_c, option_d,
-       question_type, question_image_url, option_type,
-       option_a_image, option_b_image, option_c_image, option_d_image,
-       subject, sort_order,
-              COALESCE(question_type, 'text')   AS question_type,
-              COALESCE(option_type, 'text')     AS option_type
+              question_type, question_image_url, option_type,
+              option_a_image, option_b_image, option_c_image, option_d_image,
+              subject, sort_order,
+              COALESCE(question_type, 'text') AS question_type,
+              COALESCE(option_type,   'text') AS option_type
        FROM quiz_questions
        WHERE quiz_id=$1
        ORDER BY sort_order ASC`,
       [quizId]
     );
 
-    if (!questions.length) {
+    if (!rawQuestions.length) {
       throw new BadRequestException('This quiz has no questions yet. Please contact admin.');
     }
 
-    // Create an attempt record (startedAt only — submittedAt set on submit)
+    // Fisher-Yates shuffle helper
+    const shuffle = <T>(arr: T[]): T[] => {
+      const a = [...arr];
+      for (let i = a.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [a[i], a[j]] = [a[j], a[i]];
+      }
+      return a;
+    };
+
+    const OPTION_KEYS = ['a','b','c','d'] as const;
+
+    const orderedQuestions = shuffleQuestions ? shuffle(rawQuestions) : rawQuestions;
+
+    // Build per-question option order map and reorder option fields
+    const optionOrderMap: Record<string, string[]> = {};
+    const questions = orderedQuestions.map((qRow: any) => {
+      const order = shuffleOptions ? shuffle([...OPTION_KEYS]) : [...OPTION_KEYS];
+      optionOrderMap[qRow.id] = order;
+      return {
+        ...qRow,
+        option_a: qRow[`option_${order[0]}`],
+        option_b: qRow[`option_${order[1]}`],
+        option_c: qRow[`option_${order[2]}`],
+        option_d: qRow[`option_${order[3]}`],
+        option_a_image: qRow[`option_${order[0]}_image`] ?? null,
+        option_b_image: qRow[`option_${order[1]}_image`] ?? null,
+        option_c_image: qRow[`option_${order[2]}_image`] ?? null,
+        option_d_image: qRow[`option_${order[3]}_image`] ?? null,
+      };
+    });
+
+    // Abandon any existing in_progress session for this quiz (re-start case)
     await this.db.query(
-      `INSERT INTO quiz_attempts (user_id, quiz_id, attempted_at)
-       VALUES ($1, $2, NOW())
-       `,  // FIX: removed ON CONFLICT — no unique constraint on quiz_attempts(user_id,quiz_id)
+      `UPDATE quiz_sessions SET status='abandoned' WHERE user_id=$1 AND quiz_id=$2 AND status='in_progress'`,
       [userId, quizId]
     );
 
-    return successResponse({ quiz: q, questions });
+    const questionOrder = orderedQuestions.map((r: any) => r.id);
+    const sessionResult = await this.db.query(
+      `INSERT INTO quiz_sessions (user_id, quiz_id, question_order, option_order)
+       VALUES ($1, $2, $3, $4)
+       RETURNING id`,
+      [userId, quizId, JSON.stringify(questionOrder), JSON.stringify(optionOrderMap)]
+    );
+    const sessionId = sessionResult[0].id;
+
+    // Create an attempt stub (submitted_at set on /submit)
+    await this.db.query(
+      `INSERT INTO quiz_attempts (user_id, quiz_id, attempted_at) VALUES ($1, $2, NOW())`,
+      [userId, quizId]
+    );
+
+    return successResponse({ quiz: q, questions, sessionId });
+  }
+
+  // ── POST /quizzes/:id/abandon ─────────────────────────────────
+  async abandonQuiz(quizId: string, userId: string, dto: any) {
+    const { sessionId } = dto || {};
+    if (sessionId) {
+      await this.db.query(
+        `UPDATE quiz_sessions SET status='abandoned' WHERE id=$1 AND user_id=$2 AND status='in_progress'`,
+        [sessionId, userId]
+      );
+    } else {
+      await this.db.query(
+        `UPDATE quiz_sessions SET status='abandoned' WHERE user_id=$1 AND quiz_id=$2 AND status='in_progress'`,
+        [userId, quizId]
+      );
+    }
+    return successResponse(null, 'Session abandoned');
   }
 
   // ── POST /quizzes/:id/submit ─────────────────────────────────
-  async submit(quizId: string, userId: string, dto: any) {
+  async submit(quizId: string, userId: string, dto: any & { sessionId?: string; backgroundSecs?: number }) {
     const quiz = await this.db.query(`SELECT * FROM quizzes WHERE id=$1`, [quizId]);
     if (!quiz.length) throw new NotFoundException('Quiz not found');
     const q = quiz[0];
@@ -295,6 +359,16 @@ if (q.scheduled_for) {
       [userId, quizId]
     );
     const isFirstAttempt = priorCompleted.length === 0;
+
+    // Mark quiz_session as submitted
+    if (dto.sessionId) {
+      await this.db.query(
+        `UPDATE quiz_sessions SET status='submitted', submitted_at=NOW(),
+                                  background_secs=COALESCE($3,0)
+         WHERE id=$1 AND user_id=$2 AND status='in_progress'`,
+        [dto.sessionId, userId, dto.backgroundSecs ?? 0]
+      );
+    }
 
     const attempt = await this.db.query(
       `INSERT INTO quiz_attempts
@@ -640,6 +714,8 @@ return successResponse({
       negativeMarkingEnabled: 'negative_marking_enabled',
       marksPerCorrect: 'marks_per_correct',
       marksPerWrong: 'marks_per_wrong',
+      shuffleQuestions: 'shuffle_questions',
+      shuffleOptions: 'shuffle_options',
     };
     for (const [key, col] of Object.entries(map)) {
       if (data[key] !== undefined) { fields.push(`${col}=$${i++}`); vals.push(data[key]); }
@@ -924,6 +1000,13 @@ class QuizzesController {
   @HttpCode(HttpStatus.OK)
   submit(@Param('id', ParseUUIDPipe) id: string, @Req() r: any, @Body() dto: any) {
     return this.s.submit(id, r.user.id, dto);
+  }
+
+  /** POST /quizzes/:id/abandon */
+  @Post(':id/abandon')
+  @HttpCode(HttpStatus.OK)
+  abandon(@Param('id', ParseUUIDPipe) id: string, @Req() r: any, @Body() dto: any) {
+    return this.s.abandonQuiz(id, r.user.id, dto);
   }
 
   /** GET /quizzes/:id/leaderboard — top quiz scores */

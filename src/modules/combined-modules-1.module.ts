@@ -1699,6 +1699,7 @@ export class NotificationService {
   constructor(
     @InjectDataSource() private readonly db: DataSource,
     private readonly config: ConfigService,
+    @Optional() @Inject(CACHE_MANAGER) private readonly cache: Cache,
   ) {
     this.initFirebase();
   }
@@ -1969,6 +1970,114 @@ console.log('users count:', users.length);
       ),
     ]);
     return successResponse({ notifications: result, stats: stats[0] });
+  }
+
+  // ── Scheduled notification crons ─────────────────────────────
+  // Each acquires a 2-min Redis distributed lock to prevent duplicate
+  // execution when multiple backend instances are running.
+
+  /** 07:00 IST = 01:30 UTC — notify users who haven't started today's daily quiz */
+  @Cron('30 1 * * *')
+  async cronDailyQuizUnlock() {
+    if (!this.cache) return;
+    const lockKey = 'cron:daily_quiz_unlock';
+    const existing = await this.cache.get(lockKey);
+    if (existing) return;
+    await this.cache.set(lockKey, '1', 120);
+    try {
+      const settings = await this.db.query(
+        `SELECT value FROM app_settings WHERE key='notif_daily_quiz_enabled'`
+      );
+      if (settings[0]?.value !== 'true') return;
+
+      const users = await this.db.query(`
+        SELECT u.id FROM users u
+        WHERE u.status='active'
+          AND u.notification_enabled=TRUE
+          AND u.fcm_token IS NOT NULL
+          AND NOT EXISTS (
+            SELECT 1 FROM quiz_sessions qs
+            JOIN quizzes q ON q.id=qs.quiz_id
+            WHERE qs.user_id=u.id
+              AND q.type='daily'
+              AND qs.started_at::date = CURRENT_DATE
+          )
+      `);
+      for (const u of users) {
+        await this.pushToUser(u.id, "Today's Quiz is Live! 📝", "Start today's daily quiz and keep your streak going.", { type: 'daily_quiz' });
+      }
+    } finally {
+      await this.cache.del(lockKey);
+    }
+  }
+
+  /** 20:00 IST = 14:30 UTC — notify users whose streak is at risk */
+  @Cron('30 14 * * *')
+  async cronStreakAtRisk() {
+    if (!this.cache) return;
+    const lockKey = 'cron:streak_at_risk';
+    const existing = await this.cache.get(lockKey);
+    if (existing) return;
+    await this.cache.set(lockKey, '1', 120);
+    try {
+      const settings = await this.db.query(
+        `SELECT value FROM app_settings WHERE key='notif_streak_risk_enabled'`
+      );
+      if (settings[0]?.value !== 'true') return;
+
+      const users = await this.db.query(`
+        SELECT u.id FROM users u
+        WHERE u.status='active'
+          AND u.notification_enabled=TRUE
+          AND u.fcm_token IS NOT NULL
+          AND u.streak > 0
+          AND NOT EXISTS (
+            SELECT 1 FROM quiz_sessions qs
+            WHERE qs.user_id=u.id
+              AND qs.started_at::date = CURRENT_DATE
+          )
+      `);
+      for (const u of users) {
+        await this.pushToUser(u.id, "Your Streak is at Risk! 🔥", "Study something today to keep your streak alive.", { type: 'streak_risk' });
+      }
+    } finally {
+      await this.cache.del(lockKey);
+    }
+  }
+
+  /** 09:00 IST = 03:30 UTC — remind users with a daily goal who haven't studied yet */
+  @Cron('30 3 * * *')
+  async cronDailyTargetReminder() {
+    if (!this.cache) return;
+    const lockKey = 'cron:daily_target_reminder';
+    const existing = await this.cache.get(lockKey);
+    if (existing) return;
+    await this.cache.set(lockKey, '1', 120);
+    try {
+      const settings = await this.db.query(
+        `SELECT value FROM app_settings WHERE key='notif_target_reminder_enabled'`
+      );
+      if (settings[0]?.value !== 'true') return;
+
+      const users = await this.db.query(`
+        SELECT u.id, u.daily_goal_mins FROM users u
+        WHERE u.status='active'
+          AND u.notification_enabled=TRUE
+          AND u.fcm_token IS NOT NULL
+          AND u.daily_goal_mins IS NOT NULL
+          AND u.daily_goal_mins > 0
+          AND NOT EXISTS (
+            SELECT 1 FROM quiz_sessions qs
+            WHERE qs.user_id=u.id
+              AND qs.started_at::date = CURRENT_DATE
+          )
+      `);
+      for (const u of users) {
+        await this.pushToUser(u.id, "Time to Hit Your Daily Goal! 🎯", `You have a ${u.daily_goal_mins}-min study goal. Start now!`, { type: 'target_reminder' });
+      }
+    } finally {
+      await this.cache.del(lockKey);
+    }
   }
 }
 
