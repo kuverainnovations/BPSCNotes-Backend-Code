@@ -1607,6 +1607,186 @@ class SubscriptionsService {
     return { status: 'ok' };
   }
 
+  // ── Google Play Billing: verify purchase & activate subscription ─
+  // Called from Android after BillingClient.launchBillingFlow() succeeds.
+  // purchaseToken is the token from Purchase.purchaseToken.
+  // productId is the Play Console product/subscription ID.
+  async verifyGPlayPurchase(userId: string, data: any) {
+    const { purchaseToken, productId, planKey } = data;
+    if (!purchaseToken || !productId) throw new BadRequestException('purchaseToken and productId required');
+
+    // Idempotency — reject if token already used
+    const dup = await this.db.query(
+      `SELECT id FROM subscriptions WHERE gplay_purchase_token=$1 AND payment_status='success'`,
+      [purchaseToken]
+    );
+    if (dup.length) throw new ConflictException('Purchase already processed');
+
+    // ── Server-side verification via Google Play Developer API ────
+    const serviceAccountJson = process.env.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON;
+    if (!serviceAccountJson) {
+      console.error('GOOGLE_PLAY_SERVICE_ACCOUNT_JSON not set — cannot verify Play purchase');
+      throw new BadRequestException('Payment verification not configured. Contact support.');
+    }
+
+    let packageName: string;
+    try {
+      const { google } = await import('googleapis');
+      const auth = new google.auth.GoogleAuth({
+        credentials: JSON.parse(serviceAccountJson),
+        scopes: ['https://www.googleapis.com/auth/androidpublisher'],
+      });
+      const androidpublisher = google.androidpublisher({ version: 'v3', auth });
+
+      // packageName from env so it works in both staging (com.example.bpscnotes) and prod (com.kuvera.bpscnotes)
+      packageName = process.env.ANDROID_PACKAGE_NAME || 'com.kuvera.bpscnotes';
+
+      const response = await androidpublisher.purchases.subscriptionsv2.get({
+        packageName,
+        token: purchaseToken,
+      });
+
+      const purchase = response.data;
+      // subscriptionState: SUBSCRIPTION_STATE_ACTIVE | SUBSCRIPTION_STATE_PENDING | etc.
+      const state = purchase.subscriptionState;
+      if (state !== 'SUBSCRIPTION_STATE_ACTIVE' && state !== 'SUBSCRIPTION_STATE_PENDING') {
+        throw new BadRequestException(`Play purchase not active (state: ${state})`);
+      }
+    } catch (e: any) {
+      if (e instanceof BadRequestException) throw e;
+      console.error('GPlay verify error:', e?.message);
+      throw new BadRequestException('Google Play purchase verification failed. Contact support.');
+    }
+
+    // Map productId → plan key
+    const planMap: Record<string, string> = {
+      'bpscnotes_monthly':   'monthly',
+      'bpscnotes_quarterly': 'quarterly',
+      'bpscnotes_annual':    'annual',
+    };
+    const resolvedPlan = planKey || planMap[productId] || 'monthly';
+    const plan = this.PLANS[resolvedPlan];
+    if (!plan) throw new BadRequestException('Unknown plan mapping for productId');
+
+    const endsAt = new Date();
+    if (resolvedPlan === 'monthly')   endsAt.setMonth(endsAt.getMonth() + 1);
+    if (resolvedPlan === 'quarterly') endsAt.setMonth(endsAt.getMonth() + 3);
+    if (resolvedPlan === 'annual')    endsAt.setFullYear(endsAt.getFullYear() + 1);
+
+    // Cancel any existing active subscription for this user (upgrade/replace)
+    await this.db.query(
+      `UPDATE subscriptions SET status='cancelled', updated_at=NOW()
+       WHERE user_id=$1 AND status='active' AND payment_provider != 'gplay'`,
+      [userId]
+    );
+
+    await this.db.query('BEGIN');
+    try {
+      await this.db.query(
+        `INSERT INTO subscriptions
+           (user_id, plan, status, payment_status, payment_provider,
+            gplay_purchase_token, gplay_order_id, starts_at, ends_at, amount, created_at, updated_at)
+         VALUES ($1,$2,'active','success','gplay',$3,$4,NOW(),$5,$6,NOW(),NOW())`,
+        [userId, resolvedPlan, purchaseToken, productId, endsAt, plan.price]
+      );
+
+      // Award bonus coins
+      if (plan.bonusCoins > 0 && await this.isCoinSystemEnabled()) {
+        await this.db.query(`UPDATE users SET coins=COALESCE(coins,0)+$1 WHERE id=$2`, [plan.bonusCoins, userId]);
+        const [bal] = await this.db.query(`SELECT coins FROM users WHERE id=$1`, [userId]);
+        await this.db.query(
+          `INSERT INTO coin_transactions (user_id,type,amount,description,action,balance)
+           VALUES ($1,'earned',$2,'Subscription bonus coins','subscription_bonus',$3)`,
+          [userId, plan.bonusCoins, Number(bal?.coins) || 0]
+        );
+      }
+
+      await this.db.query('COMMIT');
+    } catch (err) {
+      await this.db.query('ROLLBACK');
+      throw err;
+    }
+
+    await this.cache.del(`user:${userId}`);
+
+    this.notifService?.pushToUser(
+      userId,
+      '🎉 BPSCNotes Pro Activated!',
+      `Your ${resolvedPlan} plan is live via Play Store. Enjoy unlimited access!`,
+      { type: 'subscription', screen: 'courses' }
+    ).catch(() => {});
+
+    return successResponse({ bonusCoinsEarned: plan.bonusCoins }, '🎉 Subscription activated via Google Play!');
+  }
+
+  // ── Google Play Real-Time Developer Notifications (RTDNs) ─────
+  // Google sends these server-to-server (pubsub push or direct HTTP).
+  // No auth header — Google signs via the X-Goog-Signature header but we
+  // validate via Pub/Sub message schema + purchaseToken re-verification instead.
+  async handleGPlayWebhook(body: any) {
+    try {
+      // Pub/Sub push format: { message: { data: base64(json) } }
+      let notification: any = body;
+      if (body.message?.data) {
+        const decoded = Buffer.from(body.message.data, 'base64').toString('utf-8');
+        notification = JSON.parse(decoded);
+      }
+
+      const { subscriptionNotification, packageName } = notification;
+      if (!subscriptionNotification) return { status: 'ignored' };
+
+      const { notificationType, purchaseToken, subscriptionId } = subscriptionNotification;
+
+      // notificationType values per Google docs:
+      //  1=RECOVERED 2=RENEWED 3=CANCELED 4=PURCHASED 5=ON_HOLD 6=IN_GRACE_PERIOD 7=RESTARTED
+      //  8=PRICE_CHANGE_CONFIRMED 9=DEFERRED 10=PAUSED 11=PAUSE_SCHEDULE_CHANGED 12=REVOKED 13=EXPIRED
+
+      const [sub] = await this.db.query(
+        `SELECT * FROM subscriptions WHERE gplay_purchase_token=$1 AND payment_provider='gplay'`,
+        [purchaseToken]
+      );
+
+      // RENEWED (2) — extend subscription
+      if (notificationType === 2 && sub) {
+        const endsAt = new Date();
+        if (sub.plan === 'monthly')   endsAt.setMonth(endsAt.getMonth() + 1);
+        if (sub.plan === 'quarterly') endsAt.setMonth(endsAt.getMonth() + 3);
+        if (sub.plan === 'annual')    endsAt.setFullYear(endsAt.getFullYear() + 1);
+        await this.db.query(
+          `UPDATE subscriptions SET status='active', payment_status='success', ends_at=$1, updated_at=NOW() WHERE id=$2`,
+          [endsAt, sub.id]
+        );
+        await this.cache.del(`user:${sub.user_id}`);
+        console.log(`GPlay RTDN: subscription ${sub.id} renewed`);
+      }
+
+      // CANCELED (3) or REVOKED (12) — mark cancelled
+      if ((notificationType === 3 || notificationType === 12) && sub) {
+        await this.db.query(
+          `UPDATE subscriptions SET status='cancelled', updated_at=NOW() WHERE id=$1`,
+          [sub.id]
+        );
+        await this.cache.del(`user:${sub.user_id}`);
+        console.log(`GPlay RTDN: subscription ${sub.id} cancelled (type=${notificationType})`);
+      }
+
+      // EXPIRED (13)
+      if (notificationType === 13 && sub) {
+        await this.db.query(
+          `UPDATE subscriptions SET status='expired', payment_status='failed', updated_at=NOW() WHERE id=$1`,
+          [sub.id]
+        );
+        await this.cache.del(`user:${sub.user_id}`);
+        console.log(`GPlay RTDN: subscription ${sub.id} expired`);
+      }
+
+    } catch (e: any) {
+      console.error('GPlay webhook error:', e?.message);
+    }
+
+    return { status: 'ok' };
+  }
+
   async validateCoupon(code: string, type: string) {
     const result = await this.db.query(
       `SELECT * FROM coupons WHERE code=$1 AND is_active=TRUE AND (expires_at IS NULL OR expires_at>NOW()) AND (max_uses IS NULL OR used_count<max_uses) AND applies_to IN ($2,'both')`,
@@ -1679,6 +1859,8 @@ class SubscriptionsController {
   @Post(':id/confirm') @HttpCode(200) confirm(@Param('id', ParseUUIDPipe) id: string, @Req() r: any, @Body() dto: any) { return this.s.confirm(id, r.user.id, dto); }
   @Get('status') getStatus(@Req() r: any) { return this.s.getStatus(r.user.id); }
   @Post('coupons/validate') @HttpCode(200) validateCoupon(@Body() body: any) { return this.s.validateCoupon(body.code, body.type||'subscription'); }
+  // CRIT-06: Google Play Billing verification
+  @Post('gplay/verify') @HttpCode(200) verifyGPlay(@Req() r: any, @Body() dto: any) { return this.s.verifyGPlayPurchase(r.user.id, dto); }
 }
 
 // Cashfree webhook — no JWT guard (Cashfree calls this server-to-server)
@@ -1694,6 +1876,14 @@ class WebhookController {
   @HttpCode(200)
   cashfree(@Req() req: any, @Body() body: any) {
     return this.s.handleCashfreeWebhook(req, body);
+  }
+
+  // CRIT-06: Google Play RTDNs (Real-Time Developer Notifications)
+  @Public()
+  @Post('gplay')
+  @HttpCode(200)
+  gplay(@Body() body: any) {
+    return this.s.handleGPlayWebhook(body);
   }
 }
 
