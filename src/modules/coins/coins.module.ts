@@ -570,6 +570,49 @@ export class CoinsService implements OnModuleInit {
       ? successResponse({ balance, alreadyClaimed: true }, 'Already earned today — nice work! 🎉')
       : successResponse({ balance, alreadyClaimed: false }, 'This is awarded automatically once you complete it!');
   }
+
+  // ── Coin Store ───────────────────────────────────────────────
+
+  async getStoreItems(userId: string) {
+    const items = await this.db.query(`
+      SELECT id, title, description, coin_cost, item_type, item_value, icon_url, stock, sort_order
+      FROM coin_store_items WHERE is_active = TRUE ORDER BY sort_order ASC
+    `);
+    const [{ balance }] = await this.db.query(`SELECT COALESCE(SUM(amount),0)::int AS balance FROM coin_transactions WHERE user_id=$1`, [userId]);
+    return successResponse({ items, balance: +balance });
+  }
+
+  async redeemStoreItem(userId: string, itemId: string) {
+    const [item] = await this.db.query(
+      `SELECT * FROM coin_store_items WHERE id=$1 AND is_active=TRUE LIMIT 1`, [itemId]
+    );
+    if (!item) throw new (await import('@nestjs/common')).NotFoundException('Item not found');
+
+    const [{ balance }] = await this.db.query(
+      `SELECT COALESCE(SUM(amount),0)::int AS balance FROM coin_transactions WHERE user_id=$1`, [userId]
+    );
+    if (+balance < item.coin_cost)
+      throw new (await import('@nestjs/common')).BadRequestException('Insufficient coins');
+
+    if (item.stock !== null && item.stock <= 0)
+      throw new (await import('@nestjs/common')).BadRequestException('Item out of stock');
+
+    await this.db.query(
+      `INSERT INTO coin_transactions(user_id,amount,action,description) VALUES($1,$2,'store_redeem',$3)`,
+      [userId, -item.coin_cost, `Redeemed: ${item.title}`]
+    );
+    await this.db.query(
+      `INSERT INTO coin_redemptions(user_id,item_id,coins_spent) VALUES($1,$2,$3)`,
+      [userId, itemId, item.coin_cost]
+    );
+    if (item.stock !== null) {
+      await this.db.query(`UPDATE coin_store_items SET stock=stock-1 WHERE id=$1`, [itemId]);
+    }
+    const [{ newBalance }] = await this.db.query(
+      `SELECT COALESCE(SUM(amount),0)::int AS "newBalance" FROM coin_transactions WHERE user_id=$1`, [userId]
+    );
+    return successResponse({ balance: +newBalance, item: { id: item.id, title: item.title, itemType: item.item_type, itemValue: item.item_value } }, 'Redeemed successfully! 🎉');
+  }
 }
 
 // ════════════════════════════════════════════════════════════
@@ -625,6 +668,21 @@ export class CoinsController {
   @Get('ad-config')
   getAdConfig() {
     return this.svc.getAdConfig();
+  }
+
+  // ── Coin Store ───────────────────────────────────────────────
+
+  /** GET /coins/store — list active store items */
+  @Get('store')
+  getStoreItems(@Req() r: any) {
+    return this.svc.getStoreItems(r.user.id);
+  }
+
+  /** POST /coins/store/:itemId/redeem — spend coins on an item */
+  @Post('store/:itemId/redeem')
+  @HttpCode(HttpStatus.OK)
+  redeemStoreItem(@Param('itemId') itemId: string, @Req() r: any) {
+    return this.svc.redeemStoreItem(r.user.id, itemId);
   }
 }
 

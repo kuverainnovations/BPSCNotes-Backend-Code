@@ -2436,3 +2436,150 @@ class AdminCoinsController {
 // ⚠️ @Module MUST be directly above the class it decorates
 @Module({ imports: [ConfigModule], controllers: [CoinsController, AdminCoinsController], providers: [CoinsService] })
 export class CoinsModule {}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// GLOBAL SEARCH — LOW-11
+// GET /search?q=&types=quizzes,ca,courses
+// ══════════════════════════════════════════════════════════════════════════════
+
+@Injectable()
+class SearchService {
+  constructor(@InjectDataSource() private db: DataSource) {}
+
+  async search(userId: string, query: any) {
+    const q = (query.q || '').trim();
+    if (q.length < 2) return successResponse({ quizzes: [], articles: [], courses: [] });
+    const types = (query.types || 'quizzes,ca,courses').split(',');
+    const term  = `%${q}%`;
+
+    const [quizzes, articles, courses] = await Promise.all([
+      types.includes('quizzes')
+        ? this.db.query(
+            `SELECT id, title, subject, type, total_questions, duration_mins
+             FROM quizzes WHERE status='published' AND (title ILIKE $1 OR subject ILIKE $1)
+             LIMIT 10`,
+            [term]
+          )
+        : [],
+      types.includes('ca')
+        ? this.db.query(
+            `SELECT id, title, summary, category, date
+             FROM current_affairs WHERE (title ILIKE $1 OR summary ILIKE $1)
+             ORDER BY date DESC LIMIT 10`,
+            [term]
+          )
+        : [],
+      types.includes('courses')
+        ? this.db.query(
+            `SELECT id, title, description, subject, price
+             FROM courses WHERE status='published' AND (title ILIKE $1 OR description ILIKE $1)
+             LIMIT 10`,
+            [term]
+          )
+        : [],
+    ]);
+
+    return successResponse({ quizzes, articles, courses });
+  }
+}
+
+@ApiTags('Search') @ApiBearerAuth() @UseGuards(JwtAuthGuard) @Controller('search')
+class SearchController {
+  constructor(private s: SearchService) {}
+  @Get() search(@Query() q: any, @Req() r: any) { return this.s.search(r.user.id, q); }
+}
+
+@Module({ controllers: [SearchController], providers: [SearchService] })
+export class SearchModule {}
+
+// ══════════════════════════════════════════════════════════════════════════════
+// QUESTION BOOKMARKS — NICE-03
+// POST /quizzes/questions/:id/bookmark
+// GET  /users/me/bookmarked-questions
+// ══════════════════════════════════════════════════════════════════════════════
+
+@Injectable()
+class BookmarksService {
+  constructor(@InjectDataSource() private db: DataSource) {}
+
+  async toggle(userId: string, questionId: string) {
+    const question = await this.db.query(
+      `SELECT id, quiz_id FROM quiz_questions WHERE id=$1`, [questionId]
+    );
+    if (!question[0]) throw new NotFoundException('Question not found');
+    const quizId = question[0].quiz_id;
+
+    const existing = await this.db.query(
+      `SELECT user_id FROM bookmarked_questions WHERE user_id=$1 AND question_id=$2`,
+      [userId, questionId]
+    );
+    if (existing.length) {
+      await this.db.query(
+        `DELETE FROM bookmarked_questions WHERE user_id=$1 AND question_id=$2`,
+        [userId, questionId]
+      );
+      return successResponse({ bookmarked: false });
+    } else {
+      await this.db.query(
+        `INSERT INTO bookmarked_questions (user_id, question_id, quiz_id) VALUES ($1,$2,$3)
+         ON CONFLICT DO NOTHING`,
+        [userId, questionId, quizId]
+      );
+      return successResponse({ bookmarked: true });
+    }
+  }
+
+  async getBookmarks(userId: string, query: any) {
+    const page  = parseInt(query.page) || 1;
+    const limit = Math.min(parseInt(query.limit) || 20, 100);
+    const offset = (page - 1) * limit;
+
+    const [rows, countResult] = await Promise.all([
+      this.db.query(
+        `SELECT qq.id, qq.question, qq.option_a, qq.option_b, qq.option_c, qq.option_d, qq.option_e,
+                qq.correct, qq.explanation, qq.hint, qq.subject, qq.difficulty, qq.topic_tag,
+                q.id AS quiz_id, q.title AS quiz_title, bq.created_at AS bookmarked_at
+         FROM bookmarked_questions bq
+         JOIN quiz_questions qq ON qq.id = bq.question_id
+         JOIN quizzes q ON q.id = bq.quiz_id
+         WHERE bq.user_id=$1
+         ORDER BY bq.created_at DESC
+         LIMIT $2 OFFSET $3`,
+        [userId, limit, offset]
+      ),
+      this.db.query(
+        `SELECT COUNT(*)::int AS total FROM bookmarked_questions WHERE user_id=$1`,
+        [userId]
+      ),
+    ]);
+
+    return successResponse(
+      { questions: rows },
+      'OK',
+      paginationMeta(parseInt(countResult[0]?.total || '0'), page, limit)
+    );
+  }
+}
+
+@ApiTags('Bookmarks') @ApiBearerAuth() @UseGuards(JwtAuthGuard) @Controller('questions')
+class BookmarksController {
+  constructor(private s: BookmarksService) {}
+
+  @Post(':id/bookmark') @HttpCode(200)
+  toggle(@Param('id', ParseUUIDPipe) id: string, @Req() r: any) {
+    return this.s.toggle(r.user.id, id);
+  }
+}
+
+@ApiTags('Bookmarks') @ApiBearerAuth() @UseGuards(JwtAuthGuard) @Controller('users/me/bookmarked-questions')
+class BookmarkedQuestionsController {
+  constructor(private s: BookmarksService) {}
+
+  @Get()
+  getBookmarks(@Query() q: any, @Req() r: any) {
+    return this.s.getBookmarks(r.user.id, q);
+  }
+}
+
+@Module({ controllers: [BookmarksController, BookmarkedQuestionsController], providers: [BookmarksService] })
+export class BookmarksModule {}

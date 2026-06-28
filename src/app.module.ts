@@ -26,6 +26,8 @@ import {
   JobsModule,
   SubscriptionsModule,
   NotificationsModule,
+  SearchModule,
+  BookmarksModule,
 } from './modules/combined-modules-1.module';
 
 import { CoinsModule } from './modules/coins/coins.module';
@@ -141,7 +143,9 @@ import { MarketplaceModule }   from './modules/marketplace.module';
     StudyMaterialsModule,
     MaterialChatModule,
     MarketplaceModule,
-    CoinsModule
+    CoinsModule,
+    SearchModule,
+    BookmarksModule,
   ],
 
   controllers: [HealthController],

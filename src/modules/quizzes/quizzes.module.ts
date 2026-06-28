@@ -61,6 +61,7 @@ class QuizzesService {
            q.total_questions, q.duration_mins, q.coins_reward,
            q.exam_tags, q.scheduled_for, q.attempt_count, q.avg_score, q.status,
            q.negative_marking_enabled, q.marks_per_correct, q.marks_per_wrong,
+           COALESCE(q.is_exam_mode, FALSE) AS is_exam_mode,
            -- is_attempted: true/false boolean (not a JSON object)
            (SELECT TRUE FROM quiz_attempts qa WHERE qa.user_id=$${params.length + 1} AND qa.quiz_id=q.id LIMIT 1) AS is_attempted,
            (SELECT qa.score FROM quiz_attempts qa WHERE qa.user_id=$${params.length + 1} AND qa.quiz_id=q.id ORDER BY qa.attempted_at DESC LIMIT 1) AS my_last_score
@@ -739,6 +740,7 @@ return successResponse({
       marksPerWrong: 'marks_per_wrong',
       shuffleQuestions: 'shuffle_questions',
       shuffleOptions: 'shuffle_options',
+      isExamMode: 'is_exam_mode',
     };
     for (const [key, col] of Object.entries(map)) {
       if (data[key] !== undefined) { fields.push(`${col}=$${i++}`); vals.push(data[key]); }
