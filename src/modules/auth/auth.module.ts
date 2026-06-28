@@ -894,7 +894,10 @@ export class AuthService {
            WHERE user_id = $1 AND action = $2 AND created_at::date = CURRENT_DATE`,
           [userId, action]
         );
-        if (Number(countRow.cnt) >= maxPerDay) return 0;
+        // Per-quiz awards use a unique refId as idempotency key — skip the
+        // daily cap so a user can earn coins on multiple different quizzes in one day.
+        // The idempotency key already ensures each quiz is only rewarded once.
+        if (!safeRefId && Number(countRow.cnt) >= maxPerDay) return 0;
 
         const [updated] = await em.query(
           `UPDATE users
