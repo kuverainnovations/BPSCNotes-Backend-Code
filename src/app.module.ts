@@ -71,6 +71,11 @@ import { MarketplaceModule }   from './modules/marketplace.module';
           // Defaults to false unless explicitly in 'development' or 'test' mode.
           synchronize: ['development', 'test'].includes(config.get('app.env', 'production')),
           migrationsRun: config.get('app.isProd', true),
+          // "each" wraps every migration in its own transaction and allows
+          // individual migrations to set transaction = false (required for
+          // CREATE INDEX CONCURRENTLY which cannot run inside a transaction).
+          // "all" (the default) forbids per-migration overrides entirely.
+          migrationsTransactionMode: 'each',
 
           logging:  config.get('database.logging'),
           extra: {
