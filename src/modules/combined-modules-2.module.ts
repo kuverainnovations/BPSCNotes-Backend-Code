@@ -1029,7 +1029,7 @@ class UsersService {
         selectExtra = `, COALESCE((
           SELECT SUM(ct.amount) FROM coin_transactions ct
           WHERE ct.user_id = u.id
-            AND ct.type = 'earn'
+            AND ct.type = 'earned'
             AND ct.created_at >= date_trunc('week', NOW())
         ), 0)::int AS weekly_coins`;
         orderBy = 'weekly_coins DESC NULLS LAST, u.coins DESC';
@@ -1054,7 +1054,7 @@ class UsersService {
       this.db.query(
         `SELECT u.rank, u.coins, u.streak, u.accuracy,
           COALESCE((SELECT SUM(ct.amount) FROM coin_transactions ct
-            WHERE ct.user_id=u.id AND ct.type='earn'
+            WHERE ct.user_id=u.id AND ct.type='earned'
               AND ct.created_at >= date_trunc('week', NOW())), 0)::int AS weekly_coins
          FROM users u WHERE u.id=$1`, [userId]),
     ]);
@@ -1073,7 +1073,7 @@ class UsersService {
               r.name                                                           AS room_name,
               rt.name                                                          AS tier_name
          FROM study_sessions ss
-         LEFT JOIN tier_rooms r  ON r.id  = ss.room_id
+         LEFT JOIN study_rooms r ON r.id  = ss.room_id
          LEFT JOIN room_tiers rt ON rt.id = ss.room_tier_id
         WHERE ss.user_id = $1 ${dateClause}
         ORDER BY ss.started_at DESC
