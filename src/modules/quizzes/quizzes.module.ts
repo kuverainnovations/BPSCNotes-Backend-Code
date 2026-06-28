@@ -273,6 +273,41 @@ class QuizzesService {
       throw new BadRequestException('answers must be an array.');
     }
 
+    // Fetch the shuffle mapping saved at /start so we can translate display-position
+    // letters (what the user tapped) back to original DB letters for grading,
+    // and also return correctAnswer in display-position so the review screen
+    // highlights the right option.
+    const sessionRows = dto.sessionId
+      ? await this.db.query(
+          `SELECT option_order FROM quiz_sessions WHERE id=$1 AND user_id=$2`,
+          [dto.sessionId, userId]
+        )
+      : [];
+    const rawOptionOrder = sessionRows[0]?.option_order;
+    // option_order may already be parsed by the pg jsonb driver or still be a string
+    const optionOrderMap: Record<string, string[]> =
+      rawOptionOrder
+        ? (typeof rawOptionOrder === 'string' ? JSON.parse(rawOptionOrder) : rawOptionOrder)
+        : {};
+
+    // order = ['b','c','d','a'] means display slot 0 shows original-'b', slot 1 shows 'c', etc.
+    const IDX_TO_LETTER = ['a', 'b', 'c', 'd'];
+    const LETTER_TO_IDX: Record<string, number> = { a: 0, b: 1, c: 2, d: 3 };
+
+    // User tapped display slot → original DB letter
+    const toOriginalLetter = (displayLetter: string, order: string[]): string => {
+      if (!order.length) return displayLetter;
+      const idx = LETTER_TO_IDX[displayLetter];
+      return (idx !== undefined && order[idx]) ? order[idx] : displayLetter;
+    };
+
+    // DB correct_option (original) → display-slot letter
+    const toDisplayLetter = (originalLetter: string, order: string[]): string => {
+      if (!order.length) return originalLetter;
+      const displayIdx = order.indexOf(originalLetter);
+      return displayIdx !== -1 ? IDX_TO_LETTER[displayIdx] : originalLetter;
+    };
+
     // Fetch correct answers + explanations
     const questions = await this.db.query(
       `SELECT id, correct_option, explanation, question_text,
@@ -298,14 +333,19 @@ class QuizzesService {
     // Filters out any injected fake questionIds from the payload
     const validAnswers = dto.answers.filter((a: any) => qMap[a.questionId]);
     const evaluated = validAnswers.map((a: any) => {
-      const info      = qMap[a.questionId];
-      const isCorrect = info?.correct === a.answer;
+      const info         = qMap[a.questionId];
+      const order        = optionOrderMap[a.questionId] ?? [];
+      // Convert user's display-slot letter to original DB letter before comparing
+      const originalAnswer = toOriginalLetter(a.answer, order);
+      const isCorrect    = info?.correct === originalAnswer;
       if (isCorrect) correct++;
+      // Return correctAnswer as display-slot letter so Android highlights the right option
+      const displayCorrect = toDisplayLetter(info?.correct ?? '', order);
       return {
         questionId:    a.questionId,
         answer:        a.answer,
         isCorrect,
-        correctAnswer: info?.correct     ?? '',
+        correctAnswer: displayCorrect,
         explanation:   info?.explanation ?? '',
         subject:       info?.subject     ?? '',
         // +marksPerCorrect if right, -marksPerWrong if wrong (0 if negative
@@ -319,15 +359,18 @@ class QuizzesService {
     const submittedIds = new Set(validAnswers.map((a: any) => a.questionId));
     const skippedResults = questions
       .filter((q: any) => !submittedIds.has(q.id))
-      .map((q: any) => ({
-        questionId:    q.id,
-        answer:        '',       // empty = skipped
-        isCorrect:     false,
-        correctAnswer: qMap[q.id]?.correct ?? '',
-        explanation:   qMap[q.id]?.explanation ?? '',
-        // Skipped questions never lose marks, even with negative marking on
-        marks: 0,
-      }));
+      .map((q: any) => {
+        const order = optionOrderMap[q.id] ?? [];
+        return {
+          questionId:    q.id,
+          answer:        '',       // empty = skipped
+          isCorrect:     false,
+          correctAnswer: toDisplayLetter(qMap[q.id]?.correct ?? '', order),
+          explanation:   qMap[q.id]?.explanation ?? '',
+          // Skipped questions never lose marks, even with negative marking on
+          marks: 0,
+        };
+      });
     const allAnswers = [...evaluated, ...skippedResults];
     const total    = questions.length;
 
