@@ -976,8 +976,8 @@ class JobsService implements OnModuleInit {
           brief_description, pdf_url, advert_pdf_key, advert_pdf_url,
           location, salary_range, exam_tags,
           job_state, job_district, job_city, is_remote,
-          is_featured, is_new, created_by)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26)
+          is_featured, is_new, notification_url, created_by)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27)
        RETURNING *`,
       [
         data.title, data.organization, data.category || 'BPSC',
@@ -993,6 +993,7 @@ class JobsService implements OnModuleInit {
         data.jobState || 'Bihar', data.jobDistrict || null, data.jobCity || null,
         data.isRemote || false,
         data.isFeatured || false, data.isNew !== false,
+        data.notificationUrl || null,
         adminId,
       ]
     );
@@ -1020,6 +1021,7 @@ class JobsService implements OnModuleInit {
       experienceRequired: 'experience_required',
       jobState: 'job_state', jobDistrict: 'job_district', jobCity: 'job_city',
       isRemote: 'is_remote', isFeatured: 'is_featured', isNew: 'is_new',
+      notificationUrl: 'notification_url',
     };
     for (const [key, col] of Object.entries(map)) {
       if (data[key] !== undefined) { fields.push(`${col}=$${i++}`); vals.push(data[key]); }
@@ -1072,6 +1074,23 @@ class JobsService implements OnModuleInit {
       [key, url, jobId]
     );
     return successResponse({ advertPdfKey: key, advertPdfUrl: url }, 'Advertisement PDF uploaded');
+  }
+
+  async findOne(jobId: string, userId: string) {
+    const [rows, saved] = await Promise.all([
+      this.db.query(
+        `SELECT j.*, a.name AS created_by_name FROM job_vacancies j
+         LEFT JOIN admins a ON a.id = j.created_by
+         WHERE j.id = $1`,
+        [jobId]
+      ),
+      this.db.query(
+        `SELECT 1 FROM saved_jobs WHERE user_id=$1 AND job_id=$2`,
+        [userId, jobId]
+      ),
+    ]);
+    if (!rows[0]) throw new NotFoundException('Job not found');
+    return successResponse({ job: { ...rows[0], isSaved: saved.length > 0 } });
   }
 
   // ── Helpers ───────────────────────────────────────────────
@@ -1140,6 +1159,9 @@ class JobsController {
 
   @Get()
   findAll(@Query() q: any, @Req() r: any) { return this.s.findAll(q, r.user.id); }
+
+  @Get(':id')
+  findOne(@Param('id', ParseUUIDPipe) id: string, @Req() r: any) { return this.s.findOne(id, r.user.id); }
 
   @Post(':id/save')
   @HttpCode(200)

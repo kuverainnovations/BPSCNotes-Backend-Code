@@ -509,6 +509,85 @@ export class AdminUsersService {
     if (adminId === currentAdminId) throw new BadRequestException('Cannot deactivate your own account');
     await this.db.query(`UPDATE admin_users SET status='inactive' WHERE id=$1`, [adminId]);
   }
+
+  // MED-18: accounts sharing a device_id — possible multi-account abuse
+  async getSuspiciousAccounts(query: any) {
+    const { page = 1, limit = 20 } = query;
+    const offset = (page - 1) * limit;
+    const [rows, countResult] = await Promise.all([
+      this.db.query(
+        `SELECT u.device_id,
+                COUNT(*)::int                                            AS account_count,
+                array_agg(json_build_object(
+                  'id',         u.id,
+                  'name',       u.name,
+                  'mobile',     u.mobile,
+                  'email',      u.email,
+                  'status',     u.status,
+                  'created_at', u.created_at,
+                  'last_active_at', u.last_active_at
+                ) ORDER BY u.created_at)                                AS accounts,
+                MAX(u.created_at)                                       AS last_registered,
+                MIN(u.created_at)                                       AS first_registered
+           FROM users u
+          WHERE u.device_id IS NOT NULL
+            AND u.deleted_at IS NULL
+          GROUP BY u.device_id
+         HAVING COUNT(*) > 1
+          ORDER BY account_count DESC, last_registered DESC
+          LIMIT $1 OFFSET $2`,
+        [limit, offset]
+      ),
+      this.db.query(
+        `SELECT COUNT(DISTINCT device_id)::int AS total
+           FROM (SELECT device_id FROM users
+                  WHERE device_id IS NOT NULL AND deleted_at IS NULL
+                  GROUP BY device_id HAVING COUNT(*) > 1) sub`
+      ),
+    ]);
+    return { rows, total: parseInt(countResult[0]?.total || '0') };
+  }
+
+  // MED-20: flagged quiz sessions + anti-cheat alerts
+  async getSecurityAlerts(query: any) {
+    const { page = 1, limit = 20, severity } = query;
+    const offset = (page - 1) * limit;
+    const severityClause = severity ? `AND ql.severity = '${severity}'` : '';
+    const [alerts, quizFlags, countResult] = await Promise.all([
+      // Anti-cheat flags from study rooms
+      this.db.query(
+        `SELECT ql.id, ql.session_id, ql.user_id, ql.flag_type, ql.severity,
+                ql.details, ql.created_at,
+                u.name AS user_name, u.mobile AS user_mobile
+           FROM quiz_session_flags ql
+           JOIN users u ON u.id = ql.user_id
+          WHERE TRUE ${severityClause}
+          ORDER BY ql.created_at DESC
+          LIMIT $1 OFFSET $2`,
+        [limit, offset]
+      ).catch(() => []),
+      // Quiz sessions with unusually high background_secs (possible tab-switching)
+      this.db.query(
+        `SELECT qs.id, qs.user_id, qs.quiz_id, qs.background_secs, qs.status,
+                qs.started_at, qs.submitted_at,
+                u.name AS user_name, q.title AS quiz_title
+           FROM quiz_sessions qs
+           JOIN users u ON u.id = qs.user_id
+           JOIN quizzes q ON q.id = qs.quiz_id
+          WHERE qs.background_secs > 120
+          ORDER BY qs.background_secs DESC
+          LIMIT 50`
+      ).catch(() => []),
+      this.db.query(
+        `SELECT COUNT(*)::int AS total FROM quiz_session_flags WHERE TRUE ${severityClause}`
+      ).catch(() => [{ total: 0 }]),
+    ]);
+    return {
+      alerts,
+      flaggedSessions: quizFlags,
+      total: parseInt(countResult[0]?.total || '0'),
+    };
+  }
 }
 
 // ── Controllers ───────────────────────────────────────────────
@@ -761,6 +840,22 @@ export class AdminUsersController {
   async deactivateAdmin(@Param('id', ParseUUIDPipe) id: string, @Req() req: any) {
     await this.service.deactivateAdmin(id, req.admin.id);
     return successResponse(null, 'Admin deactivated');
+  }
+
+  // MED-18: accounts sharing a device — possible multi-account abuse
+  @Get('suspicious')
+  @RequirePermission('users')
+  async getSuspiciousAccounts(@Query() query: any) {
+    const { rows, total } = await this.service.getSuspiciousAccounts(query);
+    return successResponse({ groups: rows, total });
+  }
+
+  // MED-20: flagged quiz sessions + anti-cheat alerts
+  @Get('security-alerts')
+  @RequirePermission('users')
+  async getSecurityAlerts(@Query() query: any) {
+    const result = await this.service.getSecurityAlerts(query);
+    return successResponse(result);
   }
 }
 

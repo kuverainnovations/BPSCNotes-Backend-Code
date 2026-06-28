@@ -1016,16 +1016,70 @@ class UsersService {
   }
 
   async getLeaderboard(query: any, userId: string) {
-    const { exam } = query;
-    let userQuery = `SELECT id, name, avatar_url, primary_exam, streak, accuracy, rank, coins, total_study_minutes FROM users WHERE status='active' AND deleted_at IS NULL`;
-    const params: any[] = [];
-    if (exam) { userQuery += ` AND primary_exam=$1`; params.push(exam); }
-    userQuery += ` ORDER BY rank ASC NULLS LAST, coins DESC LIMIT 100`;
+    const { exam, type = 'coins' } = query;
+    const examClause = exam ? `AND primary_exam=$1` : '';
+    const examParams = exam ? [exam] : [];
+
+    let orderBy: string;
+    let selectExtra = '';
+    switch (type) {
+      case 'weekly_coins':
+        // Sum coin_transactions for the current ISO week (Monday 00:00 UTC onward)
+        selectExtra = `, COALESCE((
+          SELECT SUM(ct.amount) FROM coin_transactions ct
+          WHERE ct.user_id = u.id
+            AND ct.type = 'earn'
+            AND ct.created_at >= date_trunc('week', NOW())
+        ), 0)::int AS weekly_coins`;
+        orderBy = 'weekly_coins DESC NULLS LAST, u.coins DESC';
+        break;
+      case 'quiz_accuracy':
+        orderBy = 'CAST(u.accuracy AS FLOAT) DESC NULLS LAST, u.quizzes_attempted DESC';
+        break;
+      case 'streak':
+        orderBy = 'u.streak DESC NULLS LAST, u.longest_streak DESC';
+        break;
+      default: // 'coins'
+        orderBy = 'u.rank ASC NULLS LAST, u.coins DESC';
+    }
+
+    const baseSelect = `SELECT u.id, u.name, u.avatar_url, u.primary_exam,
+      u.streak, u.accuracy, u.rank, u.coins, u.total_study_minutes, u.quizzes_attempted${selectExtra}
+      FROM users u WHERE u.status='active' AND u.deleted_at IS NULL ${examClause}
+      ORDER BY ${orderBy} LIMIT 100`;
+
     const [rows, myRank] = await Promise.all([
-      this.db.query(userQuery, params),
-      this.db.query(`SELECT rank, coins, streak, accuracy FROM users WHERE id=$1`, [userId]),
+      this.db.query(baseSelect, examParams),
+      this.db.query(
+        `SELECT u.rank, u.coins, u.streak, u.accuracy,
+          COALESCE((SELECT SUM(ct.amount) FROM coin_transactions ct
+            WHERE ct.user_id=u.id AND ct.type='earn'
+              AND ct.created_at >= date_trunc('week', NOW())), 0)::int AS weekly_coins
+         FROM users u WHERE u.id=$1`, [userId]),
     ]);
-    return successResponse({ leaderboard: rows, myRank: myRank[0] });
+    return successResponse({ leaderboard: rows, myRank: myRank[0], type });
+  }
+
+  async getStudySessions(userId: string, from?: string, to?: string) {
+    const params: any[] = [userId];
+    let dateClause = '';
+    if (from) { params.push(from); dateClause += ` AND ss.started_at >= $${params.length}::date`; }
+    if (to)   { params.push(to);   dateClause += ` AND ss.started_at <  ($${params.length}::date + INTERVAL '1 day')`; }
+    const rows = await this.db.query(
+      `SELECT ss.id, ss.started_at, ss.ended_at,
+              COALESCE(ss.duration_secs, 0)                                   AS duration_secs,
+              COALESCE(ss.xp_earned, 0)                                       AS xp_earned,
+              r.name                                                           AS room_name,
+              rt.name                                                          AS tier_name
+         FROM study_sessions ss
+         LEFT JOIN tier_rooms r  ON r.id  = ss.room_id
+         LEFT JOIN room_tiers rt ON rt.id = ss.room_tier_id
+        WHERE ss.user_id = $1 ${dateClause}
+        ORDER BY ss.started_at DESC
+        LIMIT 100`,
+      params
+    );
+    return successResponse({ sessions: rows });
   }
 
   async getMyEnrollments(userId: string) {
@@ -1259,6 +1313,7 @@ class UsersController {
   @Post('live-classes/:id/register') @HttpCode(200) registerLiveClass(@Param('id', ParseUUIDPipe) id: string, @Req() r: any) { return this.s.registerLiveClass(id, r.user.id); }
   @Put('notification-settings') updateNotifSettings(@Req() r: any, @Body() b: any) { return this.s.updateNotificationSettings(r.user.id, b.enabled); }
   @Get('me/learning-progress')  getLearningProgress(@Req() r: any) { return this.s.getLearningProgress(r.user.id); }
+  @Get('me/study-sessions')     getStudySessions(@Req() r: any, @Query() q: any) { return this.s.getStudySessions(r.user.id, q.from, q.to); }
 }
 
 @ApiTags('Admin — Leaderboard & Live') @ApiBearerAuth() @Public()

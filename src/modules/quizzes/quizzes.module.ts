@@ -895,7 +895,8 @@ return successResponse({
       correctOption: 'correct_option',
       explanation:  'explanation',
       subject:      'subject',
-      // difficulty removed — not required by client
+      difficulty:   'difficulty',
+      topicTag:     'topic_tag',
       sortOrder:    'sort_order',
     };
     for (const [key, col] of Object.entries(map)) {
