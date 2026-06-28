@@ -101,6 +101,7 @@ async function bootstrap() {
     origin: (requestOrigin: string | undefined, callback) => {
       const allowed = [
         'https://admin.bpscnotes.in',
+        'https://admin-stg.bpscnotes.in',
         'https://api.bpscnotes.in',
         'http://localhost:3000',
         'http://localhost:3001',
