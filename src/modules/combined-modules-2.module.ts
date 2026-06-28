@@ -903,6 +903,7 @@ class UsersService {
            FROM quiz_attempts qa
            WHERE qa.user_id = $1
              AND qa.attempted_at >= NOW() - INTERVAL '28 days'
+             AND qa.total_questions > 0
            GROUP BY DATE(qa.attempted_at)
          ),
       

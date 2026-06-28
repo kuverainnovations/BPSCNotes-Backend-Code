@@ -229,6 +229,36 @@ export class OtpService {
     await this.db.query(`UPDATE otps SET is_used = TRUE WHERE id = $1`, [record.id]);
   }
 
+  // Checks OTP validity WITHOUT consuming it (is_used stays FALSE).
+  // Used by the forgot-mpin OTP screen so the OTP remains available
+  // for the subsequent /auth/reset-mpin call which does the real consume.
+  async validateWithoutConsuming(mobile: string, otp: string): Promise<void> {
+    const otpConfig = this.config.get('otp');
+    const result = await this.db.query(
+      `SELECT id, otp_hash, expires_at, attempts FROM otps WHERE mobile = $1 AND is_used = FALSE ORDER BY created_at DESC LIMIT 1`,
+      [mobile]
+    );
+    if (!result.length) throw new BadRequestException('OTP not found or already used');
+
+    const record = result[0];
+    if (new Date() > new Date(record.expires_at)) {
+      await this.db.query(`DELETE FROM otps WHERE id = $1`, [record.id]);
+      throw new BadRequestException('OTP has expired. Please request a new one.');
+    }
+    if (record.attempts >= otpConfig.maxAttempts) {
+      await this.db.query(`DELETE FROM otps WHERE id = $1`, [record.id]);
+      throw new BadRequestException('Too many wrong attempts. Please request a new OTP.');
+    }
+
+    const isValid = await bcrypt.compare(otp, record.otp_hash);
+    if (!isValid) {
+      await this.db.query(`UPDATE otps SET attempts = attempts + 1 WHERE id = $1`, [record.id]);
+      const remaining = otpConfig.maxAttempts - (record.attempts + 1);
+      throw new BadRequestException(`Incorrect OTP. ${remaining} attempt(s) remaining.`);
+    }
+    // Intentionally NOT marking is_used = TRUE here
+  }
+
   private generateOtp(): string {
     return Math.floor(100000 + Math.random() * 900000).toString();
   }
@@ -1017,6 +1047,12 @@ export class AuthService {
     return { mpinCreated: true };
   }
 
+  // ── POST /auth/validate-otp (public — check without consuming) ──
+  async validateForgotMpinOtp(mobile: string, otp: string) {
+    await this.otpService.validateWithoutConsuming(mobile, otp);
+    return { valid: true };
+  }
+
   // ── POST /auth/forgot-mpin (public — sends OTP) ──────
   async forgotMpin(mobile: string) {
     const [user] = await this.db.query(
@@ -1263,6 +1299,15 @@ export class AuthController {
     if (!dto.mpin) throw new BadRequestException('mpin required');
     const data = await this.authService.createMpin(req.user.id, dto.mpin);
     return successResponse(data, 'MPIN created successfully! Use it to login next time \u{1F512}');
+  }
+
+  /** POST /auth/validate-otp — public, checks OTP without consuming it (forgot-mpin flow) */
+  @Public()
+  @Post('validate-otp')
+  @HttpCode(HttpStatus.OK)
+  async validateOtp(@Body() dto: VerifyOtpDto) {
+    const data = await this.authService.validateForgotMpinOtp(dto.mobile, dto.otp);
+    return successResponse(data, 'OTP is valid');
   }
 
   /** POST /auth/forgot-mpin — public, sends WhatsApp OTP */

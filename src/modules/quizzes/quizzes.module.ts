@@ -407,7 +407,7 @@ class QuizzesService {
          total_study_minutes  = total_study_minutes + $2,
          last_active_at       = NOW()
        WHERE id = $3`,
-      [score, Math.ceil(durationMins * 0.7), userId]
+      [score, Math.ceil(timeTakenSecs / 60), userId]
     );
 
     // Invalidate quiz cache
