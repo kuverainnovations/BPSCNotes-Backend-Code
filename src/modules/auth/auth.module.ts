@@ -746,7 +746,7 @@ export class AuthService {
            q.subject     AS quiz_subject,
            q.total_questions,
            qs.started_at,
-           jsonb_array_length(qs.answers_so_far) AS answers_so_far_count
+           (SELECT count(*) FROM jsonb_each(qs.answers_so_far))::int AS answers_so_far_count
          FROM quiz_sessions qs
          JOIN quizzes q ON q.id = qs.quiz_id
          WHERE qs.user_id = $1
