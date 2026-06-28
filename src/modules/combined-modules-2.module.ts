@@ -1068,7 +1068,7 @@ class UsersService {
     if (to)   { params.push(to);   dateClause += ` AND ss.started_at <  ($${params.length}::date + INTERVAL '1 day')`; }
     const rows = await this.db.query(
       `SELECT ss.id, ss.started_at, ss.ended_at,
-              COALESCE(ss.duration_secs, 0)                                   AS duration_secs,
+              COALESCE(ss.duration_minutes, 0)                                AS duration_secs,
               COALESCE(ss.xp_earned, 0)                                       AS xp_earned,
               r.name                                                           AS room_name,
               rt.name                                                          AS tier_name
