@@ -341,6 +341,32 @@ class DailyTargetsService {
     return successResponse(rows, 'History loaded');
   }
 
+  // ── GET /users/daily-targets/history/:date ────────────────
+  async getHistoryByDate(userId: string, date: string) {
+    const rows = await this.db.query(
+      `SELECT
+         id, title, subject, difficulty, time_slot, estimated_minutes,
+         total_questions, is_completed, completed_at, coins_earned,
+         target_date::text AS date
+       FROM daily_targets
+       WHERE user_id=$1
+         AND target_date=$2::date
+       ORDER BY is_completed ASC, created_at ASC`,
+      [userId, date]
+    );
+    const total     = rows.length;
+    const completed = rows.filter((r: any) => r.is_completed).length;
+    return successResponse({
+      date,
+      targets: rows,
+      summary: {
+        total,
+        completed,
+        completion_pct: total > 0 ? Math.round((completed / total) * 100) : 0,
+      },
+    }, 'Targets for date loaded');
+  }
+
   // ── POST /users/daily-targets ─────────────────────────────
   // Create one or more custom targets for today.
   // Body: { titles: string[] }  OR  { title: string, subject?, ... }
@@ -636,6 +662,12 @@ class DailyTargetsController {
     return this.s.getHistory(r.user.id, Math.min(parseInt(days || '30', 10) || 30, 90));
   }
 
+  /** GET /api/v1/users/daily-targets/history/:date — all targets for a specific date */
+  @Get('history/:date')
+  getHistoryByDate(@Req() r: any, @Param('date') date: string) {
+    return this.s.getHistoryByDate(r.user.id, date);
+  }
+
   /**
    * POST /api/v1/users/daily-targets
    * Body: { title, subject?, difficulty?, timeSlot?, estimatedMinutes? }
@@ -885,7 +917,7 @@ class UsersService {
          ),
 
          ca_reading_activity AS (
-           -- Current affairs reading + MCQ time (logged by Android TrackStudyTime)
+           -- Current affairs reading time (logged by Android TrackStudyTime)
            SELECT
              DATE(ca.created_at) AS date,
              CEIL(SUM(ca.duration_secs)::numeric / 60)::int AS study_mins
@@ -893,6 +925,17 @@ class UsersService {
            WHERE ca.user_id = $1
              AND ca.created_at >= NOW() - INTERVAL '28 days'
            GROUP BY DATE(ca.created_at)
+         ),
+
+         ca_mcq_activity AS (
+           -- CA MCQ quiz time: estimate 2 min per attempt (no time_taken_secs stored)
+           SELECT
+             DATE(cma.attempted_at) AS date,
+             (COUNT(*) * 2)::int    AS study_mins
+           FROM ca_mcq_attempts cma
+           WHERE cma.user_id = $1
+             AND cma.attempted_at >= NOW() - INTERVAL '28 days'
+           GROUP BY DATE(cma.attempted_at)
          ),
 
          lesson_activity AS (
@@ -921,6 +964,8 @@ class UsersService {
              SELECT date, study_mins FROM session_activity
              UNION ALL
              SELECT date, study_mins FROM ca_reading_activity
+             UNION ALL
+             SELECT date, study_mins FROM ca_mcq_activity
              UNION ALL
              SELECT date, study_mins FROM lesson_activity
            ) src

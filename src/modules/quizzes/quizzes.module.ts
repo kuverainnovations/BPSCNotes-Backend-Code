@@ -279,7 +279,8 @@ class QuizzesService {
               COALESCE(question_type, 'text')   AS question_type,
               question_image_url,
               COALESCE(option_type, 'text')     AS option_type,
-              option_a_image, option_b_image, option_c_image, option_d_image
+              option_a_image, option_b_image, option_c_image, option_d_image,
+              subject
        FROM quiz_questions WHERE quiz_id=$1`,
       [quizId]
     );
@@ -287,6 +288,7 @@ class QuizzesService {
       questions.map((qq: any) => [qq.id, {
         correct:     qq.correct_option,
         explanation: qq.explanation || '',
+        subject:     qq.subject || '',
       }])
     );
 
@@ -304,6 +306,7 @@ class QuizzesService {
         isCorrect,
         correctAnswer: info?.correct     ?? '',
         explanation:   info?.explanation ?? '',
+        subject:       info?.subject     ?? '',
         // +marksPerCorrect if right, -marksPerWrong if wrong (0 if negative
         // marking is off for this quiz)
         marks: isCorrect ? marksPerCorrect : -marksPerWrong,
@@ -359,6 +362,7 @@ class QuizzesService {
       [userId, quizId]
     );
     const isFirstAttempt = priorCompleted.length === 0;
+    const canEarnCoins   = isFirstAttempt && coinsReward > 0;
 
     // Mark quiz_session as submitted
     if (dto.sessionId) {
@@ -495,6 +499,21 @@ const percentile = Number(
     await this.cache.del('leaderboard:global:0:coins').catch(() => {});
     await this.cache.del(`leaderboard:user:${userId}`).catch(() => {});
 
+    // ── Subject breakdown ──────────────────────────────────────
+    const subjectMap: Record<string, { total: number; correct: number }> = {};
+    for (const a of allAnswers) {
+      const sub = a.subject || 'General';
+      if (!subjectMap[sub]) subjectMap[sub] = { total: 0, correct: 0 };
+      subjectMap[sub].total++;
+      if (a.isCorrect) subjectMap[sub].correct++;
+    }
+    const subjectBreakdown = Object.entries(subjectMap).map(([subject, s]) => ({
+      subject,
+      total:   s.total,
+      correct: s.correct,
+      score:   s.total > 0 ? Math.round((s.correct / s.total) * 100) : 0,
+    }));
+
 return successResponse({
   attemptId: attempt[0].id,
   score,
@@ -505,6 +524,10 @@ return successResponse({
   accuracy,
   coinsEarned,
   timeTakenSecs,
+
+  isFirstAttempt,
+  canEarnCoins,
+  subjectBreakdown,
 
   rank,
   percentile,

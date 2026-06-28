@@ -735,6 +735,52 @@ export class AuthService {
     };
   }
 
+  async getLearningProgress(userId: string) {
+    const [inProgress, recentAttempts] = await Promise.all([
+      this.db.query(
+        `SELECT
+           qs.id         AS session_id,
+           qs.quiz_id,
+           q.title       AS quiz_title,
+           q.type        AS quiz_type,
+           q.subject     AS quiz_subject,
+           q.total_questions,
+           qs.started_at,
+           jsonb_array_length(qs.answers_so_far) AS answers_so_far_count
+         FROM quiz_sessions qs
+         JOIN quizzes q ON q.id = qs.quiz_id
+         WHERE qs.user_id = $1
+           AND qs.status  = 'in_progress'
+         ORDER BY qs.started_at DESC
+         LIMIT 1`,
+        [userId]
+      ),
+      this.db.query(
+        `SELECT
+           qa.quiz_id,
+           q.title  AS quiz_title,
+           q.type   AS quiz_type,
+           q.subject,
+           qa.score,
+           qa.correct_answers,
+           qa.total_questions,
+           qa.submitted_at
+         FROM quiz_attempts qa
+         JOIN quizzes q ON q.id = qa.quiz_id
+         WHERE qa.user_id = $1
+           AND qa.total_questions > 0
+         ORDER BY qa.submitted_at DESC
+         LIMIT 5`,
+        [userId]
+      ),
+    ]);
+
+    return {
+      inProgressSession: inProgress[0] ?? null,
+      recentAttempts,
+    };
+  }
+
   // Shared master switch — admin can disable the entire coin economy
   // from the Coins page (Economy settings). Cached 60s so this very
   // hot path (called on every quiz/session/award) stays cheap. Shares
@@ -1259,6 +1305,16 @@ export class AuthController {
     return successResponse(stats);
   }
 
+
+ // ── GET /users/me/learning-progress ─────────────────────────
+ // Returns the latest in-progress quiz session (if any) so the
+ // Dashboard "Continue Learning" card can deep-link to that quiz.
+ @Get('users/me/learning-progress')
+ @UseGuards(JwtAuthGuard)
+ async getLearningProgress(@Req() req: any) {
+   const rows = await this.authService.getLearningProgress(req.user.id);
+   return successResponse(rows);
+ }
 
  // ── PATCH /users/profile ─────────────────────────────────────
  @Patch('users/profile')
