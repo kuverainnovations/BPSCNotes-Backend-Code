@@ -3,6 +3,10 @@ import { MigrationInterface, QueryRunner } from 'typeorm';
 export class QuizSessions1783000000005 implements MigrationInterface {
   name = 'QuizSessions1783000000005';
 
+  // CREATE INDEX CONCURRENTLY cannot run inside a transaction block.
+  // All statements use IF NOT EXISTS / IF EXISTS guards so they are safe without one.
+  transaction = false;
+
   async up(qr: QueryRunner): Promise<void> {
     await qr.query(`
       CREATE TABLE IF NOT EXISTS quiz_sessions (
@@ -35,8 +39,8 @@ export class QuizSessions1783000000005 implements MigrationInterface {
   }
 
   async down(qr: QueryRunner): Promise<void> {
-    await qr.query(`DROP INDEX IF EXISTS idx_quiz_sessions_user`);
-    await qr.query(`DROP INDEX IF EXISTS idx_quiz_sessions_active`);
+    await qr.query(`DROP INDEX CONCURRENTLY IF EXISTS idx_quiz_sessions_user`);
+    await qr.query(`DROP INDEX CONCURRENTLY IF EXISTS idx_quiz_sessions_active`);
     await qr.query(`DROP TABLE IF EXISTS quiz_sessions`);
   }
 }
