@@ -1193,6 +1193,50 @@ class UsersService {
     if (fields.length) { fields.push('updated_at=NOW()'); await this.db.query(`UPDATE live_classes SET ${fields.join(',')} WHERE id=$${i}`, [...vals, classId]); }
     return successResponse(null, 'Live class updated ✅');
   }
+
+  async getLearningProgress(userId: string) {
+    const [inProgressRows, recentRows] = await Promise.all([
+      this.db.query(
+        `SELECT
+           qs.id                                          AS session_id,
+           qs.quiz_id,
+           q.title                                        AS quiz_title,
+           q.type                                         AS quiz_type,
+           q.subject                                      AS quiz_subject,
+           q.total_questions,
+           qs.started_at,
+           jsonb_array_length(qs.answers_so_far::jsonb)  AS answers_so_far_count
+         FROM quiz_sessions qs
+         JOIN quizzes q ON q.id = qs.quiz_id
+         WHERE qs.user_id = $1
+           AND qs.status  = 'in_progress'
+         ORDER BY qs.started_at DESC
+         LIMIT 1`,
+        [userId]
+      ),
+      this.db.query(
+        `SELECT
+           qa.quiz_id,
+           q.title            AS quiz_title,
+           q.type             AS quiz_type,
+           q.subject,
+           qa.score,
+           qa.correct_answers,
+           qa.total_questions,
+           qa.submitted_at
+         FROM quiz_attempts qa
+         JOIN quizzes q ON q.id = qa.quiz_id
+         WHERE qa.user_id = $1
+         ORDER BY qa.submitted_at DESC
+         LIMIT 5`,
+        [userId]
+      ),
+    ]);
+    return successResponse({
+      inProgressSession: inProgressRows[0] ?? null,
+      recentAttempts:    recentRows,
+    });
+  }
 }
 
 @ApiTags('Users') @ApiBearerAuth() @UseGuards(JwtAuthGuard) @Controller('users')
@@ -1214,6 +1258,7 @@ class UsersController {
   @Get('live-classes') getLiveClasses(@Req() r: any, @Query() q: any) { return this.s.getLiveClasses(r.user.id, q.limit ? parseInt(q.limit, 10) : 10, q.status); }
   @Post('live-classes/:id/register') @HttpCode(200) registerLiveClass(@Param('id', ParseUUIDPipe) id: string, @Req() r: any) { return this.s.registerLiveClass(id, r.user.id); }
   @Put('notification-settings') updateNotifSettings(@Req() r: any, @Body() b: any) { return this.s.updateNotificationSettings(r.user.id, b.enabled); }
+  @Get('me/learning-progress')  getLearningProgress(@Req() r: any) { return this.s.getLearningProgress(r.user.id); }
 }
 
 @ApiTags('Admin — Leaderboard & Live') @ApiBearerAuth() @Public()
