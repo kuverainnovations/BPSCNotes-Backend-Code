@@ -428,6 +428,12 @@ export class CoursesService {
     const course = await this.db.query(`SELECT id, is_paid, price, title, max_coins_redeemable FROM courses WHERE id=$1 AND status='published'`, [courseId]);
     if (!course.length) throw new NotFoundException('Course not found');
 
+    // Idempotency: already enrolled → return success immediately, no coin deduction.
+    const existing = await this.db.query(
+      `SELECT id FROM user_enrollments WHERE user_id=$1 AND course_id=$2`, [userId, courseId]
+    );
+    if (existing.length > 0) return successResponse(null, 'Already enrolled');
+
     if (course[0].is_paid) {
       const sub = await this.db.query(
         `SELECT id FROM subscriptions WHERE user_id=$1 AND status='active' AND ends_at > NOW()`, [userId]
@@ -488,8 +494,14 @@ export class CoursesService {
           // ── Fully covered by coins — no gateway call needed ──
           if (amountDueInr <= 0) {
             if (coinsApplied > 0) {
-              await this.db.query(`UPDATE users SET coins = coins - $1 WHERE id=$2`, [coinsApplied, userId]);
-              const [u] = await this.db.query(`SELECT coins FROM users WHERE id=$1`, [userId]);
+              // Atomic deduction: only succeeds if user still has enough coins.
+              // Prevents double-deduction from concurrent requests.
+              const deducted = await this.db.query(
+                `UPDATE users SET coins = coins - $1 WHERE id=$2 AND coins >= $1 RETURNING coins`,
+                [coinsApplied, userId]
+              );
+              if (!deducted.length) throw new BadRequestException('Insufficient coins.');
+              const [u] = deducted;
               await this.db.query(
                 `INSERT INTO coin_transactions (user_id,type,amount,description,action,balance)
                  VALUES ($1,'spent',$2,'Course purchase discount: '||$3,'course_purchase_discount',$4)`,
@@ -674,8 +686,11 @@ export class CoursesService {
 
     // 4b. Deduct any coins that were reserved as a discount for this order
     if (purchase.coins_applied > 0) {
-      await this.db.query(`UPDATE users SET coins = coins - $1 WHERE id=$2`, [purchase.coins_applied, userId]);
-      const [u] = await this.db.query(`SELECT coins FROM users WHERE id=$1`, [userId]);
+      const deducted = await this.db.query(
+        `UPDATE users SET coins = coins - $1 WHERE id=$2 AND coins >= $1 RETURNING coins`,
+        [Math.floor(Number(purchase.coins_applied)), userId]
+      );
+      const [u] = deducted.length ? deducted : await this.db.query(`SELECT coins FROM users WHERE id=$1`, [userId]);
       const [courseRow] = await this.db.query(`SELECT title FROM courses WHERE id=$1`, [courseId]);
       await this.db.query(
         `INSERT INTO coin_transactions (user_id,type,amount,description,action,balance)
