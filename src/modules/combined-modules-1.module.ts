@@ -2535,8 +2535,8 @@ class BookmarksService {
 
     const [rows, countResult] = await Promise.all([
       this.db.query(
-        `SELECT qq.id, qq.question_text AS question, qq.option_a, qq.option_b, qq.option_c, qq.option_d, qq.option_e,
-                qq.correct, qq.explanation, qq.hint, qq.subject, qq.difficulty, qq.topic_tag,
+        `SELECT qq.id, qq.question_text AS question, qq.option_a, qq.option_b, qq.option_c, qq.option_d,
+                qq.correct_option AS correct, qq.explanation, qq.hint, qq.subject, qq.difficulty, qq.topic_tag,
                 q.id AS quiz_id, q.title AS quiz_title, bq.created_at AS bookmarked_at
          FROM bookmarked_questions bq
          JOIN quiz_questions qq ON qq.id = bq.question_id
