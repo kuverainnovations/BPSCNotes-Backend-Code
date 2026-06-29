@@ -458,7 +458,7 @@ export class CoursesService {
           `SELECT id, amount FROM course_purchases WHERE user_id=$1 AND course_id=$2 AND status='completed'`,
           [userId, courseId]
         );
-        const coursePrice = course[0].price || 0;
+        const coursePrice = Math.floor(Number(course[0].price) || 0);
         // A "completed" purchase recorded at ₹0 for a course that now has a
         // real price is a stale row from before the price-fetch bug was
         // fixed — it doesn't represent a genuine payment. Treat it as if no
