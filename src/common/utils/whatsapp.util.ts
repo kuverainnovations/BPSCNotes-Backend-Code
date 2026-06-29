@@ -106,7 +106,7 @@ export function buildWhatsAppConfig(overrides: {
   return {
     phoneNumberId: overrides.phoneNumberId || process.env.WHATSAPP_PHONE_NUMBER_ID || '',
     accessToken:   overrides.accessToken   || process.env.WHATSAPP_ACCESS_TOKEN    || '',
-    templateName:  overrides.templateName  || process.env.WHATSAPP_TEMPLATE_NAME   || 'bpsc_account_request',
+    templateName:  overrides.templateName  || process.env.WHATSAPP_TEMPLATE_NAME   || 'bpsc_request',
     templateLang:  overrides.templateLang  || process.env.WHATSAPP_TEMPLATE_LANG   || 'en_US',
   };
 }
