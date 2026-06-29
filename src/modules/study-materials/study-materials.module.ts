@@ -2114,6 +2114,7 @@ export class AdminStudyMaterialsController {
   backfillPageCounts() { return this.svc.backfillPageCounts(); }
 
 
+  @Patch(':id/reject')
   @RequirePermission('study-materials')
   @HttpCode(HttpStatus.OK)
   reject(@Param('id', ParseUUIDPipe) id: string, @Body() b: any) { return this.svc.adminReject(id, b.reason); }
