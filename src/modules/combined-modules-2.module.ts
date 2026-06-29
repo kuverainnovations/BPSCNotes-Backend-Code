@@ -1040,6 +1040,9 @@ class UsersService {
       case 'streak':
         orderBy = 'u.streak DESC NULLS LAST, u.longest_streak DESC';
         break;
+      case 'study_time':
+        orderBy = 'u.total_study_minutes DESC NULLS LAST, u.coins DESC';
+        break;
       default: // 'coins'
         orderBy = 'u.rank ASC NULLS LAST, u.coins DESC';
     }
@@ -1052,7 +1055,7 @@ class UsersService {
     const [rows, myRank] = await Promise.all([
       this.db.query(baseSelect, examParams),
       this.db.query(
-        `SELECT u.rank, u.coins, u.streak, u.accuracy,
+        `SELECT u.rank, u.coins, u.streak, u.accuracy, u.total_study_minutes,
           COALESCE((SELECT SUM(ct.amount) FROM coin_transactions ct
             WHERE ct.user_id=u.id AND ct.type='earned'
               AND ct.created_at >= date_trunc('week', NOW())), 0)::int AS weekly_coins
