@@ -471,7 +471,7 @@ export class CoursesService {
           // Per-course override (admin-set max_coins_redeemable) takes
           // priority over the global app_settings default.
           const globalMaxCoins = await this.getSettingNumber('max_coins_per_purchase', 50);
-          const maxCoins       = course[0].max_coins_redeemable ?? globalMaxCoins;
+          const maxCoins       = (course[0].max_coins_redeemable > 0) ? course[0].max_coins_redeemable : globalMaxCoins;
           const coinToInrRate  = await this.getSettingNumber('coin_to_inr_rate', 1);
           const coinsApplied   = Math.max(0, Math.min(Math.floor(coinsToApply || 0), maxCoins));
 
