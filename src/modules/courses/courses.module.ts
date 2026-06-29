@@ -493,7 +493,7 @@ export class CoursesService {
               await this.db.query(
                 `INSERT INTO coin_transactions (user_id,type,amount,description,action,balance)
                  VALUES ($1,'spent',$2,'Course purchase discount: '||$3,'course_purchase_discount',$4)`,
-                [userId, coinsApplied, course[0].title, u.coins]
+                [userId, coinsApplied, course[0].title, Math.floor(Number(u.coins))]
               );
             }
             await this.db.query(
@@ -680,7 +680,7 @@ export class CoursesService {
       await this.db.query(
         `INSERT INTO coin_transactions (user_id,type,amount,description,action,balance)
          VALUES ($1,'spent',$2,'Course purchase discount: '||$3,'course_purchase_discount',$4)`,
-        [userId, purchase.coins_applied, courseRow?.title ?? '', u.coins]
+        [userId, Math.floor(Number(purchase.coins_applied)), courseRow?.title ?? '', Math.floor(Number(u.coins))]
       );
     }
 
