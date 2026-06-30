@@ -2193,14 +2193,25 @@ console.log('users count:', users.length);
   // Each acquires a 2-min Redis distributed lock to prevent duplicate
   // execution when multiple backend instances are running.
 
+  /** Atomic SET NX EX via raw ioredis client. Returns true if lock was acquired. */
+  private async acquireLock(lockKey: string, ttlSec = 120): Promise<boolean> {
+    const client: any = (this.cache as any)?.store?.client;
+    if (!client) return true; // no Redis client — allow through (single-instance fallback)
+    const acquired = await client.set(lockKey, '1', 'EX', ttlSec, 'NX');
+    return acquired === 'OK';
+  }
+
+  private async releaseLock(lockKey: string): Promise<void> {
+    const client: any = (this.cache as any)?.store?.client;
+    if (client) await client.del(lockKey);
+  }
+
   /** 07:00 IST = 01:30 UTC — notify users who haven't started today's daily quiz */
   @Cron('30 1 * * *')
   async cronDailyQuizUnlock() {
     if (!this.cache) return;
     const lockKey = 'cron:daily_quiz_unlock';
-    const existing = await this.cache.get(lockKey);
-    if (existing) return;
-    await this.cache.set(lockKey, '1', 120);
+    if (!await this.acquireLock(lockKey)) return;
     try {
       const settings = await this.db.query(
         `SELECT value FROM app_settings WHERE key='notif_daily_quiz_enabled'`
@@ -2224,7 +2235,7 @@ console.log('users count:', users.length);
         await this.pushToUser(u.id, "Today's Quiz is Live! 📝", "Start today's daily quiz and keep your streak going.", { type: 'daily_quiz' });
       }
     } finally {
-      await this.cache.del(lockKey);
+      await this.releaseLock(lockKey);
     }
   }
 
@@ -2233,9 +2244,7 @@ console.log('users count:', users.length);
   async cronStreakAtRisk() {
     if (!this.cache) return;
     const lockKey = 'cron:streak_at_risk';
-    const existing = await this.cache.get(lockKey);
-    if (existing) return;
-    await this.cache.set(lockKey, '1', 120);
+    if (!await this.acquireLock(lockKey)) return;
     try {
       const settings = await this.db.query(
         `SELECT value FROM app_settings WHERE key='notif_streak_risk_enabled'`
@@ -2258,7 +2267,7 @@ console.log('users count:', users.length);
         await this.pushToUser(u.id, "Your Streak is at Risk! 🔥", "Study something today to keep your streak alive.", { type: 'streak_risk' });
       }
     } finally {
-      await this.cache.del(lockKey);
+      await this.releaseLock(lockKey);
     }
   }
 
@@ -2267,9 +2276,7 @@ console.log('users count:', users.length);
   async cronDailyTargetReminder() {
     if (!this.cache) return;
     const lockKey = 'cron:daily_target_reminder';
-    const existing = await this.cache.get(lockKey);
-    if (existing) return;
-    await this.cache.set(lockKey, '1', 120);
+    if (!await this.acquireLock(lockKey)) return;
     try {
       const settings = await this.db.query(
         `SELECT value FROM app_settings WHERE key='notif_target_reminder_enabled'`
@@ -2293,7 +2300,7 @@ console.log('users count:', users.length);
         await this.pushToUser(u.id, "Time to Hit Your Daily Goal! 🎯", `You have a ${u.daily_goal_mins}-min study goal. Start now!`, { type: 'target_reminder' });
       }
     } finally {
-      await this.cache.del(lockKey);
+      await this.releaseLock(lockKey);
     }
   }
 }

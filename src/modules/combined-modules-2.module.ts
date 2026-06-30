@@ -1380,10 +1380,20 @@ class LeaderboardCronService implements OnModuleInit {
 @Injectable()
 class StreakReminderService {
   private readonly logger = new Logger('StreakReminderService');
-  constructor(@InjectDataSource() private readonly db: DataSource) {}
+  constructor(
+    @InjectDataSource() private readonly db: DataSource,
+    @Inject(CACHE_MANAGER) private readonly cache: Cache,
+  ) {}
 
   @Cron('30 2 * * *')   // 02:30 UTC = 08:00 IST
   async sendStreakReminders() {
+    // Atomic SET NX EX — only one server instance proceeds
+    const lockKey = 'cron:streak_reminder_morning';
+    const redisClient: any = (this.cache as any)?.store?.client;
+    if (redisClient) {
+      const acquired = await redisClient.set(lockKey, '1', 'EX', 120, 'NX');
+      if (!acquired) return;
+    }
     try {
       const users = await this.db.query(
         `SELECT u.id, u.fcm_token, u.streak, u.name
@@ -1420,6 +1430,8 @@ class StreakReminderService {
       this.logger.log(`sendStreakReminders: sent to ${tokens.length} users`);
     } catch (err: any) {
       this.logger.warn(`sendStreakReminders failed: ${err.message}`);
+    } finally {
+      if (redisClient) await redisClient.del(lockKey);
     }
   }
 }
