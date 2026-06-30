@@ -159,7 +159,7 @@ class QuizzesService {
       `SELECT id, question_text, option_a, option_b, option_c, option_d,
               question_type, question_image_url, option_type,
               option_a_image, option_b_image, option_c_image, option_d_image,
-              subject, sort_order,
+              subject, sort_order, question_subtype, match_data,
               COALESCE(question_type, 'text') AS question_type,
               COALESCE(option_type,   'text') AS option_type
        FROM quiz_questions
@@ -805,7 +805,7 @@ return successResponse({
        correct_option, explanation,
        question_type, question_image_url, option_type,
        option_a_image, option_b_image, option_c_image, option_d_image,
-       subject, sort_order
+       subject, sort_order, question_subtype, match_data
        FROM quiz_questions WHERE quiz_id=$1 ORDER BY sort_order ASC`,
       [quizId]
     );
@@ -865,6 +865,15 @@ return successResponse({
         throw new BadRequestException(`correctOption must be a-d or 0-3. Got: ${q.correctOption}`);
       }
       q.correctOption = String(co).toLowerCase();
+
+      // For match questions, validate match_data structure
+      const subtype = q.questionSubtype || q.question_subtype || 'standard';
+      if (subtype === 'match') {
+        const md = q.matchData || q.match_data;
+        if (!md || !Array.isArray(md.list1) || !Array.isArray(md.list2) || md.list1.length < 2 || md.list2.length < 2) {
+          throw new BadRequestException('Match questions require match_data with list1 and list2 (min 2 items each)');
+        }
+      }
     }
 
     // Get current max sort_order
@@ -880,9 +889,10 @@ return successResponse({
            (quiz_id, question_text, option_a, option_b, option_c, option_d,
             correct_option, explanation, subject, sort_order,
             question_type, question_image_url, option_type,
-            option_a_image, option_b_image, option_c_image, option_d_image)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
-         RETURNING id, question_text, sort_order, question_type, option_type`,
+            option_a_image, option_b_image, option_c_image, option_d_image,
+            question_subtype, match_data)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
+         RETURNING id, question_text, sort_order, question_type, option_type, question_subtype`,
         [
           quizId,
           (q.question || q.questionText).trim(),
@@ -901,6 +911,8 @@ return successResponse({
           q.optionBImage || q.option_b_image || null,
           q.optionCImage || q.option_c_image || null,
           q.optionDImage || q.option_d_image || null,
+          (q.questionSubtype || q.question_subtype || 'standard'),
+          (q.matchData || q.match_data) ? JSON.stringify(q.matchData || q.match_data) : null,
         ]
       );
       inserted.push(result[0]);
@@ -926,6 +938,8 @@ return successResponse({
     let i = 1;
     const map: any = {
       questionText:     'question_text',
+      questionSubtype:  'question_subtype',
+      matchData:        'match_data',
       questionType:     'question_type',
       questionImageUrl: 'question_image_url',
       optionType:       'option_type',

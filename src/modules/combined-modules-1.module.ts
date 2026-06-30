@@ -473,11 +473,13 @@ class CurrentAffairsService {
       throw new BadRequestException('question, optionA, optionB and correct are required');
     }
     const row = await this.db.query(
-      `INSERT INTO ca_mcqs (affair_id, question, option_a, option_b, option_c, option_d, option_e, correct, hint, explanation)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,
+      `INSERT INTO ca_mcqs (affair_id, question, option_a, option_b, option_c, option_d, option_e, correct, hint, explanation, question_subtype, match_data)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING *`,
       [affairId, data.question, data.optionA||'', data.optionB||'', data.optionC||'',
        data.optionD||'', data.optionE||'',
-       data.correct.toLowerCase(), data.hint || '', data.explanation || '']
+       data.correct.toLowerCase(), data.hint || '', data.explanation || '',
+       data.questionSubtype || 'standard',
+       data.matchData ? JSON.stringify(data.matchData) : null]
     );
     return successResponse({ mcq: row[0] }, 'MCQ added ✅');
   }
@@ -488,9 +490,13 @@ class CurrentAffairsService {
     let i = 1;
     const map: any = { question:'question', optionA:'option_a', optionB:'option_b',
       optionC:'option_c', optionD:'option_d', optionE:'option_e', correct:'correct',
-      hint:'hint', explanation:'explanation' };
+      hint:'hint', explanation:'explanation', questionSubtype:'question_subtype' };
     for (const [k, col] of Object.entries(map)) {
       if (data[k] !== undefined) { fields.push(`${col}=$${i++}`); vals.push(data[k]); }
+    }
+    if (data.matchData !== undefined) {
+      fields.push(`match_data=$${i++}`);
+      vals.push(data.matchData ? JSON.stringify(data.matchData) : null);
     }
     if (!fields.length) throw new BadRequestException('No fields to update');
     await this.db.query(`UPDATE ca_mcqs SET ${fields.join(',')} WHERE id=$${i}`, [...vals, mcqId]);
