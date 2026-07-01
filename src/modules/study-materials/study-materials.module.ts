@@ -1198,8 +1198,8 @@ console.log("==============================");
         '🎉 Added to your library!');
     }
 
-    // ── Validate coin discount — capped at maxCoinDiscountPctCourse % of material price ──
-    const maxPct        = await this.getSettingNumber('max_coin_discount_pct_course', 10);
+    // ── Validate coin discount — capped at maxCoinDiscountPctMaterial % of material price ──
+    const maxPct        = await this.getSettingNumber('max_coin_discount_pct_material', 10);
     const coinToInrRate = await this.getSettingNumber('coin_to_inr_rate', 1);
     const maxCoins      = coinToInrRate > 0 ? Math.floor(price * maxPct / 100 / coinToInrRate) : 0;
 

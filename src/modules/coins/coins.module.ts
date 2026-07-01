@@ -88,6 +88,7 @@ interface EconomySettings {
   enabled: boolean;
   coinToInrRate: number;
   maxCoinDiscountPctCourse: number;
+  maxCoinDiscountPctMaterial: number;
   maxCoinDiscountPctSubscription: number;
   checkInRewards: number[];
   adMinPerSession: number;
@@ -104,7 +105,8 @@ async function readEconomySettings(db: DataSource, cache: Cache): Promise<Econom
   const rows = await db.query(`
     SELECT key, value FROM app_settings WHERE key IN (
       'coin_system_enabled','coin_to_inr_rate','max_coin_discount_pct_course',
-      'max_coin_discount_pct_subscription','checkin_streak_rewards','ad_min_per_session'
+      'max_coin_discount_pct_material','max_coin_discount_pct_subscription',
+      'checkin_streak_rewards','ad_min_per_session'
     )
   `).catch(() => []);
   const map: Record<string, string> = {};
@@ -117,6 +119,7 @@ async function readEconomySettings(db: DataSource, cache: Cache): Promise<Econom
     enabled:                        map['coin_system_enabled'] !== 'false',
     coinToInrRate:                  parseFloat(map['coin_to_inr_rate'] ?? '1') || 1,
     maxCoinDiscountPctCourse:        parseInt(map['max_coin_discount_pct_course'] ?? '10', 10) || 10,
+    maxCoinDiscountPctMaterial:      parseInt(map['max_coin_discount_pct_material'] ?? '10', 10) || 10,
     maxCoinDiscountPctSubscription:  parseInt(map['max_coin_discount_pct_subscription'] ?? '30', 10) || 30,
     checkInRewards:                  parsedRewards.length === 7 ? parsedRewards : DEFAULT_CHECKIN_REWARDS,
     adMinPerSession:                 parseInt(map['ad_min_per_session'] ?? '2', 10) || 2,
@@ -507,6 +510,7 @@ export class CoinsService implements OnModuleInit {
       economy: {
         coinToInrRate:                  economy.coinToInrRate,
         maxCoinDiscountPctCourse:       economy.maxCoinDiscountPctCourse,
+        maxCoinDiscountPctMaterial:     economy.maxCoinDiscountPctMaterial,
         maxCoinDiscountPctSubscription: economy.maxCoinDiscountPctSubscription,
       },
       checkInRewards: economy.checkInRewards,
@@ -737,6 +741,7 @@ export class AdminCoinsService {
     enabled?: boolean;
     coinToInrRate?: number;
     maxCoinDiscountPctCourse?: number;
+    maxCoinDiscountPctMaterial?: number;
     maxCoinDiscountPctSubscription?: number;
     adMinPerSession?: number;
     checkInRewards?: number[];
@@ -760,6 +765,11 @@ export class AdminCoinsService {
       const v = Math.round(Number(dto.maxCoinDiscountPctCourse));
       if (!isFinite(v) || v < 0 || v > 100) throw new BadRequestException('maxCoinDiscountPctCourse must be between 0 and 100');
       await upsert('max_coin_discount_pct_course', String(v));
+    }
+    if (dto.maxCoinDiscountPctMaterial !== undefined) {
+      const v = Math.round(Number(dto.maxCoinDiscountPctMaterial));
+      if (!isFinite(v) || v < 0 || v > 100) throw new BadRequestException('maxCoinDiscountPctMaterial must be between 0 and 100');
+      await upsert('max_coin_discount_pct_material', String(v));
     }
     if (dto.maxCoinDiscountPctSubscription !== undefined) {
       const v = Math.round(Number(dto.maxCoinDiscountPctSubscription));
