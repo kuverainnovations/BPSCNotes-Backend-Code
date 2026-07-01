@@ -1,7 +1,7 @@
 // ── quizzes.module.ts — Complete production version ──────────────────────────
 import {
   Module, Injectable, Controller, Get, Post, Put, Delete, Body,
-  Param, Query, Req, HttpCode, HttpStatus,
+  Param, Query, Req, HttpCode, HttpStatus, Header,
   NotFoundException, BadRequestException, ForbiddenException,
   UseGuards, ParseUUIDPipe,
 } from '@nestjs/common';
@@ -1098,14 +1098,22 @@ return successResponse({
 class QuizzesController {
   constructor(private s: QuizzesService) {}
 
-  /** GET /quizzes?type=daily&subject=Polity */
+  /**
+   * GET /quizzes?type=daily&subject=Polity
+   * is_attempted/my_last_score are per-user and change on every submit —
+   * no-store prevents any intermediate cache (CDN/proxy in front of this
+   * API, or the client's own HTTP cache) from serving a snapshot from
+   * before the user's latest attempt.
+   */
   @Get()
+  @Header('Cache-Control', 'no-store')
   findAll(@Query() q: any, @Req() r: any) {
     return this.s.findAll(q, r.user.id);
   }
 
   /** GET /quizzes/:id — quiz info only, NO questions */
   @Get(':id')
+  @Header('Cache-Control', 'no-store')
   findOne(@Param('id', ParseUUIDPipe) id: string, @Req() r: any) {
     return this.s.findOne(id, r.user.id);
   }

@@ -6,7 +6,7 @@ import {
   Module, Injectable, Controller, HttpException, Get, Post, Put, Delete,
   Body, Param, Query, Req, HttpCode, HttpStatus, NotFoundException,
   ForbiddenException, BadRequestException, ParseUUIDPipe, UseGuards, UseInterceptors,
-  UploadedFile,
+  UploadedFile, Header,
 } from '@nestjs/common';
 import { InjectDataSource } from '@nestjs/typeorm';
 import { DataSource } from 'typeorm';
@@ -1178,7 +1178,10 @@ export class CoursesController {
   }
 
   // !! MUST be before @Get(':id') — NestJS matches routes top-down
+  // no-store: per-user, mutates on every save/unsave — must never be
+  // served stale by an intermediate cache (CDN/proxy) or the client's HTTP cache.
   @Get('saved')
+  @Header('Cache-Control', 'no-store')
   getSaved(@Req() r: any) { return this.service.getSavedCourses(r.user.id); }
 
   @Get(':id')
