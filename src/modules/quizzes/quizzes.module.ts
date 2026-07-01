@@ -62,9 +62,15 @@ class QuizzesService {
            q.exam_tags, q.scheduled_for, q.attempt_count, q.avg_score, q.status,
            q.negative_marking_enabled, q.marks_per_correct, q.marks_per_wrong,
            COALESCE(q.is_exam_mode, FALSE) AS is_exam_mode,
-           -- is_attempted: true/false boolean (not a JSON object)
-           (SELECT TRUE FROM quiz_attempts qa WHERE qa.user_id=$${params.length + 1} AND qa.quiz_id=q.id LIMIT 1) AS is_attempted,
-           (SELECT qa.score FROM quiz_attempts qa WHERE qa.user_id=$${params.length + 1} AND qa.quiz_id=q.id ORDER BY qa.attempted_at DESC LIMIT 1) AS my_last_score
+           -- is_attempted / my_last_score must only look at COMPLETED attempts
+           -- (total_questions > 0). /start inserts a bare stub row with
+           -- score=0 on every entry into the quiz — including re-opening an
+           -- already-completed quiz to review it — and that stub is always
+           -- the most recent row. Without this filter it outranks the real
+           -- submitted score and the UI shows 0% for a quiz you actually
+           -- scored on.
+           (SELECT TRUE FROM quiz_attempts qa WHERE qa.user_id=$${params.length + 1} AND qa.quiz_id=q.id AND qa.total_questions > 0 LIMIT 1) AS is_attempted,
+           (SELECT qa.score FROM quiz_attempts qa WHERE qa.user_id=$${params.length + 1} AND qa.quiz_id=q.id AND qa.total_questions > 0 ORDER BY qa.attempted_at DESC LIMIT 1) AS my_last_score
          FROM quizzes q
          WHERE ${where}
          ORDER BY q.created_at DESC
@@ -90,7 +96,7 @@ class QuizzesService {
       // Inject user-specific is_attempted dynamically (can't cache per-user)
       const data: any = cached;
       const attempted = await this.db.query(
-        `SELECT score FROM quiz_attempts WHERE quiz_id=$1 AND user_id=$2 ORDER BY attempted_at DESC LIMIT 1`,
+        `SELECT score FROM quiz_attempts WHERE quiz_id=$1 AND user_id=$2 AND total_questions > 0 ORDER BY attempted_at DESC LIMIT 1`,
         [quizId, userId]
       );
       data.data.quiz.is_attempted  = attempted.length > 0;
@@ -109,7 +115,7 @@ class QuizzesService {
     if (!quiz.length) throw new NotFoundException('Quiz not found');
 
     const attempted = await this.db.query(
-      `SELECT score FROM quiz_attempts WHERE quiz_id=$1 AND user_id=$2 ORDER BY attempted_at DESC LIMIT 1`,
+      `SELECT score FROM quiz_attempts WHERE quiz_id=$1 AND user_id=$2 AND total_questions > 0 ORDER BY attempted_at DESC LIMIT 1`,
       [quizId, userId]
     );
 
@@ -397,16 +403,27 @@ class QuizzesService {
     const score    = total > 0 ? Math.round((correct / total) * 100) : 0;
     const accuracy = score;
 
-    // Anti-farming: coins are only awarded on the user's FIRST completed
-    // attempt for this quiz. "Completed" = total_questions > 0, which only
-    // ever gets set on a submit insert — distinguishes it from the bare
-    // start-stub row inserted by startQuiz() above.
+    // "Completed" = total_questions > 0, which only ever gets set on a
+    // submit insert — distinguishes it from the bare start-stub row
+    // inserted by startQuiz() above. Used for the quizzes_attempted
+    // counter (unique quizzes completed), not for the coin gate below.
     const priorCompleted = await this.db.query(
       `SELECT id FROM quiz_attempts WHERE user_id=$1 AND quiz_id=$2 AND total_questions > 0 LIMIT 1`,
       [userId, quizId]
     );
     const isFirstAttempt = priorCompleted.length === 0;
-    const canEarnCoins   = isFirstAttempt && coinsReward > 0;
+
+    // Anti-farming: coins are awarded the first time the user scores 100%
+    // on this quiz — whichever attempt that is — and never again after
+    // that. Gate on "coins already paid out for this quiz" rather than
+    // "is this the very first attempt", so a 100% on attempt #3 (after
+    // earlier imperfect attempts) still pays out once.
+    const priorCoinsEarned = await this.db.query(
+      `SELECT id FROM quiz_attempts WHERE user_id=$1 AND quiz_id=$2 AND coins_earned > 0 LIMIT 1`,
+      [userId, quizId]
+    );
+    const hasEarnedCoinsBefore = priorCoinsEarned.length > 0;
+    const canEarnCoins         = !hasEarnedCoinsBefore && coinsReward > 0;
 
     // Mark quiz_session as submitted
     if (dto.sessionId) {
@@ -425,7 +442,7 @@ class QuizzesService {
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,NOW(),$9,$10,$11,$12,$13)
        RETURNING id, attempted_at`,
       [
-        userId, quizId, score, total, correct, timeTakenSecs, (isFirstAttempt && total > 0 && correct === total) ? coinsReward : 0, JSON.stringify(allAnswers),
+        userId, quizId, score, total, correct, timeTakenSecs, (!hasEarnedCoinsBefore && total > 0 && correct === total) ? coinsReward : 0, JSON.stringify(allAnswers),
         wrongCount, unansweredCount, marksObtained, negativeMarks, finalScore,
       ]
     );
@@ -463,13 +480,14 @@ class QuizzesService {
     // values until that cache happened to expire on its own.
     await this.cache.del(`user_tier:${userId}`);
 
-    // FIX Issue 1: Coins ONLY awarded when:
-    //   1. This is the user's FIRST completed attempt for this quiz (anti-farming)
-    //   2. The user scored 100% (all answers correct)
-    // Scoring 0% or any partial score does NOT earn coins.
+    // Coins ONLY awarded when:
+    //   1. Coins haven't already been paid out for this quiz (any attempt)
+    //   2. The user scored 100% (all answers correct) on THIS attempt
+    // Scoring 0% or any partial score does NOT earn coins, and a later
+    // 100% still pays out once even if an earlier attempt wasn't perfect.
     let coinsEarned = 0;
     const isPerfectScore = total > 0 && correct === total;
-    if (isFirstAttempt && isPerfectScore) {
+    if (!hasEarnedCoinsBefore && isPerfectScore) {
         const quizType = q.type || 'daily';
         const coinAction = quizType === 'mock'  ? 'mock_quiz'
                          : quizType === 'topic' ? 'topic_quiz'
