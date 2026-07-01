@@ -672,12 +672,37 @@ return successResponse({
       if (/^[1-4]$/.test(co)) co = LETTERS[parseInt(co) - 1];
       else if (/^[0-3]$/.test(co)) co = LETTERS[parseInt(co)];
       if (!LETTERS.includes(co)) throw new BadRequestException(`Row ${idx + 2}: correct_option must be a-d`);
+
+      // Match the Following support
+      const subtype = (q.question_subtype || q.questionSubtype || 'standard').toString().toLowerCase().trim();
+      const isMatch = subtype === 'match';
+      let matchData: any = null;
+      if (isMatch) {
+        const list1 = [
+          { label: 'A', text: (q.list1_a || '').toString().trim() },
+          { label: 'B', text: (q.list1_b || '').toString().trim() },
+          { label: 'C', text: (q.list1_c || '').toString().trim() },
+          { label: 'D', text: (q.list1_d || '').toString().trim() },
+        ].filter(item => item.text);
+        const list2 = [
+          { label: '1', text: (q.list2_1 || '').toString().trim() },
+          { label: '2', text: (q.list2_2 || '').toString().trim() },
+          { label: '3', text: (q.list2_3 || '').toString().trim() },
+          { label: '4', text: (q.list2_4 || '').toString().trim() },
+        ].filter(item => item.text);
+        if (list1.length < 2 || list2.length < 2)
+          throw new BadRequestException(`Row ${idx + 2}: match question needs ≥2 items in List-I (list1_a, list1_b…) and List-II (list2_1, list2_2…)`);
+        matchData = { list1, list2 };
+      }
+
       return {
         questionText: qText,
         optionA: opts[0], optionB: opts[1], optionC: opts[2], optionD: opts[3],
         correctOption: co,
         explanation: (q.explanation || '').toString().trim() || null,
         subject: (q.subject || quizMeta.subject || '').toString().trim() || null,
+        questionSubtype: isMatch ? 'match' : 'standard',
+        matchData,
       };
     });
 
@@ -721,9 +746,10 @@ return successResponse({
       for (let i = 0; i < normalised.length; i++) {
         const q = normalised[i];
         await this.db.query(
-          `INSERT INTO quiz_questions (quiz_id, question_text, option_a, option_b, option_c, option_d, correct_option, explanation, subject, sort_order)
-           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
-          [quiz.id, q.questionText, q.optionA, q.optionB, q.optionC, q.optionD, q.correctOption, q.explanation, q.subject, sortBase + i]
+          `INSERT INTO quiz_questions (quiz_id, question_text, option_a, option_b, option_c, option_d, correct_option, explanation, subject, sort_order, question_subtype, match_data)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+          [quiz.id, q.questionText, q.optionA, q.optionB, q.optionC, q.optionD, q.correctOption, q.explanation, q.subject, sortBase + i,
+           q.questionSubtype, q.matchData ? JSON.stringify(q.matchData) : null]
         );
       }
       // Update total_questions count
