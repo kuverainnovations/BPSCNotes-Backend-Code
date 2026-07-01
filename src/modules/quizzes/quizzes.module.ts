@@ -63,14 +63,19 @@ class QuizzesService {
            q.negative_marking_enabled, q.marks_per_correct, q.marks_per_wrong,
            COALESCE(q.is_exam_mode, FALSE) AS is_exam_mode,
            -- is_attempted / my_last_score must only look at COMPLETED attempts
-           -- (total_questions > 0). /start inserts a bare stub row with
-           -- score=0 on every entry into the quiz — including re-opening an
-           -- already-completed quiz to review it — and that stub is always
-           -- the most recent row. Without this filter it outranks the real
-           -- submitted score and the UI shows 0% for a quiz you actually
-           -- scored on.
+           -- (total_questions > 0) — /start inserts a bare stub row with
+           -- score=0 on every entry into the quiz, including re-opening an
+           -- already-completed quiz (button literally says "Retry"), so an
+           -- unfiltered "most recent row" is never safe to trust.
+           --
+           -- Beyond that: retaking an already-completed quiz is a real,
+           -- supported flow (no read-only review mode exists), so "most
+           -- recent completed attempt" can legitimately be a worse score
+           -- than a genuine earlier 100%. Surfacing the best-ever score
+           -- instead means a real achievement can never appear to vanish
+           -- behind a later, worse retry.
            (SELECT TRUE FROM quiz_attempts qa WHERE qa.user_id=$${params.length + 1} AND qa.quiz_id=q.id AND qa.total_questions > 0 LIMIT 1) AS is_attempted,
-           (SELECT qa.score FROM quiz_attempts qa WHERE qa.user_id=$${params.length + 1} AND qa.quiz_id=q.id AND qa.total_questions > 0 ORDER BY qa.attempted_at DESC LIMIT 1) AS my_last_score
+           (SELECT qa.score FROM quiz_attempts qa WHERE qa.user_id=$${params.length + 1} AND qa.quiz_id=q.id AND qa.total_questions > 0 ORDER BY qa.score DESC, qa.attempted_at DESC LIMIT 1) AS my_last_score
          FROM quizzes q
          WHERE ${where}
          ORDER BY q.created_at DESC
@@ -96,7 +101,7 @@ class QuizzesService {
       // Inject user-specific is_attempted dynamically (can't cache per-user)
       const data: any = cached;
       const attempted = await this.db.query(
-        `SELECT score FROM quiz_attempts WHERE quiz_id=$1 AND user_id=$2 AND total_questions > 0 ORDER BY attempted_at DESC LIMIT 1`,
+        `SELECT score FROM quiz_attempts WHERE quiz_id=$1 AND user_id=$2 AND total_questions > 0 ORDER BY score DESC, attempted_at DESC LIMIT 1`,
         [quizId, userId]
       );
       data.data.quiz.is_attempted  = attempted.length > 0;
@@ -115,7 +120,7 @@ class QuizzesService {
     if (!quiz.length) throw new NotFoundException('Quiz not found');
 
     const attempted = await this.db.query(
-      `SELECT score FROM quiz_attempts WHERE quiz_id=$1 AND user_id=$2 AND total_questions > 0 ORDER BY attempted_at DESC LIMIT 1`,
+      `SELECT score FROM quiz_attempts WHERE quiz_id=$1 AND user_id=$2 AND total_questions > 0 ORDER BY score DESC, attempted_at DESC LIMIT 1`,
       [quizId, userId]
     );
 
@@ -535,8 +540,14 @@ const rank = higherScores + 1;
 const percentile = Number(
   (((totalAttempts - rank) / totalAttempts) * 100).toFixed(2)
 );
-// 🔔 First-time completion notification
-    if (isFirstAttempt && coinsEarned > 0) {
+// 🔔 Coin-earning completion notification — fire whenever THIS attempt
+// actually earned coins, not just on the user's first-ever attempt.
+// coinsEarned is already 0 unless hasEarnedCoinsBefore was false AND this
+// attempt was a perfect score (and awardCoins() didn't hit its own daily
+// cap), so `coinsEarned > 0` alone is the correct, complete signal — the
+// old `isFirstAttempt` clause silently dropped this notification on a
+// later attempt that finally hit 100% after an earlier imperfect one.
+    if (coinsEarned > 0) {
       this.notifService.pushToUser(
         userId,
         '🎉 Quiz Completed!',
