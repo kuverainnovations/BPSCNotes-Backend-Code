@@ -397,14 +397,6 @@ export class CoursesService {
 
     const { rows, total } = await this.repo.findAll(query, userId);
 
-    // Resolve each course's effective coin-redemption cap (per-course
-    // override, falling back to the global app_settings default) so the
-    // client never has to guess.
-    const globalMaxCoins = await this.getSettingNumber('max_coins_per_purchase', 50);
-    for (const row of rows) {
-      row.max_coins_redeemable = row.max_coins_redeemable ?? globalMaxCoins;
-    }
-
     const result = successResponse({ courses: rows }, 'Success', paginationMeta(total, query.page, query.limit));
     await this.cache.set(cacheKey, result, 120);
     return result;
@@ -413,13 +405,6 @@ export class CoursesService {
   async findOne(courseId: string, userId?: string) {
     const course = await this.repo.findOneById(courseId, userId);
     if (!course) throw new NotFoundException('Course not found');
-
-    // Resolve the effective coin-redemption cap for this course: a
-    // per-course override (max_coins_redeemable) takes priority over the
-    // global app_settings.max_coins_per_purchase default. The Android
-    // client uses this directly instead of guessing a static value.
-    const globalMaxCoins = await this.getSettingNumber('max_coins_per_purchase', 50);
-    course.max_coins_redeemable = course.max_coins_redeemable ?? globalMaxCoins;
 
     return successResponse({ course });
   }
@@ -477,7 +462,7 @@ export class CoursesService {
           // Per-course override (admin-set max_coins_redeemable) takes
           // priority over the global app_settings default.
           const globalMaxCoins = await this.getSettingNumber('max_coins_per_purchase', 50);
-          const maxCoins       = (course[0].max_coins_redeemable > 0) ? course[0].max_coins_redeemable : globalMaxCoins;
+          const maxCoins       = globalMaxCoins;
           const coinToInrRate  = await this.getSettingNumber('coin_to_inr_rate', 1);
           const coinsApplied   = Math.max(0, Math.min(Math.floor(coinsToApply || 0), maxCoins));
 
