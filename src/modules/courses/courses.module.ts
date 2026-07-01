@@ -996,7 +996,14 @@ export class CoursesService {
   }
 
   // ── Save / Wishlist ──────────────────────────────────────────
-  async toggleSave(courseId: string, userId: string) {
+  // saveCourse/unsaveCourse are each idempotent — calling POST /save
+  // twice in a row (retry, double-tap, client/server state drift) always
+  // leaves it saved; calling DELETE /save twice always leaves it unsaved.
+  // They must NOT flip based on current DB state (that was the previous
+  // bug: a single blind toggle meant any desync between what the client
+  // thought was saved and what the server had would flip it the wrong
+  // way — visible as tapping "Save" instantly un-saving it).
+  private async ensureCourseSavesTable() {
     await this.db.query(`
       CREATE TABLE IF NOT EXISTS course_saves (
         user_id   UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -1005,14 +1012,10 @@ export class CoursesService {
         PRIMARY KEY (user_id, course_id)
       )
     `);
-    const existing = await this.db.query(
-      `SELECT user_id FROM course_saves WHERE user_id=$1 AND course_id=$2`,
-      [userId, courseId]
-    );
-    if (existing.length) {
-      await this.db.query(`DELETE FROM course_saves WHERE user_id=$1 AND course_id=$2`, [userId, courseId]);
-      return successResponse({ isSaved: false }, 'Removed from saved');
-    }
+  }
+
+  async saveCourse(courseId: string, userId: string) {
+    await this.ensureCourseSavesTable();
     await this.db.query(
       `INSERT INTO course_saves (user_id, course_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`,
       [userId, courseId]
@@ -1020,15 +1023,14 @@ export class CoursesService {
     return successResponse({ isSaved: true }, 'Course saved');
   }
 
+  async unsaveCourse(courseId: string, userId: string) {
+    await this.ensureCourseSavesTable();
+    await this.db.query(`DELETE FROM course_saves WHERE user_id=$1 AND course_id=$2`, [userId, courseId]);
+    return successResponse({ isSaved: false }, 'Removed from saved');
+  }
+
   async getSavedCourses(userId: string) {
-    await this.db.query(`
-      CREATE TABLE IF NOT EXISTS course_saves (
-        user_id   UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-        course_id UUID NOT NULL REFERENCES courses(id) ON DELETE CASCADE,
-        saved_at  TIMESTAMPTZ DEFAULT NOW(),
-        PRIMARY KEY (user_id, course_id)
-      )
-    `);
+    await this.ensureCourseSavesTable();
     const rows = await this.db.query(`
       SELECT c.*,
         COALESCE(e.completed_lessons,0) AS completed_lessons_count,
@@ -1187,14 +1189,14 @@ export class CoursesController {
 
   @Post(':id/save')
   @HttpCode(200)
-  toggleSave(@Param('id', ParseUUIDPipe) id: string, @Req() r: any) {
-    return this.service.toggleSave(id, r.user.id);
+  saveCourse(@Param('id', ParseUUIDPipe) id: string, @Req() r: any) {
+    return this.service.saveCourse(id, r.user.id);
   }
 
   @Delete(':id/save')
   @HttpCode(200)
   unsaveCourse(@Param('id', ParseUUIDPipe) id: string, @Req() r: any) {
-    return this.service.toggleSave(id, r.user.id);
+    return this.service.unsaveCourse(id, r.user.id);
   }
 
   @Post(':id/enroll')
