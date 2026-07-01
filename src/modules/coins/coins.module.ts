@@ -87,7 +87,7 @@ const DEFAULT_CHECKIN_REWARDS = [5, 5, 10, 10, 15, 15, 25];
 interface EconomySettings {
   enabled: boolean;
   coinToInrRate: number;
-  maxCoinsPerPurchase: number;
+  maxCoinDiscountPctCourse: number;
   maxCoinDiscountPctSubscription: number;
   checkInRewards: number[];
   adMinPerSession: number;
@@ -506,7 +506,7 @@ export class CoinsService implements OnModuleInit {
       rules:   ruleMap,
       economy: {
         coinToInrRate:                  economy.coinToInrRate,
-        maxCoinsPerPurchase:            economy.maxCoinsPerPurchase,
+        maxCoinDiscountPctCourse:       economy.maxCoinDiscountPctCourse,
         maxCoinDiscountPctSubscription: economy.maxCoinDiscountPctSubscription,
       },
       checkInRewards: economy.checkInRewards,
@@ -736,7 +736,7 @@ export class AdminCoinsService {
   async updateEconomy(dto: {
     enabled?: boolean;
     coinToInrRate?: number;
-    maxCoinsPerPurchase?: number;
+    maxCoinDiscountPctCourse?: number;
     maxCoinDiscountPctSubscription?: number;
     adMinPerSession?: number;
     checkInRewards?: number[];
