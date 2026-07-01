@@ -64,6 +64,7 @@ class CreateCourseDto {
   @ApiPropertyOptional() @IsOptional() @Type(() => Number) @IsNumber() totalLessons?: number;
   @ApiPropertyOptional() @IsOptional() @Type(() => Number) @IsNumber() totalHours?: number;
   @ApiPropertyOptional() @IsOptional() @Type(() => Number) @IsNumber() bpscRelevance?: number;
+  @ApiPropertyOptional() @IsOptional() @Type(() => Number) @IsNumber() syllabusCoverage?: number;
   @ApiPropertyOptional() @IsOptional() @IsString() language?: string;
   @ApiPropertyOptional() @IsOptional() @IsString() trialLessonTitle?: string;
   @ApiPropertyOptional() @IsOptional() @IsEnum(['draft','published','review']) status?: string;
@@ -305,15 +306,16 @@ export class CoursesRepository {
       `INSERT INTO courses (title, slug, description, instructor, instructor_bio,
         instructor_students, instructor_courses,
         subject, price, original_price, is_paid, is_featured, total_lessons, total_hours,
-        bpsc_relevance, language, trial_lesson_title, exam_tags, status,
+        bpsc_relevance, syllabus_coverage, language, trial_lesson_title, exam_tags, status,
         what_you_learn, has_certificate, created_by, max_coins_redeemable)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23) RETURNING *`,
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,$24) RETURNING *`,
       [
         data.title, slug, data.description, data.instructor, data.instructorBio,
         data.instructorStudents || '0', data.instructorCourses || 1,
         data.subject, data.price || 0, data.originalPrice || data.price || 0,
         data.isPaid || false, data.isFeatured || false, data.totalLessons || 0,
-        data.totalHours || 0, data.bpscRelevance || 0, data.language || 'Hindi + English',
+        data.totalHours || 0, data.bpscRelevance || 0, data.syllabusCoverage || 0,
+        data.language || 'Hindi + English',
         data.trialLessonTitle, data.examTags || [], data.status || 'draft',
         data.whatYouLearn || [], data.hasCertificate !== false, adminId,
         data.maxCoinsRedeemable ?? null,
@@ -334,6 +336,7 @@ export class CoursesRepository {
       subject: 'subject', price: 'price',
       originalPrice: 'original_price', isPaid: 'is_paid', isFeatured: 'is_featured',
       totalLessons: 'total_lessons', totalHours: 'total_hours', bpscRelevance: 'bpsc_relevance',
+      syllabusCoverage: 'syllabus_coverage',
       language: 'language', trialLessonTitle: 'trial_lesson_title',
       examTags: 'exam_tags', status: 'status',
       whatYouLearn: 'what_you_learn', hasCertificate: 'has_certificate',
