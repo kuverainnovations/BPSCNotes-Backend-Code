@@ -1198,9 +1198,10 @@ console.log("==============================");
         '🎉 Added to your library!');
     }
 
-    // ── Validate coin discount ──
-    const maxCoins      = await this.getSettingNumber('max_coins_per_purchase', 50);
+    // ── Validate coin discount — capped at maxCoinDiscountPctCourse % of material price ──
+    const maxPct        = await this.getSettingNumber('max_coin_discount_pct_course', 10);
     const coinToInrRate = await this.getSettingNumber('coin_to_inr_rate', 1);
+    const maxCoins      = coinToInrRate > 0 ? Math.floor(price * maxPct / 100 / coinToInrRate) : 0;
 
     const coinsApplied = Math.max(0, Math.min(Math.floor(coinsToApply || 0), maxCoins));
     if (coinsApplied > 0) {

@@ -68,7 +68,7 @@ async function runSeeds() {
     ['new_registrations',         'true',    'Allow new registrations'],
     ['coin_system_enabled',       'true',    'Master switch — when false, no coins are earned or spent anywhere in the app'],
     ['coin_to_inr_rate',          '1',       'Rupee value of 1 coin when applied as a discount on a purchase'],
-    ['max_coins_per_purchase',    '50',      'Default max coins a buyer can apply on a course/material purchase'],
+    ['max_coin_discount_pct_course', '10',   'Max % of a course/material price that can be discounted with coins (e.g. 10 = up to 10% off)'],
     ['max_coin_discount_pct_subscription', '30', 'Max % of a subscription price that can be paid with coins'],
     ['checkin_streak_rewards',    '5,5,10,10,15,15,25', 'Comma-separated coin rewards for daily check-in streak days 1-7'],
     ['ad_min_per_session',        '2',       'Minimum rewarded ads a student should watch per study session'],

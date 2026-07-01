@@ -103,7 +103,7 @@ async function readEconomySettings(db: DataSource, cache: Cache): Promise<Econom
 
   const rows = await db.query(`
     SELECT key, value FROM app_settings WHERE key IN (
-      'coin_system_enabled','coin_to_inr_rate','max_coins_per_purchase',
+      'coin_system_enabled','coin_to_inr_rate','max_coin_discount_pct_course',
       'max_coin_discount_pct_subscription','checkin_streak_rewards','ad_min_per_session'
     )
   `).catch(() => []);
@@ -116,7 +116,7 @@ async function readEconomySettings(db: DataSource, cache: Cache): Promise<Econom
   const settings: EconomySettings = {
     enabled:                        map['coin_system_enabled'] !== 'false',
     coinToInrRate:                  parseFloat(map['coin_to_inr_rate'] ?? '1') || 1,
-    maxCoinsPerPurchase:             parseInt(map['max_coins_per_purchase'] ?? '50', 10) || 50,
+    maxCoinDiscountPctCourse:        parseInt(map['max_coin_discount_pct_course'] ?? '10', 10) || 10,
     maxCoinDiscountPctSubscription:  parseInt(map['max_coin_discount_pct_subscription'] ?? '30', 10) || 30,
     checkInRewards:                  parsedRewards.length === 7 ? parsedRewards : DEFAULT_CHECKIN_REWARDS,
     adMinPerSession:                 parseInt(map['ad_min_per_session'] ?? '2', 10) || 2,
@@ -756,10 +756,10 @@ export class AdminCoinsService {
       if (!isFinite(v) || v < 0) throw new BadRequestException('coinToInrRate must be a non-negative number');
       await upsert('coin_to_inr_rate', String(v));
     }
-    if (dto.maxCoinsPerPurchase !== undefined) {
-      const v = Math.round(Number(dto.maxCoinsPerPurchase));
-      if (!isFinite(v) || v < 0) throw new BadRequestException('maxCoinsPerPurchase must be a non-negative number');
-      await upsert('max_coins_per_purchase', String(v));
+    if (dto.maxCoinDiscountPctCourse !== undefined) {
+      const v = Math.round(Number(dto.maxCoinDiscountPctCourse));
+      if (!isFinite(v) || v < 0 || v > 100) throw new BadRequestException('maxCoinDiscountPctCourse must be between 0 and 100');
+      await upsert('max_coin_discount_pct_course', String(v));
     }
     if (dto.maxCoinDiscountPctSubscription !== undefined) {
       const v = Math.round(Number(dto.maxCoinDiscountPctSubscription));

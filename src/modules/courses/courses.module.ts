@@ -458,13 +458,11 @@ export class CoursesService {
           !(coursePrice > 0 && Number(individualPurchase[0].amount) === 0);
 
         if (!hasValidPurchase) {
-          // ── Coin discount (1 coin = coin_to_inr_rate ₹, capped) ──
-          // Per-course override (admin-set max_coins_redeemable) takes
-          // priority over the global app_settings default.
-          const globalMaxCoins = await this.getSettingNumber('max_coins_per_purchase', 50);
-          const maxCoins       = globalMaxCoins;
-          const coinToInrRate  = await this.getSettingNumber('coin_to_inr_rate', 1);
-          const coinsApplied   = Math.max(0, Math.min(Math.floor(coinsToApply || 0), maxCoins));
+          // ── Coin discount — capped at maxCoinDiscountPctCourse % of course price ──
+          const maxPct        = await this.getSettingNumber('max_coin_discount_pct_course', 10);
+          const coinToInrRate = await this.getSettingNumber('coin_to_inr_rate', 1);
+          const maxCoins      = coinToInrRate > 0 ? Math.floor(coursePrice * maxPct / 100 / coinToInrRate) : 0;
+          const coinsApplied  = Math.max(0, Math.min(Math.floor(coinsToApply || 0), maxCoins));
 
           if (coinsApplied > 0) {
             const [userRow] = await this.db.query(`SELECT coins FROM users WHERE id=$1`, [userId]);

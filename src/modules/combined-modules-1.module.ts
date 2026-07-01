@@ -1277,7 +1277,7 @@ class SubscriptionsService {
   async getPlans() {
     const coinToInrRate        = parseFloat(await this.getSetting('coin_to_inr_rate', '1'));
     const maxCoinDiscountSub    = parseInt(await this.getSetting('max_coin_discount_pct_subscription', '30'), 10);
-    const maxCoinDiscountCourse = parseInt(await this.getSetting('max_coins_per_purchase', '50'), 10);
+    const maxCoinDiscountPctCourse = parseInt(await this.getSetting('max_coin_discount_pct_course', '10'), 10);
     return successResponse({
       plans: [
         { id:'monthly',   name:'Monthly',   price:199, originalPrice:299,  duration:'1 Month',   billingCycle:'Billed monthly',  bonusCoins:20,  savings:100 },
@@ -1286,7 +1286,7 @@ class SubscriptionsService {
       ],
       coinValueInr:        coinToInrRate,
       maxCoinDiscountSub:  maxCoinDiscountSub,
-      maxCoinDiscountCourse: maxCoinDiscountCourse,
+      maxCoinDiscountPctCourse: maxCoinDiscountPctCourse,
     });
   }
 
