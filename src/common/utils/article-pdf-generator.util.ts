@@ -160,6 +160,15 @@ function emitRuns(doc: any, runs: Run[], size: number, x: number, width: number)
   const y0 = doc.y;
   runs.forEach((run, i) => {
     const isLast = i === runs.length - 1;
+    // FIX: the highlight rect used to anchor to doc.x/doc.y unconditionally.
+    // For the FIRST run in a batch, doc.x/doc.y is the STALE cursor left
+    // over from whatever was rendered immediately before (a heading, table,
+    // bullet marker, etc.) — not where this run's text is about to be
+    // placed (that's the explicit (x, y0) used a few lines below for the
+    // actual doc.text() call). This mismatch is why highlight/marker boxes
+    // showed up in the wrong place relative to the text they should cover.
+    const runX = i === 0 ? x : doc.x;
+    const runY = i === 0 ? y0 : doc.y;
 
     // Highlight background drawn BEFORE text, same row
     if (run.style.highlight && run.text.trim()) {
@@ -167,7 +176,7 @@ function emitRuns(doc: any, runs: Run[], size: number, x: number, width: number)
       doc.save()
         .fillColor(toPdfColor(run.style.highlight))
         .fillOpacity(0.82)
-        .rect(doc.x, doc.y + 1.5, tw, size * 1.3)
+        .rect(runX, runY + 1.5, tw, size * 1.3)
         .fill()
         .restore();
       doc.fillOpacity(1);
@@ -280,7 +289,11 @@ function renderList(doc: any, items: any[], ctx: RenderCtx, ordered: boolean, de
       if (sub.type !== 'tag') continue;
       if (sub.name === 'ul') renderList(doc, sub.children, ctx, false, depth + 1);
       else if (sub.name === 'ol') renderList(doc, sub.children, ctx, true, depth + 1);
-      else if (BLOCK_IN_LI.has(sub.name)) renderNodes(doc, [sub], ctx);
+      // FIX: was rendered with the outer (un-indented, full-width) ctx, so an
+      // image/table/blockquote nested inside a bullet point rendered flush
+      // against the page's left margin instead of scoped under the bullet —
+      // now uses the same indented x/w already computed for this <li>.
+      else if (BLOCK_IN_LI.has(sub.name)) renderNodes(doc, [sub], { ...ctx, contentX: x, contentWidth: w });
     }
   }
   doc.moveDown(0.2);
@@ -355,15 +368,37 @@ function renderImage(doc: any, el: any, ctx: RenderCtx) {
 
   const pct    = extractWidthPct(el.attribs?.style) ?? 100;
   const align  = extractAlign(el.attribs?.style);
-  const targetW = Math.min(ctx.contentWidth, ctx.contentWidth * pct / 100);
-  const targetH = img.height * (targetW / img.width);
+  let targetW = Math.min(ctx.contentWidth, ctx.contentWidth * pct / 100);
+  let targetH = img.height * (targetW / img.width);
 
-  ensureSpace(doc, Math.min(targetH, 200));
+  // FIX: ensureSpace() used to be capped at 200pt regardless of the image's
+  // real height, so a tall image near the bottom of a page never triggered a
+  // page break — PDFKit doesn't clip, so it just got drawn straight off the
+  // bottom edge (the overflow portion effectively lost). Now: if the image is
+  // taller than a full page's usable height, scale it down first (preserving
+  // aspect ratio) so it always fits within a single page, then check space
+  // using its real (possibly scaled-down) height.
+  const maxPageH = doc.page.height - doc.page.margins.top - doc.page.margins.bottom - 20;
+  if (targetH > maxPageH) {
+    const scale = maxPageH / targetH;
+    targetH = maxPageH;
+    targetW = targetW * scale;
+  }
+  ensureSpace(doc, targetH);
+
   let imgX = ctx.contentX;
   if (align === 'center') imgX = ctx.contentX + (ctx.contentWidth - targetW) / 2;
   else if (align === 'right')  imgX = ctx.contentX + ctx.contentWidth - targetW;
 
-  doc.image(img, imgX, doc.y, { width: targetW });
+  // FIX: doc.image() can throw for a malformed-but-openable buffer. This runs
+  // mid-stream (after headers/piping already started), so an uncaught throw
+  // here used to silently truncate/hang the download with no clean error.
+  try {
+    doc.image(img, imgX, doc.y, { width: targetW });
+  } catch (err: any) {
+    console.error(`Article PDF: failed to draw image ${src}: ${err?.message}`);
+    return;
+  }
   doc.y += targetH + 10;
   doc.x = ctx.contentX;
 }
@@ -422,6 +457,25 @@ function renderSectionBlock(
 
   ensureSpace(doc, 60);
 
+  // FIX: this function used to unconditionally render the section's content
+  // TWICE (once to measure its height, once "on top" of a background box —
+  // a fake z-index trick, since PDFKit draws strictly in stream order). That
+  // only produces a correct result when the whole section fits on a single
+  // page. The moment keyPoints/examRelevance/importantFacts HTML is long
+  // enough to trigger a page break during the first pass, contentEndY lands
+  // on a DIFFERENT page than blockStartY (so the computed height is garbage),
+  // and doc.y = contentStartY resets a page-1-relative Y coordinate while
+  // PDFKit is still sitting on whatever page the first pass ended on — the
+  // second pass then re-renders the ENTIRE section a second time starting
+  // mid-page, roughly doubling that section's page count and leaving
+  // mangled/blank pages behind. This is what turned a 30-page article into
+  // ~60 pages. Fix: render the content exactly ONCE, then only attempt the
+  // "box behind text" redraw trick when we can prove (via buffered page
+  // index) that no page break occurred. If it spans multiple pages, decorate
+  // each touched page with a left accent bar instead — no exact bounds
+  // needed, no second render pass, so the content itself is never duplicated.
+  const startPageIdx = doc.bufferedPageRange().count - 1;
+
   // Snapshot Y before rendering content so we can draw the background box behind it
   const blockStartY = doc.y;
   const LABEL_H = 20;
@@ -435,34 +489,56 @@ function renderSectionBlock(
   doc.y = labelY + LABEL_H;
   doc.x = innerX;
 
-  // ── Content ──
+  // ── Content — rendered exactly once ──
   const contentStartY = doc.y;
   const dom = parseDocument(html);
   renderNodes(doc, dom.children as any[], { ...ctx, contentX: innerX, contentWidth: innerW });
   const contentEndY = doc.y;
-  const totalH = contentEndY - blockStartY + 10;
+  const endPageIdx = doc.bufferedPageRange().count - 1;
 
-  // ── Draw background box + left accent bar BEHIND content (via save/restore) ──
-  // PDFKit doesn't support true z-index; we use a second draw pass in place.
-  // Because bufferPages is true, we can draw on the current page directly.
-  doc.save()
-    .fillColor(spec.bgColor).fillOpacity(0.7)
-    .roundedRect(ctx.contentX, blockStartY - 4, ctx.contentWidth, totalH, 4)
-    .fill()
-    .restore();
-  doc.save()
-    .fillColor(spec.accentColor).fillOpacity(1)
-    .rect(ctx.contentX, blockStartY - 4, 3.5, totalH)
-    .fill()
-    .restore();
+  if (endPageIdx === startPageIdx) {
+    // Single page — blockStartY and contentEndY are on the same page, so the
+    // height is trustworthy. Safe to draw the background box behind the
+    // content and redraw the (short, page-confined) content on top.
+    const totalH = contentEndY - blockStartY + 10;
+    doc.save()
+      .fillColor(spec.bgColor).fillOpacity(0.7)
+      .roundedRect(ctx.contentX, blockStartY - 4, ctx.contentWidth, totalH, 4)
+      .fill()
+      .restore();
+    doc.save()
+      .fillColor(spec.accentColor).fillOpacity(1)
+      .rect(ctx.contentX, blockStartY - 4, 3.5, totalH)
+      .fill()
+      .restore();
 
-  // Re-draw label + content on TOP of the background (PDFKit streams sequentially,
-  // so the earlier text got covered — repeat it).
-  doc.font('Helvetica-Bold').fontSize(8).fillColor(spec.accentColor)
-    .text(spec.label, innerX, labelY + 4, { width: innerW, lineBreak: false });
-  doc.y = contentStartY;
-  doc.x = innerX;
-  renderNodes(doc, dom.children as any[], { ...ctx, contentX: innerX, contentWidth: innerW });
+    doc.font('Helvetica-Bold').fontSize(8).fillColor(spec.accentColor)
+      .text(spec.label, innerX, labelY + 4, { width: innerW, lineBreak: false });
+    doc.y = contentStartY;
+    doc.x = innerX;
+    renderNodes(doc, dom.children as any[], { ...ctx, contentX: innerX, contentWidth: innerW });
+  } else {
+    // Multi-page — content is already correctly rendered (single pass), so it
+    // must NOT be redrawn. Decorate each touched page with a left accent bar
+    // (no background tint, since its exact per-page horizontal bounds aren't
+    // knowable without a second pass). switchToPage() moves doc's cursor, so
+    // save the real end position first and restore it once done.
+    const savedY = doc.y;
+    const savedX = doc.x;
+    for (let i = startPageIdx; i <= endPageIdx; i++) {
+      doc.switchToPage(i);
+      const top    = i === startPageIdx ? blockStartY - 4 : doc.page.margins.top;
+      const bottom = i === endPageIdx   ? contentEndY      : doc.page.height - doc.page.margins.bottom;
+      doc.save()
+        .fillColor(spec.accentColor).fillOpacity(1)
+        .rect(ctx.contentX, top, 3.5, Math.max(8, bottom - top))
+        .fill()
+        .restore();
+    }
+    doc.switchToPage(endPageIdx);
+    doc.y = savedY;
+    doc.x = savedX;
+  }
 
   doc.moveDown(0.6);
   doc.x = ctx.contentX;
@@ -549,6 +625,38 @@ function drawWatermark(doc: any, logo?: Buffer) {
     doc.fontSize(11)
       .text('www.bpscnotes.in', 0, height / 2 + 18, { width, align: 'center' });
   }
+  doc.restore();
+}
+
+// FIX: the only existing "logo" was drawWatermark() above — a huge, 6%-opacity
+// background image, effectively invisible as branding. This is a real, opaque
+// header banner (logo thumbnail + app name) drawn in the top margin band on
+// EVERY page, which is what was actually requested. It's drawn within
+// y < doc.page.margins.top so it never overlaps the article content, which
+// always starts at doc.y >= margins.top.
+function drawPageHeader(doc: any, logo: Buffer | undefined, appName: string) {
+  const { width, margins } = doc.page;
+  const logoSize = 20;
+  const y = 12;
+  doc.save();
+  doc.fillOpacity(1);
+  let textX = margins.left;
+  if (logo) {
+    try {
+      const img = doc.openImage(logo);
+      const sc  = logoSize / Math.max(img.width, img.height);
+      const iw  = img.width  * sc;
+      const ih  = img.height * sc;
+      doc.image(img, margins.left, y, { width: iw, height: ih });
+      textX = margins.left + iw + 8;
+    } catch (_) {
+      // corrupt / unsupported — fall through to text-only header
+    }
+  }
+  doc.fillColor(BRAND).font('Helvetica-Bold').fontSize(11)
+    .text(appName, textX, y + logoSize / 2 - 5, { width: width - textX - margins.right, lineBreak: false });
+  doc.moveTo(margins.left, y + logoSize + 4).lineTo(width - margins.right, y + logoSize + 4)
+    .strokeColor(BORDER).lineWidth(0.5).stroke();
   doc.restore();
 }
 
@@ -692,6 +800,12 @@ export async function streamArticlePdf(
   res.setHeader('Content-Type', 'application/pdf');
   res.setHeader('Content-Disposition', `attachment; filename="${safeFileName(plainTitle)}.pdf"`);
   doc.pipe(res);
+  // FIX: neither the response stream nor the pdfkit document had an error
+  // listener — an unhandled mid-stream error (e.g. client disconnects on a
+  // mobile network drop) would surface as an unhandled rejection instead of
+  // being logged/cleaned up.
+  res.on('error', (err: any) => console.error(`Article PDF: response stream error: ${err?.message}`));
+  doc.on('error', (err: any) => console.error(`Article PDF: pdfkit stream error: ${err?.message}`));
 
   drawHeader(doc, { ...data, title: plainTitle, source: plainSource }, cw);
 
@@ -710,11 +824,12 @@ export async function streamArticlePdf(
 
   drawTagsFooter(doc, data, cw);
 
-  // Post-process: watermark + page numbers on every buffered page
+  // Post-process: watermark + logo header + page numbers on every buffered page
   const range = doc.bufferedPageRange();
   for (let i = range.start; i < range.start + range.count; i++) {
     doc.switchToPage(i);
     drawWatermark(doc, logo);
+    drawPageHeader(doc, logo, 'BPSCNotes');
     drawFooter(doc, i - range.start + 1, range.count);
   }
 

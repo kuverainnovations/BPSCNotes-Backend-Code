@@ -670,10 +670,27 @@ class CurrentAffairsController {
   }
   // @Res({ passthrough: false }) hands the response fully to us, bypassing
   // the global TransformInterceptor (which would otherwise wrap the PDF
-  // bytes in the standard {success,message,data} JSON envelope).
+  // bytes in the standard {success,message,data} JSON envelope) — and also
+  // bypassing Nest's exception filters, so we must catch errors ourselves.
+  // FIX: there was no try/catch at all — any error thrown by streamPdf/the
+  // PDF generator (before OR mid-stream) became an unhandled rejection, and
+  // the client either got a raw connection failure or a hung/truncated
+  // download with no clean error, matching "PDF sometimes fails to download."
   @Get(':id/pdf')
   async downloadPdf(@Param('id', ParseUUIDPipe) id: string, @Res({ passthrough: false }) res: Response) {
-    await this.s.streamPdf(id, res, './uploads');
+    try {
+      await this.s.streamPdf(id, res, './uploads');
+    } catch (err: any) {
+      console.error(`Current affairs PDF download failed (id=${id}): ${err?.message}`);
+      if (!res.headersSent) {
+        const status = err instanceof NotFoundException ? 404 : 500;
+        res.status(status).json({ success: false, message: err?.message || 'Failed to generate PDF' });
+      } else {
+        // Streaming had already begun — can't send a clean error body at
+        // this point, just end the connection instead of leaving it hung.
+        res.end();
+      }
+    }
   }
   @Post('log-activity') @HttpCode(200) logActivity(@Body() body: any, @Req() r: any) {
     return this.s.logActivity(r.user.id, body.activityType, body.durationSecs);
