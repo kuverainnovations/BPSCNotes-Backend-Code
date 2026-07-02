@@ -673,19 +673,35 @@ export class CoursesService {
       [payment.cfPaymentId, payment.paymentMethod || 'upi', purchase.id]
     );
 
-    // 4b. Deduct any coins that were reserved as a discount for this order
+    // 4b. Deduct any coins that were reserved as a discount for this order.
+    // FIX: wrapped in try/catch — the payment is already verified SUCCESS and
+    // course_purchases is already marked completed at this point, so a failure
+    // in this side-effect (e.g. a corrupted/NaN coin balance for this user,
+    // which Postgres NUMERIC tolerates but INTEGER columns like coin_transactions
+    // .amount/.balance reject) must not abort the whole request and block
+    // enrollment — that was crashing the entire confirm call with a 500 and
+    // leaving the user with a captured payment but no access.
     if (purchase.coins_applied > 0) {
-      const deducted = await this.db.query(
-        `UPDATE users SET coins = coins - $1 WHERE id=$2 AND coins >= $1 RETURNING coins`,
-        [Math.floor(Number(purchase.coins_applied)), userId]
-      );
-      const [u] = deducted.length ? deducted : await this.db.query(`SELECT coins FROM users WHERE id=$1`, [userId]);
-      const [courseRow] = await this.db.query(`SELECT title FROM courses WHERE id=$1`, [courseId]);
-      await this.db.query(
-        `INSERT INTO coin_transactions (user_id,type,amount,description,action,balance)
-         VALUES ($1,'spent',$2,'Course purchase discount: '||$3,'course_purchase_discount',$4)`,
-        [userId, Math.floor(Number(purchase.coins_applied)), courseRow?.title ?? '', Math.floor(Number(u.coins))]
-      );
+      try {
+        const coinsToDeduct = Math.floor(Number(purchase.coins_applied));
+        const deducted = await this.db.query(
+          `UPDATE users SET coins = coins - $1 WHERE id=$2 AND coins >= $1 RETURNING coins`,
+          [coinsToDeduct, userId]
+        );
+        const [u] = deducted.length ? deducted : await this.db.query(`SELECT coins FROM users WHERE id=$1`, [userId]);
+        const [courseRow] = await this.db.query(`SELECT title FROM courses WHERE id=$1`, [courseId]);
+        const balanceAfter = Math.floor(Number(u?.coins));
+        await this.db.query(
+          `INSERT INTO coin_transactions (user_id,type,amount,description,action,balance)
+           VALUES ($1,'spent',$2,'Course purchase discount: '||$3,'course_purchase_discount',$4)`,
+          [userId, coinsToDeduct, courseRow?.title ?? '', Number.isFinite(balanceAfter) ? balanceAfter : 0]
+        );
+      } catch (err: any) {
+        console.error(
+          `Course purchase coin-deduction failed (non-fatal — enrollment still granted): ` +
+          `user=${userId} course=${courseId} err=${err.message}`
+        );
+      }
     }
 
     // 5. Grant enrollment

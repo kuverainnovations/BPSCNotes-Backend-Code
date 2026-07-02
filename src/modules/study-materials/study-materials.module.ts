@@ -1420,17 +1420,30 @@ console.log("SECRET =", cfMap["cashfree_secret_key"]?.substring(0, 10));
     userId: string, purchaseOrderId: string,
     coinsApplied: number, coinDiscountInr: number, fullPrice: number,
   ) {
-    // Deduct applied coins from buyer
+    // Deduct applied coins from buyer.
+    // FIX: wrapped in try/catch — this runs BEFORE the material_purchases INSERT
+    // below (the row that actually grants access), so any failure here (e.g. a
+    // corrupted/NaN coin balance for this user) used to abort the whole request
+    // and leave the material permanently unpurchased despite a captured payment
+    // — the same class of bug as the course purchase confirm flow.
     let updatedCoins: number | null = null;
     if (coinsApplied > 0) {
-      await this.db.query(`UPDATE users SET coins=coins-$1 WHERE id=$2`, [coinsApplied, userId]);
-      const [u] = await this.db.query(`SELECT coins FROM users WHERE id=$1`, [userId]);
-      updatedCoins = u.coins;
-      await this.db.query(
-        `INSERT INTO coin_transactions (user_id,type,amount,description,action,balance)
-         VALUES ($1,'spent',$2,'Marketplace discount: '||$3,'material_purchase_discount',$4)`,
-        [userId, coinsApplied, material.title, updatedCoins]
-      );
+      try {
+        await this.db.query(`UPDATE users SET coins=coins-$1 WHERE id=$2`, [coinsApplied, userId]);
+        const [u] = await this.db.query(`SELECT coins FROM users WHERE id=$1`, [userId]);
+        const balanceAfter = Math.floor(Number(u?.coins));
+        updatedCoins = Number.isFinite(balanceAfter) ? balanceAfter : null;
+        await this.db.query(
+          `INSERT INTO coin_transactions (user_id,type,amount,description,action,balance)
+           VALUES ($1,'spent',$2,'Marketplace discount: '||$3,'material_purchase_discount',$4)`,
+          [userId, coinsApplied, material.title, updatedCoins ?? 0]
+        );
+      } catch (err: any) {
+        console.error(
+          `Material purchase coin-deduction failed (non-fatal — purchase still recorded): ` +
+          `user=${userId} material=${material.id} err=${err.message}`
+        );
+      }
     }
 
     // ── 60/40 split: compute seller's share and the platform's net fee ──
