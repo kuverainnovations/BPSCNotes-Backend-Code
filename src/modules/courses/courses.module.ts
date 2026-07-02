@@ -621,8 +621,11 @@ export class CoursesService {
     }
 
     // 2. Find pending purchase row created by enroll()
+    // FIX: was missing provider_order_id, so purchase.provider_order_id below was
+    // always undefined and every confirm call failed with "Missing provider order
+    // ID" before Cashfree verification (and the enrollment insert) ever ran.
     const [purchase] = await this.db.query(
-      `SELECT id, amount, coins_applied FROM course_purchases
+      `SELECT id, amount, coins_applied, provider_order_id FROM course_purchases
        WHERE user_id=$1 AND course_id=$2 AND status='pending'
        ORDER BY created_at DESC LIMIT 1`,
       [userId, courseId]

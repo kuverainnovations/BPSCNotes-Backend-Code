@@ -1232,6 +1232,7 @@ console.log("==============================");
     // ── Remaining balance needs Cashfree ─────────────────────────
     let paymentSessionId: string | null = null;
     let cfOrderId:        string | null = null;
+    let paymentEnvironment: 'sandbox' | 'production' = 'sandbox';
     try {
       const { createCashfreeOrder, buildCashfreeCredentials, cashfreeReceiptId } = CashfreeUtil;
       let rows: any[] = [];
@@ -1276,6 +1277,10 @@ console.log("SECRET =", cfMap["cashfree_secret_key"]?.substring(0, 10));
         secretKey: cfMap['cashfree_secret_key'],
         env:       cfMap['payment_mode'],
       });
+      // Expose environment so Android opens the SDK against the matching
+      // endpoint (courses/subscriptions already do this — this was missing
+      // here, so materials always opened Cashfree in sandbox mode).
+      paymentEnvironment = creds.env;
       const [userRow] = await this.db.query(
         `SELECT name, email, mobile FROM users WHERE id=$1`, [userId]
       );
@@ -1318,6 +1323,7 @@ console.log("SECRET =", cfMap["cashfree_secret_key"]?.substring(0, 10));
       amountDueInr,
       paymentSessionId,
       providerOrderId:  cfOrderId,
+      paymentEnvironment,           // → Android SDK: 'sandbox' | 'production'
       materialTitle:    material.title,
     }, `₹${amountDueInr} due — complete payment to unlock`);
   }
