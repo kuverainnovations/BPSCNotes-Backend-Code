@@ -1660,8 +1660,12 @@ class SubscriptionsService {
       });
       const androidpublisher = google.androidpublisher({ version: 'v3', auth });
 
-      // packageName from env so it works in both staging (com.example.bpscnotes) and prod (com.kuvera.bpscnotes)
-      packageName = process.env.ANDROID_PACKAGE_NAME || 'com.kuvera.bpscnotes';
+      // packageName from env; fallback matches the current applicationId in
+      // app/build.gradle.kts (com.bpscnotes.app, per "Package name changed"
+      // commit 72256c9) — verify against Play Console before relying on it,
+      // applicationId has changed before and this fallback drifted silently
+      // out of sync with it last time.
+      packageName = process.env.ANDROID_PACKAGE_NAME || 'com.bpscnotes.app';
 
       const response = await androidpublisher.purchases.subscriptionsv2.get({
         packageName,
@@ -1754,52 +1758,102 @@ class SubscriptionsService {
         notification = JSON.parse(decoded);
       }
 
-      const { subscriptionNotification, packageName } = notification;
-      if (!subscriptionNotification) return { status: 'ignored' };
+      const { subscriptionNotification, oneTimeProductNotification, voidedPurchaseNotification } = notification;
 
-      const { notificationType, purchaseToken, subscriptionId } = subscriptionNotification;
+      if (subscriptionNotification) {
+        const { notificationType, purchaseToken } = subscriptionNotification;
 
-      // notificationType values per Google docs:
-      //  1=RECOVERED 2=RENEWED 3=CANCELED 4=PURCHASED 5=ON_HOLD 6=IN_GRACE_PERIOD 7=RESTARTED
-      //  8=PRICE_CHANGE_CONFIRMED 9=DEFERRED 10=PAUSED 11=PAUSE_SCHEDULE_CHANGED 12=REVOKED 13=EXPIRED
+        // notificationType values per Google docs:
+        //  1=RECOVERED 2=RENEWED 3=CANCELED 4=PURCHASED 5=ON_HOLD 6=IN_GRACE_PERIOD 7=RESTARTED
+        //  8=PRICE_CHANGE_CONFIRMED 9=DEFERRED 10=PAUSED 11=PAUSE_SCHEDULE_CHANGED 12=REVOKED 13=EXPIRED
 
-      const [sub] = await this.db.query(
-        `SELECT * FROM subscriptions WHERE gplay_purchase_token=$1 AND payment_provider='gplay'`,
-        [purchaseToken]
-      );
-
-      // RENEWED (2) — extend subscription
-      if (notificationType === 2 && sub) {
-        const endsAt = new Date();
-        if (sub.plan === 'monthly')   endsAt.setMonth(endsAt.getMonth() + 1);
-        if (sub.plan === 'quarterly') endsAt.setMonth(endsAt.getMonth() + 3);
-        if (sub.plan === 'annual')    endsAt.setFullYear(endsAt.getFullYear() + 1);
-        await this.db.query(
-          `UPDATE subscriptions SET status='active', payment_status='success', ends_at=$1, updated_at=NOW() WHERE id=$2`,
-          [endsAt, sub.id]
+        const [sub] = await this.db.query(
+          `SELECT * FROM subscriptions WHERE gplay_purchase_token=$1 AND payment_provider='gplay'`,
+          [purchaseToken]
         );
-        await this.cache.del(`user:${sub.user_id}`);
-        console.log(`GPlay RTDN: subscription ${sub.id} renewed`);
+
+        // RENEWED (2) — extend subscription
+        if (notificationType === 2 && sub) {
+          const endsAt = new Date();
+          if (sub.plan === 'monthly')   endsAt.setMonth(endsAt.getMonth() + 1);
+          if (sub.plan === 'quarterly') endsAt.setMonth(endsAt.getMonth() + 3);
+          if (sub.plan === 'annual')    endsAt.setFullYear(endsAt.getFullYear() + 1);
+          await this.db.query(
+            `UPDATE subscriptions SET status='active', payment_status='success', ends_at=$1, updated_at=NOW() WHERE id=$2`,
+            [endsAt, sub.id]
+          );
+          await this.cache.del(`user:${sub.user_id}`);
+          console.log(`GPlay RTDN: subscription ${sub.id} renewed`);
+        }
+
+        // CANCELED (3) or REVOKED (12) — mark cancelled
+        if ((notificationType === 3 || notificationType === 12) && sub) {
+          await this.db.query(
+            `UPDATE subscriptions SET status='cancelled', updated_at=NOW() WHERE id=$1`,
+            [sub.id]
+          );
+          await this.cache.del(`user:${sub.user_id}`);
+          console.log(`GPlay RTDN: subscription ${sub.id} cancelled (type=${notificationType})`);
+        }
+
+        // EXPIRED (13)
+        if (notificationType === 13 && sub) {
+          await this.db.query(
+            `UPDATE subscriptions SET status='expired', payment_status='failed', updated_at=NOW() WHERE id=$1`,
+            [sub.id]
+          );
+          await this.cache.del(`user:${sub.user_id}`);
+          console.log(`GPlay RTDN: subscription ${sub.id} expired`);
+        }
       }
 
-      // CANCELED (3) or REVOKED (12) — mark cancelled
-      if ((notificationType === 3 || notificationType === 12) && sub) {
-        await this.db.query(
-          `UPDATE subscriptions SET status='cancelled', updated_at=NOW() WHERE id=$1`,
-          [sub.id]
-        );
-        await this.cache.del(`user:${sub.user_id}`);
-        console.log(`GPlay RTDN: subscription ${sub.id} cancelled (type=${notificationType})`);
+      // ── One-time course purchases ──────────────────────────────
+      // notificationType: 1=PURCHASED 2=CANCELED (pending purchase abandoned
+      // before completion). PURCHASED is informational here — the Android
+      // app drives verification itself via POST courses/:id/purchase/gplay/verify
+      // right after BillingClient reports success, so by the time this RTDN
+      // arrives the purchase is normally already recorded. This is logged
+      // for visibility rather than acted on; there's no reconciliation job
+      // yet that would use it to catch a verify call the client never made.
+      if (oneTimeProductNotification) {
+        console.log(`GPlay RTDN: one-time product notification type=${oneTimeProductNotification.notificationType} sku=${oneTimeProductNotification.sku}`);
       }
 
-      // EXPIRED (13)
-      if (notificationType === 13 && sub) {
-        await this.db.query(
-          `UPDATE subscriptions SET status='expired', payment_status='failed', updated_at=NOW() WHERE id=$1`,
-          [sub.id]
-        );
-        await this.cache.del(`user:${sub.user_id}`);
-        console.log(`GPlay RTDN: subscription ${sub.id} expired`);
+      // ── Refunds / chargebacks — the entitlement-revoking path ──────
+      // Only fires when the refund was issued with revoke=true (Play
+      // Console "Revoke" checkbox, or revoke=true on the orders.refund
+      // API call) — a refund issued without it reaches here never, and
+      // the user keeps access. That's a Play-side behavior, not something
+      // this handler can compensate for.
+      if (voidedPurchaseNotification) {
+        const { purchaseToken, productType, refundType } = voidedPurchaseNotification;
+        // productType: 1=PRODUCT_TYPE_SUBSCRIPTION 2=PRODUCT_TYPE_ONE_TIME
+        if (productType === 2) {
+          const [purchase] = await this.db.query(
+            `SELECT id, user_id, course_id FROM course_purchases
+             WHERE gplay_purchase_token=$1 AND payment_provider='gplay' AND status='completed'`,
+            [purchaseToken]
+          );
+          if (purchase) {
+            await this.db.query(
+              `UPDATE course_purchases SET status='refunded', updated_at=NOW() WHERE id=$1`,
+              [purchase.id]
+            );
+            await this.db.query(
+              `DELETE FROM user_enrollments WHERE user_id=$1 AND course_id=$2`,
+              [purchase.user_id, purchase.course_id]
+            );
+            await this.cache.del(`user:${purchase.user_id}`);
+            console.log(`GPlay RTDN: course purchase ${purchase.id} voided (refundType=${refundType}), access revoked`);
+          }
+        }
+        // productType 1 (subscription) voided purchases aren't separately
+        // handled here — the existing CANCELED/REVOKED subscriptionNotification
+        // branch above already covers the subscription-refund path.
+      }
+
+      if (!subscriptionNotification && !oneTimeProductNotification && !voidedPurchaseNotification) {
+        return { status: 'ignored' };
       }
 
     } catch (e: any) {

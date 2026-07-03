@@ -1,4 +1,6 @@
 import * as CashfreeUtil from '../../common/utils/cashfree.util';
+import { syncCourseToPlayCatalog } from '../../common/utils/gplay-catalog.util';
+import { getOneTimeProductPurchase, acknowledgeOneTimeProductPurchase } from '../../common/utils/gplay-purchase.util';
 // ════════════════════════════════════════════════════════════
 // COURSES MODULE — Repository → Service → Controller
 // ════════════════════════════════════════════════════════════
@@ -732,6 +734,114 @@ export class CoursesService {
     return successResponse(null, 'Course purchased successfully! Start learning');
   }
 
+  // ─────────────────────────────────────────────────────────────
+  // POST /courses/:id/purchase/gplay/verify
+  // Called by Android (release builds) after BillingClient reports a
+  // successful one-time-product purchase. Unlike confirmCoursePurchase
+  // (Cashfree), there's no pending course_purchases row to look up —
+  // Play Billing checkout is entirely client-driven with no backend call
+  // beforehand, so this inserts the completed row directly once Google
+  // confirms the token is valid.
+  //
+  // clientPriceInr is the price the app read off the ProductDetails object
+  // it used to launch the billing flow — Play's purchase-verification API
+  // never returns the amount actually charged (checked: ProductPurchaseV2
+  // has no price field), so this is the best available record of it. It's
+  // a bookkeeping figure only — entitlement below never depends on it.
+  // ─────────────────────────────────────────────────────────────
+  async verifyGPlayCoursePurchase(
+    courseId: string,
+    userId: string,
+    dto: { purchaseToken: string; clientPriceInr?: number }
+  ) {
+    const { purchaseToken } = dto;
+    if (!purchaseToken) throw new BadRequestException('purchaseToken required');
+
+    // 1. Idempotency — token already processed (e.g. retried confirm call)
+    const [dup] = await this.db.query(
+      `SELECT id FROM course_purchases WHERE gplay_purchase_token=$1 AND status='completed'`,
+      [purchaseToken]
+    );
+    if (dup) {
+      await this.db.query(
+        `INSERT INTO user_enrollments (user_id, course_id) VALUES ($1,$2) ON CONFLICT (user_id, course_id) DO NOTHING`,
+        [userId, courseId]
+      );
+      return successResponse(null, 'Course already purchased');
+    }
+
+    const [course] = await this.db.query(
+      `SELECT id, title, gplay_product_id FROM courses WHERE id=$1 AND status='published'`,
+      [courseId]
+    );
+    if (!course) throw new NotFoundException('Course not found');
+    if (!course.gplay_product_id) {
+      throw new BadRequestException('This course is not available for purchase via Google Play.');
+    }
+
+    // 2. Verify server-side with Google — client cannot tamper with this
+    let purchase;
+    try {
+      purchase = await getOneTimeProductPurchase(purchaseToken);
+    } catch (e: any) {
+      console.error(
+        `GPlay course purchase verify failed: user=${userId} course=${courseId}`,
+        e?.response?.data ?? e?.message ?? e
+      );
+      throw new BadRequestException('Google Play purchase verification failed. Contact support.');
+    }
+
+    if (purchase.productId !== course.gplay_product_id) {
+      throw new BadRequestException('This purchase does not match this course.');
+    }
+    if (purchase.purchaseState !== 'PURCHASED') {
+      throw new BadRequestException(`Play purchase not completed (state: ${purchase.purchaseState}).`);
+    }
+
+    const amount = Math.max(0, Math.floor(Number(dto.clientPriceInr) || 0));
+
+    // 3. Record the completed purchase
+    await this.db.query(
+      `INSERT INTO course_purchases
+         (user_id, course_id, amount, payment_provider, gplay_purchase_token, gplay_order_id, status)
+       VALUES ($1,$2,$3,'gplay',$4,$5,'completed')
+       ON CONFLICT (user_id, course_id) DO UPDATE
+         SET amount=$3, payment_provider='gplay', gplay_purchase_token=$4, gplay_order_id=$5,
+             status='completed', updated_at=NOW()`,
+      [userId, courseId, amount, purchaseToken, purchase.orderId]
+    );
+
+    // 4. Acknowledge — required within 3 days or Google auto-refunds.
+    // Awaited (not fire-and-forget): there's no reconciliation job yet to
+    // retry a missed acknowledge, so this is the only attempt that happens.
+    if (purchase.acknowledgementState !== 'ACKNOWLEDGEMENT_STATE_ACKNOWLEDGED') {
+      const acked = await acknowledgeOneTimeProductPurchase(course.gplay_product_id, purchaseToken);
+      if (!acked) {
+        console.error(`GPlay course purchase acknowledge failed: user=${userId} course=${courseId} token=${purchaseToken}`);
+      }
+    }
+
+    // 5. Grant enrollment — same tail as confirmCoursePurchase (Cashfree)
+    await this.db.query(
+      `INSERT INTO user_enrollments (user_id, course_id) VALUES ($1,$2) ON CONFLICT (user_id, course_id) DO NOTHING`,
+      [userId, courseId]
+    );
+    await this.db.query(`UPDATE courses SET enrollment_count = enrollment_count + 1 WHERE id=$1`, [courseId]);
+    try {
+      const keys = await (this.cache.store as any).keys?.('courses:*') ?? [];
+      for (const k of keys) await this.cache.del(k);
+    } catch (_) {}
+
+    this.notifService?.pushToUser(
+      userId,
+      'Course Unlocked!',
+      'You now have full access. Start your first lesson!',
+      { type: 'course_purchased', courseId, screen: 'my_courses' }
+    ).catch(() => {});
+
+    return successResponse(null, 'Course purchased successfully! Start learning');
+  }
+
   async completeLesson(courseId: string, lessonId: string, userId: string, dto: CompleteLessonDto) {
     // FIX: lesson watch time was recorded in lesson_progress but NEVER
     // added to users.total_study_minutes — so course-lesson study time
@@ -1074,11 +1184,39 @@ export class CoursesService {
 
   async adminCreate(dto: CreateCourseDto, adminId: string) {
     const course = await this.repo.create(dto, adminId);
+    await this.syncPlayCatalog(course.id);
     await this.invalidateCache();
     if (dto.status === 'published') {
       this.sendCourseNotification(course.id || '', dto.title, dto.subject || 'General', dto.isPaid || false).catch(() => {});
     }
     return successResponse({ course }, 'Course created', undefined);
+  }
+
+  // Upserts this course's Google Play one-time product so its price/title
+  // stay in lockstep with what admin just saved — no manual Play Console
+  // step. Best-effort: never throws, never blocks the course save. Free
+  // courses (isPaid=false) are skipped entirely inside syncCourseToPlayCatalog.
+  private async syncPlayCatalog(courseId: string): Promise<void> {
+    const [course] = await this.db.query(
+      `SELECT id, title, description, price, is_paid FROM courses WHERE id=$1`,
+      [courseId]
+    ).catch(() => []);
+    if (!course) return;
+
+    const productId = await syncCourseToPlayCatalog({
+      id: course.id,
+      title: course.title,
+      description: course.description,
+      price: Number(course.price),
+      isPaid: course.is_paid,
+    });
+
+    if (productId) {
+      await this.db.query(
+        `UPDATE courses SET gplay_product_id=$1 WHERE id=$2`,
+        [productId, courseId]
+      ).catch(() => {});
+    }
   }
 
   private async sendCourseNotification(courseId: string, title: string, subject: string, isPaid: boolean) {
@@ -1131,6 +1269,10 @@ export class CoursesService {
     // Ensure rejection_reason column exists (migration-safe — matches library_notes pattern)
     await this.db.query(`ALTER TABLE courses ADD COLUMN IF NOT EXISTS rejection_reason TEXT`).catch(() => {});
     await this.repo.update(courseId, dto);
+    // Re-reads the full row rather than trusting dto, since dto is partial
+    // and may not include price/isPaid on an edit that only touched e.g.
+    // description — syncPlayCatalog needs the course's current full state.
+    await this.syncPlayCatalog(courseId);
     await this.invalidateCache();
     return successResponse(null, 'Course updated — changes are live in mobile app ✅');
   }
@@ -1238,6 +1380,19 @@ export class CoursesController {
     }
   ) {
     return this.service.confirmCoursePurchase(id, req.user.id, dto);
+  }
+
+  @Post(':id/purchase/gplay/verify')
+  @HttpCode(HttpStatus.OK)
+  verifyGPlayCoursePurchase(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Req() req: any,
+    @Body() dto: {
+      purchaseToken:   string;   // from Purchase.purchaseToken (BillingClient)
+      clientPriceInr?: number;   // price read off the ProductDetails used to launch the flow
+    }
+  ) {
+    return this.service.verifyGPlayCoursePurchase(id, req.user.id, dto);
   }
 
   @Post(':courseId/lessons/:lessonId/complete')
