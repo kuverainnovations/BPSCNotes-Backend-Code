@@ -757,10 +757,17 @@ export class CoursesService {
     const { purchaseToken } = dto;
     if (!purchaseToken) throw new BadRequestException('purchaseToken required');
 
-    // 1. Idempotency — token already processed (e.g. retried confirm call)
+    // 1. Idempotency — token already processed (e.g. retried confirm call).
+    // Scoped to user_id: previously this matched on gplay_purchase_token alone,
+    // so a token captured by a second user (shared device, leaked log) could be
+    // replayed here to get the first user's completed purchase re-granted as a
+    // free enrollment for themselves, without ever calling Google. Scoping this
+    // to the requesting user means a different user's replay attempt finds no
+    // match here and falls through to the real Google verification below,
+    // where the account-binding check (step 2b) rejects it.
     const [dup] = await this.db.query(
-      `SELECT id FROM course_purchases WHERE gplay_purchase_token=$1 AND status='completed'`,
-      [purchaseToken]
+      `SELECT id FROM course_purchases WHERE gplay_purchase_token=$1 AND user_id=$2 AND status='completed'`,
+      [purchaseToken, userId]
     );
     if (dup) {
       await this.db.query(
@@ -796,6 +803,19 @@ export class CoursesService {
     }
     if (purchase.purchaseState !== 'PURCHASED') {
       throw new BadRequestException(`Play purchase not completed (state: ${purchase.purchaseState}).`);
+    }
+    // 2b. Bind the purchase to the requesting user via Play's own account
+    // identifier (set by the Android app at launchBillingFlow time) rather
+    // than trusting userId alone — this is the actual fix for the replay gap
+    // the scoped dup-check above only narrows. A purchase made by an app
+    // build that predates this fix (never sets obfuscatedAccountId) has no
+    // value here and is rejected too — only enrollments already recorded
+    // before this deploys are grandfathered in (caught by the dup-check above).
+    if (!purchase.obfuscatedExternalAccountId || purchase.obfuscatedExternalAccountId !== userId) {
+      console.warn(
+        `GPlay course purchase account mismatch: user=${userId} course=${courseId} tokenAccountId=${purchase.obfuscatedExternalAccountId}`
+      );
+      throw new BadRequestException('This purchase does not belong to your account.');
     }
 
     const amount = Math.max(0, Math.floor(Number(dto.clientPriceInr) || 0));

@@ -20,9 +20,19 @@ export async function getPlayAuthClients() {
   const serviceAccountJson = requireEnv('GOOGLE_PLAY_SERVICE_ACCOUNT_JSON');
   const packageName        = requireEnv('ANDROID_PACKAGE_NAME');
 
+  let credentials: unknown;
+  try {
+    credentials = JSON.parse(serviceAccountJson);
+  } catch {
+    throw new Error(
+      'GOOGLE_PLAY_SERVICE_ACCOUNT_JSON is not valid JSON — check it was pasted as a single line ' +
+      'and not truncated or re-escaped when saved into .env'
+    );
+  }
+
   const { google } = await import('googleapis');
   const auth = new google.auth.GoogleAuth({
-    credentials: JSON.parse(serviceAccountJson),
+    credentials,
     scopes: ['https://www.googleapis.com/auth/androidpublisher'],
   });
   const androidpublisher = google.androidpublisher({ version: 'v3', auth });
