@@ -25,6 +25,8 @@ import { Response }               from 'express';
 import { JwtAuthGuard, AdminJwtGuard, PermissionGuard, RequirePermission, Public } from '../../common/guards';
 import { ActivityLogService, ACTIONS } from '../../common/activity/activity-log.service';
 import { successResponse, paginationMeta } from '../../common/utils/response.util';
+import { syncMaterialToPlayCatalog, gplayProductIdForMaterial } from '../../common/utils/gplay-catalog.util';
+import { getOneTimeProductPurchase, acknowledgeOneTimeProductPurchase } from '../../common/utils/gplay-purchase.util';
 import { AuthModule }             from '../auth/auth.module';
 import { CoinsModule, CoinsService } from '../coins/coins.module';
 
@@ -680,8 +682,53 @@ if (query.search)  { conditions.push(`(sm.title ILIKE $${pi} OR sm.subject ILIKE
     return successResponse({ updated, skipped, total: rows.length }, 'Backfill complete');
   }
 
+  // ── Admin: one-time backfill — sync already-approved materials to Play ──
+  // Covers every material that was approved (or had its price finalized via
+  // negotiation) before the gplay catalog-sync hooks existed in
+  // adminApprove/respondToNegotiation/adminFinalDecision — those only sync
+  // going forward, so anything approved earlier is stuck with
+  // gplay_product_id=NULL until this runs once.
+  //
+  // Idempotent: the WHERE clause only selects rows still missing a product
+  // id, so a material already synced (by this backfill or by the normal
+  // approval-time hook) is never re-processed — safe to call repeatedly,
+  // e.g. if the first run was interrupted or new approved-but-unsynced
+  // materials show up later for any reason.
+  //
+  // Uses the exact same syncMaterialToPlayCatalog() the live approval hooks
+  // call — no separate Play API logic. That function already never throws
+  // (logs and returns null on failure), so the try/catch here only guards
+  // the DB update, keeping one material's failure from stopping the loop.
+  async backfillMaterialGplayCatalog() {
+    const rows = await this.db.query(
+      `SELECT id, title, description, price FROM study_materials
+       WHERE status = 'approved' AND price > 0 AND gplay_product_id IS NULL`
+    );
+    let synced = 0;
+    let skipped = 0;
+    for (const row of rows) {
+      try {
+        const productId = await syncMaterialToPlayCatalog({
+          id: row.id, title: row.title, description: row.description, price: Number(row.price) || 0,
+        });
+        if (productId) {
+          await this.db.query(`UPDATE study_materials SET gplay_product_id=$2 WHERE id=$1`, [row.id, productId]);
+          synced++;
+        } else {
+          skipped++;
+        }
+      } catch (err: any) {
+        this.logger.warn(`backfillMaterialGplayCatalog: skip ${row.id} — ${err.message}`);
+        skipped++;
+      }
+    }
+    this.logger.log(`backfillMaterialGplayCatalog: synced=${synced} skipped=${skipped} total=${rows.length}`);
+    return successResponse({ synced, skipped, total: rows.length }, 'Backfill complete');
+  }
+
   async adminApprove(id: string) {
     await this.db.query(`UPDATE study_materials SET status='approved', updated_at=NOW() WHERE id=$1`, [id]);
+    this.syncMaterialGPlayProduct(id).catch(() => {});
 
     // Award coins to the uploader for the upload_note task (once per material approved)
     // Only award if they haven't already been awarded for this material's upload action
@@ -765,6 +812,26 @@ if (query.search)  { conditions.push(`(sm.title ILIKE $${pi} OR sm.subject ILIKE
     }
 
     return successResponse(null, `Rejected${reason ? ': ' + reason : ''}`);
+  }
+
+  // ── Shared: sync a material's current price to a Play one-time product ──
+  // Called after every point where a material's price becomes final and
+  // purchasable (plain approval, negotiation acceptance, admin final
+  // decision) — mirrors the course catalog-sync trigger, just spread across
+  // three call sites instead of one create/edit handler. Best-effort: never
+  // throws, a sync failure must not block approval/negotiation from
+  // completing (same resilience contract as syncCourseToPlayCatalog).
+  private async syncMaterialGPlayProduct(materialId: string): Promise<void> {
+    const [mat] = await this.db.query(
+      `SELECT id, title, description, price FROM study_materials WHERE id=$1`, [materialId]
+    );
+    if (!mat) return;
+    const productId = await syncMaterialToPlayCatalog({
+      id: mat.id, title: mat.title, description: mat.description, price: Number(mat.price) || 0,
+    });
+    if (productId) {
+      await this.db.query(`UPDATE study_materials SET gplay_product_id=$2 WHERE id=$1`, [materialId, productId]);
+    }
   }
 
   // ── Shared: push notification to a material's uploader ─────
@@ -882,6 +949,7 @@ if (query.search)  { conditions.push(`(sm.title ILIKE $${pi} OR sm.subject ILIKE
          VALUES ($1,$2,'user',$3,$4,'accept')`,
         [materialId, mat.negotiation_round, finalPrice, message || null]
       );
+      this.syncMaterialGPlayProduct(materialId).catch(() => {});
 
       // Coin reward + referral milestone, same as a normal approval
       try {
@@ -952,6 +1020,7 @@ if (query.search)  { conditions.push(`(sm.title ILIKE $${pi} OR sm.subject ILIKE
          VALUES ($1,$2,'admin',$3,$4,'final_approve')`,
         [id, mat.negotiation_round, finalPrice, reason || null]
       );
+      this.syncMaterialGPlayProduct(id).catch(() => {});
 
       try {
         await this.coinsService.claimTask('upload_note', mat.uploader_id);
@@ -1416,6 +1485,92 @@ console.log("SECRET =", cfMap["cashfree_secret_key"]?.substring(0, 10));
     return await this.finalizeMaterialPurchase(
       material, userId, order.id, order.coins_applied, order.coin_discount_inr, order.material_price
     );
+  }
+
+  // ── POST: confirm a marketplace purchase after Google Play Billing ──
+  // Release-build counterpart to confirmPurchase() above. No coin discount
+  // support here — Play always charges the full synced catalog price, so
+  // this is only reachable for materials with a positive price and only
+  // ever called from the !BuildConfig.DEBUG path on Android. Free materials
+  // never reach Play Billing at all (initPurchase's free branch, unchanged,
+  // already handles that with no gateway involved).
+  async verifyGPlayMaterialPurchase(materialId: string, userId: string, purchaseToken: string) {
+    if (!purchaseToken) throw new BadRequestException('purchaseToken required');
+
+    // Idempotency — user already owns this material (e.g. retried confirm call)
+    const [already] = await this.db.query(
+      `SELECT id FROM material_purchases WHERE material_id=$1 AND user_id=$2`,
+      [materialId, userId]
+    );
+    if (already) {
+      const fileUrl = await this.fileUrlForMaterial(materialId);
+      return successResponse({ purchased: true, alreadyPurchased: true, fileUrl }, 'Already purchased');
+    }
+
+    const [material] = await this.db.query(
+      `SELECT id, title, price, uploader_id, gplay_product_id FROM study_materials WHERE id=$1 AND status='approved'`,
+      [materialId]
+    );
+    if (!material) throw new NotFoundException('Material not found');
+    if (!material.gplay_product_id) {
+      throw new BadRequestException('This material is not available for purchase via Google Play yet. Please try again shortly.');
+    }
+
+    // Verify server-side with Google — client cannot tamper with this
+    let purchase;
+    try {
+      purchase = await getOneTimeProductPurchase(purchaseToken);
+    } catch (e: any) {
+      this.logger.error(
+        `GPlay material purchase verify failed: user=${userId} material=${materialId} ` +
+        `${e?.response?.data ? JSON.stringify(e.response.data) : (e?.message || e)}`
+      );
+      throw new BadRequestException('Google Play purchase verification failed. Contact support.');
+    }
+
+    if (purchase.productId !== material.gplay_product_id) {
+      throw new BadRequestException('This purchase does not match this material.');
+    }
+    if (purchase.purchaseState !== 'PURCHASED') {
+      throw new BadRequestException(`Play purchase not completed (state: ${purchase.purchaseState}).`);
+    }
+    // Bind the purchase to the requesting user via Play's own account
+    // identifier (set by the Android app at launchBillingFlow time) rather
+    // than trusting the caller's userId alone — otherwise a purchase token
+    // captured by a second user (shared device, leaked log) could be replayed
+    // against this endpoint to claim someone else's paid purchase for free.
+    if (!purchase.obfuscatedExternalAccountId || purchase.obfuscatedExternalAccountId !== userId) {
+      this.logger.warn(
+        `GPlay material purchase account mismatch: user=${userId} material=${materialId} ` +
+        `tokenAccountId=${purchase.obfuscatedExternalAccountId}`
+      );
+      throw new BadRequestException('This purchase does not belong to your account.');
+    }
+
+    // Dup-check scoped to this token — safe to treat as an idempotent retry
+    // by the same legitimate buyer, since the account-binding check above
+    // already rejects anyone else presenting this token.
+    const [dup] = await this.db.query(
+      `SELECT id FROM material_purchase_orders WHERE provider_payment_id=$1 AND payment_provider='gplay' AND status='completed'`,
+      [purchaseToken]
+    );
+    if (dup) {
+      const fileUrl = await this.fileUrlForMaterial(materialId);
+      return successResponse({ purchased: true, alreadyPurchased: true, fileUrl }, 'Already purchased');
+    }
+
+    await acknowledgeOneTimeProductPurchase(material.gplay_product_id, purchaseToken);
+
+    const price = Number(material.price) || 0;
+    const [order] = await this.db.query(`
+      INSERT INTO material_purchase_orders
+        (material_id, user_id, material_price, coins_applied, coin_discount_inr,
+         amount_due_inr, provider_order_id, provider_payment_id, payment_provider, status)
+      VALUES ($1,$2,$3,0,0,$3,$4,$5,'gplay','completed')
+      RETURNING id
+    `, [materialId, userId, price, purchase.orderId, purchaseToken]);
+
+    return await this.finalizeMaterialPurchase(material, userId, order.id, 0, 0, price);
   }
 
   // ── Shared: finalize a purchase — deduct coins, record purchase, ──
@@ -2017,6 +2172,15 @@ export class StudyMaterialsController {
     return this.svc.confirmPurchase(id, r.user.id, b);
   }
 
+  // POST /study-materials/:id/purchase/gplay/verify  body: { purchaseToken }
+  // Release-build counterpart to purchase/confirm — Google Play Billing
+  // instead of Cashfree. No coin discount support (see verifyGPlayMaterialPurchase).
+  @Post(':id/purchase/gplay/verify')
+  @HttpCode(HttpStatus.OK)
+  verifyGPlayMaterialPurchase(@Param('id', ParseUUIDPipe) id: string, @Body() b: { purchaseToken: string }, @Req() r: any) {
+    return this.svc.verifyGPlayMaterialPurchase(id, r.user.id, b?.purchaseToken);
+  }
+
   // POST /study-materials/:id/rate  body: { stars: 1-5, review?: string }
   @Post(':id/rate')
   @HttpCode(HttpStatus.OK)
@@ -2138,6 +2302,15 @@ export class AdminStudyMaterialsController {
   @RequirePermission('study-materials')
   @HttpCode(HttpStatus.OK)
   backfillPageCounts() { return this.svc.backfillPageCounts(); }
+
+  // ── Backfill gplay_product_id for materials approved before the ──
+  // catalog-sync hooks existed. Admin triggers this once after deploying
+  // the Play Billing migration. Safe to call multiple times.
+  // POST /admin/study-materials/backfill-gplay-catalog
+  @Post('backfill-gplay-catalog')
+  @RequirePermission('study-materials')
+  @HttpCode(HttpStatus.OK)
+  backfillMaterialGplayCatalog() { return this.svc.backfillMaterialGplayCatalog(); }
 
 
   @Patch(':id/reject')

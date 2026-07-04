@@ -24,6 +24,11 @@ export interface OneTimeProductPurchase {
   orderId: string | null;
   regionCode: string | null;
   purchaseCompletionTime: string | null;
+  // Google's account-binding field (externalAccountIdentifiers.obfuscatedExternalAccountId).
+  // Not read by the existing course verify flow — added for the new study-materials
+  // gplay verify path, which checks this against the requesting user's id to prevent
+  // a purchase token from being replayed/claimed by a different account.
+  obfuscatedExternalAccountId: string | null;
 }
 
 // GET purchases.productsv2.getproductpurchasev2 — read-only, checks token
@@ -45,6 +50,7 @@ export async function getOneTimeProductPurchase(purchaseToken: string): Promise<
     orderId: data?.orderId ?? null,
     regionCode: data?.regionCode ?? null,
     purchaseCompletionTime: data?.purchaseCompletionTime ?? null,
+    obfuscatedExternalAccountId: data?.externalAccountIdentifiers?.obfuscatedExternalAccountId ?? null,
   };
 }
 

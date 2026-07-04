@@ -122,3 +122,75 @@ export async function syncCourseToPlayCatalog(course: CourseForSync): Promise<st
     return null;
   }
 }
+
+// ── Study materials marketplace — same sync, applied to materials ──────
+// A material's price is settled through admin approval or negotiation
+// (adminApprove / respondToNegotiation / adminFinalDecision in
+// study-materials.module.ts), not a stable admin-authored catalog price
+// like courses — so this is called from each of those price-finalizing
+// call sites instead of a single create/edit handler. Same best-effort,
+// never-throws contract as syncCourseToPlayCatalog.
+export interface MaterialForSync {
+  id: string;
+  title: string;
+  description?: string | null;
+  price: number;
+}
+
+// "mat_" (not "material_") — Play product ids allow only [a-z0-9_.], max
+// 40 chars, and "material_" + 32-hex-uuid is 41 chars, one over the limit.
+export function gplayProductIdForMaterial(materialId: string): string {
+  return `mat_${materialId.replace(/-/g, '')}`;
+}
+
+export async function syncMaterialToPlayCatalog(material: MaterialForSync): Promise<string | null> {
+  if (!material.price || material.price <= 0) return null;
+
+  const productId = gplayProductIdForMaterial(material.id);
+
+  try {
+    const { rawClient, packageName } = await getPlayAuthClients();
+    const regionsVersion = requireEnv('GOOGLE_PLAY_REGIONS_VERSION');
+
+    const units = Math.floor(material.price);
+    const nanos = Math.round((material.price - units) * 1_000_000_000);
+
+    const url = `https://androidpublisher.googleapis.com/androidpublisher/v3/applications/${encodeURIComponent(packageName)}/onetimeproducts/${encodeURIComponent(productId)}`;
+
+    await rawClient.request({
+      url,
+      method: 'PATCH',
+      params: { allowMissing: true, 'regionsVersion.version': regionsVersion },
+      data: {
+        packageName,
+        productId,
+        listings: [
+          {
+            languageCode: 'en-US',
+            title: material.title.slice(0, 55),
+            description: (material.description || material.title).slice(0, 200),
+          },
+        ],
+        purchaseOptions: [
+          {
+            purchaseOptionId: PURCHASE_OPTION_ID,
+            buyOption: { legacyCompatible: true },
+            regionalPricingAndAvailabilityConfigs: [
+              {
+                regionCode: 'IN',
+                price: { currencyCode: 'INR', units: String(units), nanos },
+                availability: 'AVAILABLE',
+              },
+            ],
+          },
+        ],
+      },
+    });
+
+    return productId;
+  } catch (e: any) {
+    const detail = e?.response?.data ? JSON.stringify(e.response.data) : (e?.message || e);
+    console.error(`Play catalog sync failed for material ${material.id}:`, detail);
+    return null;
+  }
+}
