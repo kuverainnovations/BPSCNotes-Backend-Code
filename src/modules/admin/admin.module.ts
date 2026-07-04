@@ -16,7 +16,7 @@ import { CACHE_MANAGER } from '@nestjs/cache-manager';
 import { Cache } from 'cache-manager';
 import { Inject } from '@nestjs/common';
 import { ApiTags, ApiBearerAuth, ApiOperation } from '@nestjs/swagger';
-import { IsString, IsEmail, IsNotEmpty, IsOptional, IsArray, IsObject } from 'class-validator';
+import { IsString, IsEmail, IsNotEmpty, IsOptional, IsArray, IsObject, IsInt, Min, Max } from 'class-validator';
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import * as bcrypt from 'bcryptjs';
 import { Response } from 'express';
@@ -50,7 +50,9 @@ class UserStatusDto {
 
 class AwardCoinsDto {
   @ApiProperty() @IsString() @IsNotEmpty() userId: string;
-  @ApiProperty() amount: number;
+  // Without a class-validator decorator, ValidationPipe{whitelist:true}
+  // strips this field → NULL hits the NOT NULL users.coins column → 500.
+  @ApiProperty() @IsInt() @Min(1) @Max(100000) amount: number;
   @ApiPropertyOptional() @IsOptional() @IsString() reason?: string;
 }
 
@@ -493,15 +495,37 @@ export class AdminUsersService {
     return result[0];
   }
 
-  async updateAdmin(adminId: string, data: { permissions?: string[]; status?: string; name?: string; email?: string }) {
+  async updateAdmin(adminId: string, data: { permissions?: string[]; status?: string; name?: string; email?: string; password?: string }) {
+    // The Edit Admin dialog sends email + optional new password; both must
+    // actually persist — dropping them here is how "old password still
+    // works after change" happened (QA issue 2, 04-Jul).
+    let passwordHash: string | null = null;
+    if (data.password) {
+      if (data.password.length < 8) {
+        throw new BadRequestException('Password must be at least 8 characters');
+      }
+      passwordHash = await bcrypt.hash(data.password, 12);
+    }
+
+    let email: string | null = null;
+    if (data.email) {
+      email = data.email.toLowerCase();
+      const clash = await this.db.query(
+        `SELECT id FROM admin_users WHERE email=$1 AND id<>$2`, [email, adminId]
+      );
+      if (clash.length) throw new BadRequestException('Email already used by another admin');
+    }
+
     await this.db.query(
       `UPDATE admin_users SET
         permissions=COALESCE($1,permissions),
         status=COALESCE($2,status),
         name=COALESCE($3,name),
+        email=COALESCE($4,email),
+        password_hash=COALESCE($5,password_hash),
         updated_at=NOW()
-       WHERE id=$4`,
-      [data.permissions||null, data.status||null, data.name||null, adminId]
+       WHERE id=$6`,
+      [data.permissions||null, data.status||null, data.name||null, email, passwordHash, adminId]
     );
   }
 

@@ -44,7 +44,7 @@ import { CoinsModule, CoinsService } from '../coins/coins.module';
 //   }
 // ════════════════════════════════════════════════════════════
 
-const TYPES = ['pdf', 'pyq', 'book', 'video', 'notes', 'image'] as const;
+const TYPES = ['pdf', 'pyq', 'book', 'video', 'notes', 'image', 'handwritten'] as const;
 type MaterialType = typeof TYPES[number];
 
 const ALLOWED_MIME_TYPES = [
@@ -377,7 +377,7 @@ export class StudyMaterialsService {
 
     // Auto-count PDF pages from the uploaded file
     let pageCount = parseInt(String(dto.pageCount ?? '0'), 10) || 0;
-    if (pageCount === 0 && matType === 'pdf') {
+    if (pageCount === 0 && (matType === 'pdf' || matType === 'handwritten')) {
       try {
         const pdfBytes = fs.readFileSync(file.path);
         // Count pages by scanning for /Type /Page entries in the PDF byte stream
@@ -642,7 +642,7 @@ if (query.search)  { conditions.push(`(sm.title ILIKE $${pi} OR sm.subject ILIKE
   async backfillPageCounts() {
     const rows = await this.db.query(
       `SELECT id, file_key FROM study_materials
-       WHERE material_type IN ('pdf','pyq','book') AND page_count = 0 AND file_key IS NOT NULL`
+       WHERE material_type IN ('pdf','pyq','book','handwritten') AND page_count = 0 AND file_key IS NOT NULL`
     );
     let updated = 0;
     let skipped = 0;

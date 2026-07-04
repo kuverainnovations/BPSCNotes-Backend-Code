@@ -843,6 +843,7 @@ class JobsService implements OnModuleInit {
            COALESCE(j.advert_pdf_key,'')               AS advert_pdf_key,
            COALESCE(j.advert_pdf_url,'')               AS advert_pdf_url,
            COALESCE(j.application_link,'')             AS official_link,
+           COALESCE(j.notification_url,'')             AS notification_url,
            j.status,
            j.exam_tags,
            j.notification_date::TEXT                   AS notification_date,
@@ -885,17 +886,32 @@ class JobsService implements OnModuleInit {
     return successResponse({ jobs: rows }, 'Success', paginationMeta(parseInt(cnt.count), Number(page), Number(limit)));
   }
 
-  // ── Toggle save ───────────────────────────────────────────
-  async toggleSave(jobId: string, userId: string) {
-    const existing = await this.db.query(`SELECT user_id FROM job_saves WHERE user_id=$1 AND job_id=$2`, [userId, jobId]);
-    if (existing.length) {
-      await this.db.query(`DELETE FROM job_saves WHERE user_id=$1 AND job_id=$2`, [userId, jobId]);
-      await this.db.query(`UPDATE job_vacancies SET save_count=GREATEST(save_count-1,0) WHERE id=$1`, [jobId]);
-      return successResponse({ isSaved: false });
+  // ── Save / Unsave ─────────────────────────────────────────
+  // Idempotent, same contract as course saves: POST always ends saved,
+  // DELETE always ends unsaved. The previous blind toggle flipped on
+  // current DB state, so any client/server drift (double-tap, retry,
+  // stale list) made "Save" randomly unsave — QA issue 14 ("saving is
+  // not happening sometimes").
+  async saveJob(jobId: string, userId: string) {
+    const inserted = await this.db.query(
+      `INSERT INTO job_saves VALUES ($1,$2) ON CONFLICT DO NOTHING RETURNING job_id`,
+      [userId, jobId]
+    );
+    if (inserted.length) {
+      await this.db.query(`UPDATE job_vacancies SET save_count=save_count+1 WHERE id=$1`, [jobId]);
     }
-    await this.db.query(`INSERT INTO job_saves VALUES ($1,$2) ON CONFLICT DO NOTHING`, [userId, jobId]);
-    await this.db.query(`UPDATE job_vacancies SET save_count=save_count+1 WHERE id=$1`, [jobId]);
-    return successResponse({ isSaved: true });
+    return successResponse({ isSaved: true }, 'Job saved');
+  }
+
+  async unsaveJob(jobId: string, userId: string) {
+    const removed = await this.db.query(
+      `DELETE FROM job_saves WHERE user_id=$1 AND job_id=$2 RETURNING job_id`,
+      [userId, jobId]
+    );
+    if (removed.length) {
+      await this.db.query(`UPDATE job_vacancies SET save_count=GREATEST(save_count-1,0) WHERE id=$1`, [jobId]);
+    }
+    return successResponse({ isSaved: false }, 'Removed from saved');
   }
 
   // ── Cron: auto-expire jobs past their last_date ───────────
@@ -989,6 +1005,10 @@ class JobsService implements OnModuleInit {
   async adminCreate(data: any, adminId: string) {
     if (!data.title || !data.organization || !data.lastDate)
       throw new BadRequestException('Title, organization and last date required');
+
+    // Play policy (Misleading Claims): every govt job must cite its official source
+    if (!data.applicationLink && !data.applicationUrl && !data.notificationUrl && !data.pdfUrl)
+      throw new BadRequestException('Official source link required — provide a Notification URL, Application URL or notification PDF');
 
     const locationDisplay = this.buildLocationDisplay(data);
 
@@ -1197,8 +1217,14 @@ class JobsController {
 
   @Post(':id/save')
   @HttpCode(200)
-  toggleSave(@Param('id', ParseUUIDPipe) id: string, @Req() r: any) {
-    return this.s.toggleSave(id, r.user.id);
+  saveJob(@Param('id', ParseUUIDPipe) id: string, @Req() r: any) {
+    return this.s.saveJob(id, r.user.id);
+  }
+
+  @Delete(':id/save')
+  @HttpCode(200)
+  unsaveJob(@Param('id', ParseUUIDPipe) id: string, @Req() r: any) {
+    return this.s.unsaveJob(id, r.user.id);
   }
 }
 

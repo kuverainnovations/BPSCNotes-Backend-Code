@@ -239,16 +239,25 @@ class DailyTargetsService {
     );
 
     if (parseInt(pendingCount.count) > 0) {
+      // carried_from_id links the copy to its source row and created_at is
+      // preserved from the source, so (a) the NOT EXISTS guard survives title
+      // edits — matching by title re-created "phantom" duplicates the moment
+      // a carried target was renamed (QA issue 7) — and (b) the app can show
+      // the true origin ("From 3 days ago", not always "From yesterday" —
+      // QA issue 6).
       await this.db.query(
         `INSERT INTO daily_targets
            (user_id, title, subject, difficulty, time_slot, estimated_minutes,
-            total_questions, is_carried_forward, target_date, source_quiz_id, source_note_id)
+            total_questions, is_carried_forward, target_date, source_quiz_id, source_note_id,
+            carried_from_id, created_at)
          SELECT
            dt.user_id, dt.title, dt.subject, dt.difficulty, dt.time_slot,
            dt.estimated_minutes, dt.total_questions,
            TRUE, -- is_carried_forward
            $2::date, -- today
-           dt.source_quiz_id, dt.source_note_id
+           dt.source_quiz_id, dt.source_note_id,
+           dt.id,
+           dt.created_at
          FROM daily_targets dt
          WHERE dt.user_id = $1
            AND dt.is_completed = FALSE
@@ -258,9 +267,11 @@ class DailyTargetsService {
            AND NOT EXISTS (
              SELECT 1 FROM daily_targets existing
              WHERE existing.user_id = dt.user_id
-               AND existing.title = dt.title
                AND existing.target_date = $2::date
-               AND existing.is_carried_forward = TRUE
+               AND (existing.carried_from_id = dt.id
+                    OR (existing.carried_from_id IS NULL
+                        AND existing.title = dt.title
+                        AND existing.is_carried_forward = TRUE))
            )`,
         [userId, today]
       );
@@ -281,6 +292,8 @@ class DailyTargetsService {
          dt.is_carried_forward,
          dt.target_date,
          dt.completed_at,
+         dt.created_at,
+         dt.carried_from_id,
          q.title AS linked_quiz_title,
          q.id    AS linked_quiz_id,
          ln.title AS linked_note_title,
@@ -491,6 +504,27 @@ class DailyTargetsService {
       ]
     );
 
+    // Keep the carry chain in sync: completing only the carried COPY left the
+    // source row incomplete, so getTargets() resurrected the "done" target the
+    // next morning. Mirror the state onto the source (id link, title fallback
+    // for pre-lineage rows). No coins are involved for the source rows.
+    if (target.is_carried_forward) {
+      if (target.carried_from_id) {
+        await this.db.query(
+          `UPDATE daily_targets SET is_completed=$1, completed_at=$2, updated_at=NOW()
+           WHERE id=$3 AND user_id=$4`,
+          [nowComplete, nowComplete ? new Date() : null, target.carried_from_id, userId]
+        );
+      } else {
+        await this.db.query(
+          `UPDATE daily_targets SET is_completed=$1, completed_at=$2, updated_at=NOW()
+           WHERE user_id=$3 AND title=$4 AND is_carried_forward=FALSE AND target_date < $5::date`,
+          [nowComplete, nowComplete ? new Date() : null, userId, target.title,
+           new Date().toISOString().split('T')[0]]
+        );
+      }
+    }
+
     // ── Trigger achievements + challenge progress on completion ──
     if (nowComplete) {
       // Fire-and-forget so UI isn't blocked by achievement checks
@@ -552,7 +586,7 @@ class DailyTargetsService {
   // ── DELETE /users/daily-targets/:id ──────────────────────
   async deleteTarget(targetId: string, userId: string) {
     const rows = await this.db.query(
-      `SELECT id, title, is_completed, is_carried_forward, target_date
+      `SELECT id, title, is_completed, is_carried_forward, target_date, carried_from_id
        FROM daily_targets WHERE id=$1 AND user_id=$2`,
       [targetId, userId]
     );
@@ -561,27 +595,43 @@ class DailyTargetsService {
     const target      = rows[0];
     const wasCompleted = target.is_completed;
 
-    // ── KEY FIX: if this is a carried-forward copy, also delete ALL
-    // source originals (same title, same user, not carried forward, incomplete)
-    // so getTargets() cannot re-create this target on next load.
+    // ── KEY FIX: if this is a carried-forward copy, also delete the source
+    // originals so getTargets() cannot re-create this target on next load.
+    // Prefer the carried_from_id lineage (survives title edits); title match
+    // remains as fallback for rows created before the lineage column existed.
     if (target.is_carried_forward) {
-      await this.db.query(
-        `DELETE FROM daily_targets
-         WHERE user_id=$1
-           AND title=$2
-           AND is_carried_forward = FALSE
-           AND is_completed = FALSE`,
-        [userId, target.title]
-      );
-      // Also delete any other carried-forward copies of the same title today
-      await this.db.query(
-        `DELETE FROM daily_targets
-         WHERE user_id=$1
-           AND title=$2
-           AND is_carried_forward = TRUE
-           AND id != $3`,
-        [userId, target.title, targetId]
-      );
+      if (target.carried_from_id) {
+        await this.db.query(
+          `DELETE FROM daily_targets
+           WHERE user_id=$1 AND id=$2 AND is_completed = FALSE`,
+          [userId, target.carried_from_id]
+        );
+        // Any sibling copies of the same source (shouldn't exist, but keeps
+        // the day clean if legacy duplicates are still around)
+        await this.db.query(
+          `DELETE FROM daily_targets
+           WHERE user_id=$1 AND carried_from_id=$2 AND id != $3`,
+          [userId, target.carried_from_id, targetId]
+        );
+      } else {
+        await this.db.query(
+          `DELETE FROM daily_targets
+           WHERE user_id=$1
+             AND title=$2
+             AND is_carried_forward = FALSE
+             AND is_completed = FALSE`,
+          [userId, target.title]
+        );
+        // Also delete any other carried-forward copies of the same title today
+        await this.db.query(
+          `DELETE FROM daily_targets
+           WHERE user_id=$1
+             AND title=$2
+             AND is_carried_forward = TRUE
+             AND id != $3`,
+          [userId, target.title, targetId]
+        );
+      }
     }
 
     // If completed, debit the exact coins awarded for THIS specific target
@@ -628,15 +678,37 @@ class DailyTargetsService {
 
   async updateTarget(targetId: string, userId: string, title: string, subject: string) {
     const rows = await this.db.query(
-      `SELECT id FROM daily_targets WHERE id=$1 AND user_id=$2`,
+      `SELECT id, title, is_carried_forward, carried_from_id
+       FROM daily_targets WHERE id=$1 AND user_id=$2`,
       [targetId, userId]
     );
     if (!rows.length) throw new NotFoundException('Target not found');
+    const target = rows[0];
 
     await this.db.query(
       `UPDATE daily_targets SET title=$1, subject=$2, updated_at=NOW() WHERE id=$3 AND user_id=$4`,
       [title.trim(), subject || 'General Studies', targetId, userId]
     );
+
+    // Rename the source row too — otherwise the source keeps the OLD title,
+    // stops matching the carried copy, and gets carried forward again as a
+    // brand-new target on the next load ("edit duplicates the target",
+    // QA issue 7). Id link first; title fallback covers pre-lineage rows.
+    if (target.is_carried_forward) {
+      if (target.carried_from_id) {
+        await this.db.query(
+          `UPDATE daily_targets SET title=$1, subject=$2, updated_at=NOW()
+           WHERE id=$3 AND user_id=$4`,
+          [title.trim(), subject || 'General Studies', target.carried_from_id, userId]
+        );
+      } else {
+        await this.db.query(
+          `UPDATE daily_targets SET title=$1, subject=$2, updated_at=NOW()
+           WHERE user_id=$3 AND title=$4 AND is_carried_forward=FALSE AND is_completed=FALSE`,
+          [title.trim(), subject || 'General Studies', userId, target.title]
+        );
+      }
+    }
 
     return this.getTargets(userId);
   }
@@ -801,6 +873,16 @@ class UsersService {
     await this.cache.del(`profile:${userId}`);
     await this.cache.del(`user:${userId}`);
     return successResponse({ url }, 'Avatar updated');
+  }
+
+  // QA 04-Jul issue 15: there was no way to remove an uploaded profile
+  // photo. Dedicated DELETE (rather than PATCH with avatar_url:null)
+  // because the app's Gson serializer drops null fields.
+  async removeAvatar(userId: string) {
+    await this.db.query(`UPDATE users SET avatar_url=NULL, updated_at=NOW() WHERE id=$1`, [userId]);
+    await this.cache.del(`profile:${userId}`);
+    await this.cache.del(`user:${userId}`);
+    return successResponse(null, 'Profile photo removed');
   }
 
   async updateExamTarget(userId: string, data: any) {
@@ -1307,6 +1389,7 @@ class UsersController {
   uploadAvatar(@Req() r: any, @UploadedFile() file: Express.Multer.File) {
     return this.s.uploadAvatar(r.user.id, file);
   }
+  @Delete('avatar') removeAvatar(@Req() r: any) { return this.s.removeAvatar(r.user.id); }
   @Put('exam-target') updateExamTarget(@Req() r: any, @Body() dto: any) { return this.s.updateExamTarget(r.user.id, dto); }
   @Get('stats')       getStats(@Req() r: any) { return this.s.getStats(r.user.id); }
   @Get('leaderboard') getLeaderboard(@Query() q: any, @Req() r: any) { return this.s.getLeaderboard(q, r.user.id); }
