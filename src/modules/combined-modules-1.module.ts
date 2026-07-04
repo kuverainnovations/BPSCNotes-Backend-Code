@@ -904,11 +904,12 @@ class JobsService implements OnModuleInit {
   }
 
   async unsaveJob(jobId: string, userId: string) {
-    const removed = await this.db.query(
+    // DELETE returns [rows, count] from raw query() — unwrap rows first
+    const [removedRows] = await this.db.query(
       `DELETE FROM job_saves WHERE user_id=$1 AND job_id=$2 RETURNING job_id`,
       [userId, jobId]
     );
-    if (removed.length) {
+    if (removedRows.length) {
       await this.db.query(`UPDATE job_vacancies SET save_count=GREATEST(save_count-1,0) WHERE id=$1`, [jobId]);
     }
     return successResponse({ isSaved: false }, 'Removed from saved');
@@ -920,14 +921,14 @@ class JobsService implements OnModuleInit {
   @Cron('35 18 * * *')
   async expireOverdueJobs() {
     try {
-      const result = await this.db.query(
+      const [expiredRows] = await this.db.query(
         `UPDATE job_vacancies
          SET status='expired', updated_at=NOW()
          WHERE status='active' AND last_date < CURRENT_DATE
          RETURNING id, title`
       );
-      if (result.length > 0) {
-        this.logger.log(`expireOverdueJobs: expired ${result.length} jobs — ${result.map((r: any) => r.title).join(', ')}`);
+      if (expiredRows.length > 0) {
+        this.logger.log(`expireOverdueJobs: expired ${expiredRows.length} jobs — ${expiredRows.map((r: any) => r.title).join(', ')}`);
       }
     } catch (err: any) {
       this.logger.warn(`expireOverdueJobs failed: ${err.message}`);

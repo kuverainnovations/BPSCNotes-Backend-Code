@@ -1400,12 +1400,13 @@ export class StudySessionsService {
 
   private async awardSessionCoins(userId: string, sessionId: string, amount: number, multiplier: number) {
     if (amount <= 0) return;
-    const bal = await this.db.query(
+    // UPDATE returns [rows, count] from raw query() — unwrap rows first
+    const [balRows] = await this.db.query(
       `UPDATE users SET coins=COALESCE(coins,0)+$1, total_coins_earned=COALESCE(total_coins_earned,0)+$1 WHERE id=$2 RETURNING coins`,
       [amount, userId]
     );
-    if (!bal.length) return;
-    const newBalance = Number(bal[0].coins) || 0;
+    if (!balRows.length) return;
+    const newBalance = Number(balRows[0].coins) || 0;
     await this.db.query(
       `INSERT INTO coin_transactions (user_id,type,amount,description,action,ref_id,balance)
        VALUES ($1,'earned',$2,$3,'study_time',$4,$5)`,

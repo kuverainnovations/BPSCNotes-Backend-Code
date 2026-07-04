@@ -484,16 +484,18 @@ export class CoursesService {
             if (coinsApplied > 0) {
               // Atomic deduction: only succeeds if user still has enough coins.
               // Prevents double-deduction from concurrent requests.
-              const deducted = await this.db.query(
+              // UPDATE returns [rows, count] from raw query() — the old
+              // `.length` check ran on the outer pair (always 2), so
+              // "Insufficient coins" could never fire.
+              const [deductedRows] = await this.db.query(
                 `UPDATE users SET coins = coins - $1 WHERE id=$2 AND coins >= $1 RETURNING coins`,
                 [coinsApplied, userId]
               );
-              if (!deducted.length) throw new BadRequestException('Insufficient coins.');
-              const [u] = deducted;
+              if (!deductedRows.length) throw new BadRequestException('Insufficient coins.');
               await this.db.query(
                 `INSERT INTO coin_transactions (user_id,type,amount,description,action,balance)
                  VALUES ($1,'spent',$2,'Course purchase discount: '||$3,'course_purchase_discount',$4)`,
-                [userId, coinsApplied, course[0].title, Math.floor(Number(u.coins))]
+                [userId, coinsApplied, course[0].title, Math.floor(Number(deductedRows[0].coins)) || 0]
               );
             }
             await this.db.query(
@@ -686,11 +688,12 @@ export class CoursesService {
     if (purchase.coins_applied > 0) {
       try {
         const coinsToDeduct = Math.floor(Number(purchase.coins_applied));
-        const deducted = await this.db.query(
+        // UPDATE returns [rows, count] from raw query() — unwrap rows first
+        const [deductedRows] = await this.db.query(
           `UPDATE users SET coins = coins - $1 WHERE id=$2 AND coins >= $1 RETURNING coins`,
           [coinsToDeduct, userId]
         );
-        const [u] = deducted.length ? deducted : await this.db.query(`SELECT coins FROM users WHERE id=$1`, [userId]);
+        const [u] = deductedRows.length ? deductedRows : await this.db.query(`SELECT coins FROM users WHERE id=$1`, [userId]);
         const [courseRow] = await this.db.query(`SELECT title FROM courses WHERE id=$1`, [courseId]);
         const balanceAfter = Math.floor(Number(u?.coins));
         await this.db.query(

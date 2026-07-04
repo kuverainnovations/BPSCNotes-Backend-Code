@@ -454,19 +454,24 @@ export class AdminUsersService {
 
   async awardCoins(dto: AwardCoinsDto, adminId: string) {
     if (dto.amount <= 0) throw new BadRequestException('Amount must be positive');
-    const balResult = await this.db.query(
+    // TypeORM's raw query() returns [rows, affectedCount] for UPDATE — the
+    // rows must be unwrapped first. Reading .coins off the outer array gave
+    // undefined → NULL balance → NOT NULL violation → the admin "award
+    // coins" 500 (QA issue 1, second round).
+    const [balRows] = await this.db.query(
       `UPDATE users SET coins = COALESCE(coins, 0) + $1, total_coins_earned = COALESCE(total_coins_earned, 0) + $1 WHERE id = $2 RETURNING COALESCE(coins, 0)::int AS coins`,
       [dto.amount, dto.userId]
     );
-    if (!balResult.length) throw new NotFoundException('User not found');
+    if (!balRows.length) throw new NotFoundException('User not found');
+    const newBalance = Number(balRows[0].coins) || 0;
 
     await this.db.query(
       `INSERT INTO coin_transactions (user_id, type, amount, description, action, balance)
        VALUES ($1, 'earned', $2, $3, 'admin_award', $4)`,
-      [dto.userId, dto.amount, dto.reason || 'Admin award', balResult[0].coins]
+      [dto.userId, dto.amount, dto.reason || 'Admin award', newBalance]
     );
     await this.cache.del(`user:${dto.userId}`);
-    return { newBalance: balResult[0].coins };
+    return { newBalance };
   }
 
   async deleteAccount(userId: string) {

@@ -899,15 +899,18 @@ export class AuthService {
         // The idempotency key already ensures each quiz is only rewarded once.
         if (!safeRefId && Number(countRow.cnt) >= maxPerDay) return 0;
 
-        const [updated] = await em.query(
+        // UPDATE via raw query() returns [rows, affectedCount] — unwrap the
+        // rows first. The old code read .coins off the outer array, so every
+        // coin transaction recorded balance 0.
+        const [updatedRows] = await em.query(
           `UPDATE users
              SET coins              = COALESCE(coins, 0) + $1,
                  total_coins_earned = COALESCE(total_coins_earned, 0) + $1
            WHERE id = $2 RETURNING coins`,
           [coinsToAward, userId]
         );
-        if (!updated) return 0;
-        const newBalance = Number(updated.coins) || 0;
+        if (!updatedRows.length) return 0;
+        const newBalance = Number(updatedRows[0].coins) || 0;
 
         // ON CONFLICT DO NOTHING is a secondary safety net only — the idempotency
         // check above already prevents duplicates under normal operation

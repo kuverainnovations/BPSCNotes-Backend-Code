@@ -448,7 +448,8 @@ class DailyTargetsService {
       );
       if (rule.length) {
         const coins = rule[0].coins_awarded;
-        const balRows = await this.db.query(`UPDATE users SET coins=COALESCE(coins,0)+$1 WHERE id=$2 RETURNING coins`, [coins, userId]);
+        // UPDATE returns [rows, count] from raw query() — unwrap rows first
+        const [balRows] = await this.db.query(`UPDATE users SET coins=COALESCE(coins,0)+$1 WHERE id=$2 RETURNING coins`, [coins, userId]);
         const bal = balRows.length ? (Number(balRows[0].coins) || 0) : 0;
         await this.db.query(
           `INSERT INTO coin_transactions (user_id,type,amount,description,action,balance)
@@ -1315,11 +1316,11 @@ class UsersService {
 
   async toggleLiveClass(classId: string, isLive: boolean) {
     const newStatus = isLive ? 'live' : 'ended';
-    const result = await this.db.query(
+    const [updatedRows] = await this.db.query(
       `UPDATE live_classes SET status=$1, updated_at=NOW() WHERE id=$2 RETURNING *`,
       [newStatus, classId]
     );
-    if (!result.length) throw new NotFoundException('Live class not found');
+    if (!updatedRows.length) throw new NotFoundException('Live class not found');
     return successResponse({ status: newStatus, isLive }, isLive ? 'Class is now LIVE 🔴' : 'Class ended ⏹');
   }
 

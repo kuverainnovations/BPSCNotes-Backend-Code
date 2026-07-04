@@ -628,12 +628,13 @@ if (query.search)  { conditions.push(`(sm.title ILIKE $${pi} OR sm.subject ILIKE
   async updateMaterialLanguage(id: string, language: string) {
     const allowed = ['English', 'Hindi', 'Hindi + English'];
     const value = allowed.includes(language) ? language : 'English';
-    const [row] = await this.db.query(
+    // UPDATE returns [rows, count] from raw query() — unwrap rows first
+    const [langRows] = await this.db.query(
       `UPDATE study_materials SET language=$2, updated_at=NOW() WHERE id=$1 RETURNING id, language`,
       [id, value]
     );
-    if (!row) throw new NotFoundException('Material not found');
-    return successResponse({ id: row.id, language: row.language }, 'Language updated');
+    if (!langRows.length) throw new NotFoundException('Material not found');
+    return successResponse({ id: langRows[0].id, language: langRows[0].language }, 'Language updated');
   }
 
   // ── Admin: backfill page_count for existing PDFs ──────────
