@@ -288,7 +288,12 @@ export class StudyMaterialsService {
       SELECT sm.*,
              u.name AS uploader_name,
              (SELECT TRUE FROM material_bookmarks mb WHERE mb.material_id=sm.id AND mb.user_id=$2) AS is_bookmarked,
-             (SELECT COUNT(*) FROM material_purchases mp WHERE mp.material_id=sm.id AND mp.price_paid > 0) AS buyer_count
+             (SELECT COUNT(*) FROM material_purchases mp WHERE mp.material_id=sm.id AND mp.price_paid > 0) AS buyer_count,
+             (
+               NOT sm.is_premium
+               OR EXISTS (SELECT 1 FROM material_purchases mp WHERE mp.material_id=sm.id AND mp.user_id=$2)
+               OR EXISTS (SELECT 1 FROM download_history dh WHERE dh.material_id=sm.id AND dh.user_id=$2)
+             ) AS is_purchased
       FROM study_materials sm
       LEFT JOIN users u ON u.id = sm.uploader_id
       WHERE sm.id = $1 AND sm.status = 'approved'
@@ -299,6 +304,7 @@ export class StudyMaterialsService {
       fileUrl:      row.file_key      ? this.fileUrl(row.file_key)      : null,
       thumbnailUrl: row.thumbnail_key ? this.fileUrl(row.thumbnail_key) : null,
       buyer_count:  parseInt(row.buyer_count ?? '0', 10),
+      is_purchased: !!row.is_purchased,
     });
   }
 
