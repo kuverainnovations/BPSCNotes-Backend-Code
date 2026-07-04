@@ -294,7 +294,7 @@ export class StudyMaterialsService {
              (
                NOT sm.is_premium
                OR EXISTS (SELECT 1 FROM material_purchases mp WHERE mp.material_id=sm.id AND mp.user_id=$2)
-               OR EXISTS (SELECT 1 FROM download_history dh WHERE dh.material_id=sm.id AND dh.user_id=$2)
+               OR EXISTS (SELECT 1 FROM material_downloads dh WHERE dh.material_id=sm.id AND dh.user_id=$2)
              ) AS is_purchased
       FROM study_materials sm
       LEFT JOIN users u ON u.id = sm.uploader_id
@@ -1157,7 +1157,7 @@ if (query.search)  { conditions.push(`(sm.title ILIKE $${pi} OR sm.subject ILIKE
     const [access] = await this.db.query(`
       SELECT 1 FROM material_purchases WHERE material_id=$1 AND user_id=$2
       UNION ALL
-      SELECT 1 FROM download_history   WHERE material_id=$1 AND user_id=$2
+      SELECT 1 FROM material_downloads   WHERE material_id=$1 AND user_id=$2
       LIMIT 1
     `, [materialId, userId]).catch(() => [null]);
     if (!access) throw new BadRequestException('You can only rate materials you have accessed.');
