@@ -456,7 +456,7 @@ export class StudyMaterialsService {
     const fileKey = `pending/${userId}/${Date.now()}${ext}`;
     // Store token in cache so the confirm step can verify it
     await this.cache.set(`upload_token:${token}`, { userId, fileKey, mimeType }, 900);
-    // Return same shape as S3 presigned URL response — Android code unchanged
+    // Return same shape as S3 presigned URL response — Android code unchanged.
     const uploadUrl = `${this.baseUrl}/api/v1/study-materials/upload-local?token=${token}`;
     return successResponse({ uploadUrl, fileKey, token });
   }
