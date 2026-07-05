@@ -295,7 +295,15 @@ export class StudyMaterialsService {
                NOT sm.is_premium
                OR EXISTS (SELECT 1 FROM material_purchases mp WHERE mp.material_id=sm.id AND mp.user_id=$2)
                OR EXISTS (SELECT 1 FROM material_downloads dh WHERE dh.material_id=sm.id AND dh.user_id=$2)
-             ) AS is_purchased
+             ) AS is_purchased,
+             -- Strict access flag matching rateMaterial's rule (purchase or
+             -- download row). is_purchased is TRUE for any free material, so
+             -- gating the rating stars on it produced "You can only rate
+             -- materials you have accessed" 400s (QA issue 12 follow-up).
+             (
+               EXISTS (SELECT 1 FROM material_purchases mp2 WHERE mp2.material_id=sm.id AND mp2.user_id=$2)
+               OR EXISTS (SELECT 1 FROM material_downloads dh2 WHERE dh2.material_id=sm.id AND dh2.user_id=$2)
+             ) AS has_accessed
       FROM study_materials sm
       LEFT JOIN users u ON u.id = sm.uploader_id
       WHERE sm.id = $1 AND sm.status = 'approved'

@@ -102,7 +102,7 @@ class CurrentAffairsService {
     const offset = (page-1)*limit;
     const conditions = [`ca.status='published'`], params: any[] = [];
     if (date)      { conditions.push(`ca.date=$${params.length+1}`); params.push(date); }
-    if (category)  { conditions.push(`ca.category=$${params.length+1}`); params.push(category); }
+    if (category)  { conditions.push(`(ca.category=$${params.length+1} OR $${params.length+1}=ANY(ca.categories))`); params.push(category); }
     if (exam) {
       if (exam === 'prelims' || exam === 'mains') {
         conditions.push(`($${params.length+1}=ANY(ca.exam_tags) OR 'both'=ANY(ca.exam_tags))`);
@@ -121,7 +121,7 @@ class CurrentAffairsService {
 
     const [rows, countResult] = await Promise.all([
       this.db.query(
-        `SELECT ca.id,ca.title,ca.summary,ca.category,ca.date,ca.is_important,ca.exam_tags,ca.tags,ca.view_count,ca.bookmark_count,
+        `SELECT ca.id,ca.title,ca.summary,ca.category,ca.categories,ca.date,ca.is_important,ca.exam_tags,ca.tags,ca.view_count,ca.bookmark_count,
            COALESCE(ca.read_time, 1) AS read_time,
            (SELECT TRUE FROM affairs_bookmarks ab WHERE ab.user_id=$${params.length+1} AND ab.affair_id=ca.id) AS is_bookmarked,
            (SELECT COUNT(*) FROM ca_mcqs m WHERE m.affair_id=ca.id)::int AS mcq_count,
@@ -170,7 +170,7 @@ class CurrentAffairsService {
     const conditions = ['1=1'], params: any[] = [];
     if (status)   { conditions.push(`ca.status=$${params.length+1}`);     params.push(status); }
     if (date)     { conditions.push(`ca.date=$${params.length+1}`);        params.push(date); }
-    if (category) { conditions.push(`ca.category=$${params.length+1}`);    params.push(category); }
+    if (category) { conditions.push(`(ca.category=$${params.length+1} OR $${params.length+1}=ANY(ca.categories))`); params.push(category); }
     if (search)   { conditions.push(`(ca.title ILIKE $${params.length+1} OR ca.summary ILIKE $${params.length+1})`); params.push(`%${search}%`); }
     if (exam) {
       if (exam === 'prelims' || exam === 'mains') {
@@ -195,7 +195,7 @@ class CurrentAffairsService {
     const [rows, countResult, prelimsResult, mainsResult, importantResult] = await Promise.all([
       this.db.query(
         `SELECT ca.id, ca.title, ca.summary, ca.full_content, ca.key_points, ca.exam_relevance, ca.important_facts,
-                ca.category, ca.date, ca.is_important, ca.exam_tags, ca.tags, ca.status,
+                ca.category, ca.categories, ca.date, ca.is_important, ca.exam_tags, ca.tags, ca.status,
                 ca.view_count, ca.bookmark_count, ca.created_at, ca.read_time,
                 ca.mcq_negative_marking_override, ca.mcq_marks_per_correct_override, ca.mcq_marks_per_wrong_override,
                 (SELECT COUNT(*) FROM ca_mcqs m WHERE m.affair_id=ca.id)::int AS mcq_count
@@ -237,6 +237,15 @@ class CurrentAffairsService {
     }, 'Success', paginationMeta(parseInt(countResult[0].count), Number(page), Number(limit)));
   }
 
+  // Multi-category support (QA issue 19): `categories` is the source of
+  // truth; the legacy single `category` column mirrors the first entry so
+  // older app builds and existing filters keep working.
+  private normalizeCategories(data: any): string[] | undefined {
+    if (data.categories === undefined) return undefined;
+    const arr = Array.isArray(data.categories) ? data.categories : [data.categories];
+    return [...new Set(arr.map((c: any) => String(c).trim()).filter(Boolean))].slice(0, 5) as string[];
+  }
+
   async adminCreate(data: any, adminId: string) {
     if (!data.title || !data.summary) throw new BadRequestException('Title and summary required');
     // Store type (prelims/mains/both) as the first exam_tag for easy filtering
@@ -244,11 +253,13 @@ class CurrentAffairsService {
     const typeTag = data.type || 'prelims';
     // Always ensure the type is in exam_tags as first element
     const mergedTags = [typeTag, ...examTagsWithType.filter((t: string) => !['prelims','mains','both'].includes(t))];
+    const categories = this.normalizeCategories(data)
+      ?? (data.category ? [String(data.category).trim()] : []);
     const result = await this.db.query(
       `INSERT INTO current_affairs
          (title, summary, full_content, key_points, exam_relevance, important_facts,
-          category, source, date, is_important, exam_tags, tags, status, author, read_time, created_by)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16) RETURNING *`,
+          category, categories, source, date, is_important, exam_tags, tags, status, author, read_time, created_by)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) RETURNING *`,
       [
         sanitizeCaInline(data.title),
         sanitizeCaInline(data.summary),
@@ -256,7 +267,7 @@ class CurrentAffairsService {
         data.keyPoints   ? sanitizeCaContent(data.keyPoints)   : null,
         data.examRelevance ? sanitizeCaContent(data.examRelevance) : null,
         data.importantFacts ? sanitizeCaContent(data.importantFacts) : null,
-        data.category, data.source,
+        categories[0] ?? data.category ?? null, categories, data.source,
         data.date||new Date().toISOString().split('T')[0],
         data.isImportant||false, mergedTags, data.tags||[],
         data.status||'draft', data.author, data.readTime||1, adminId,
@@ -281,6 +292,14 @@ class CurrentAffairsService {
           : (key === 'title' || key === 'summary') ? sanitizeCaInline(data[key])
           : data[key];
         fields.push(`${col}=$${i++}`); vals.push(val);
+      }
+    }
+    // Multi-category: categories drives, legacy category mirrors first entry
+    const cats = this.normalizeCategories(data);
+    if (cats !== undefined) {
+      fields.push(`categories=$${i++}`); vals.push(cats);
+      if (data.category === undefined) {
+        fields.push(`category=$${i++}`); vals.push(cats[0] ?? null);
       }
     }
     // Per-article MCQ marking override — sits alongside the global config.

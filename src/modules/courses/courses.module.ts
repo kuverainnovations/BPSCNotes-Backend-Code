@@ -146,7 +146,9 @@ export class CoursesRepository {
    FROM course_lessons cl
    WHERE cl.course_id = c.id
 ) AS total_lessons,
-                c.total_hours, c.rating, c.review_count,
+                CASE WHEN COALESCE(c.total_hours,0) > 0 THEN c.total_hours
+                     ELSE ROUND(COALESCE((SELECT SUM(cl_h.duration_mins) FROM course_lessons cl_h WHERE cl_h.course_id=c.id),0)/60.0, 1)
+                END AS total_hours, c.rating, c.review_count,
                 (
    SELECT COUNT(*)
    FROM user_enrollments ue2
@@ -179,7 +181,10 @@ export class CoursesRepository {
    SELECT COUNT(*)
    FROM course_lessons cl
    WHERE cl.course_id = c.id
-) AS total_lessons, c.total_hours, c.rating, c.review_count,
+) AS total_lessons,
+         CASE WHEN COALESCE(c.total_hours,0) > 0 THEN c.total_hours
+              ELSE ROUND(COALESCE((SELECT SUM(cl_h.duration_mins) FROM course_lessons cl_h WHERE cl_h.course_id=c.id),0)/60.0, 1)
+         END AS total_hours, c.rating, c.review_count,
          (
    SELECT COUNT(*)
    FROM user_enrollments ue2
@@ -1188,6 +1193,11 @@ export class CoursesService {
         COALESCE(e.completed_lessons,0) AS completed_lessons_count,
         e.last_studied_at, e.completed_at,
         (SELECT COUNT(*) FROM course_chapters WHERE course_id=c.id)::int AS total_chapters,
+        -- duplicate column name intentionally: pg maps by name, last wins,
+        -- so this computed fallback overrides c.total_hours from c.*
+        CASE WHEN COALESCE(c.total_hours,0) > 0 THEN c.total_hours
+             ELSE ROUND(COALESCE((SELECT SUM(cl_h.duration_mins) FROM course_lessons cl_h WHERE cl_h.course_id=c.id),0)/60.0, 1)
+        END AS total_hours,
         TRUE AS is_saved
       FROM course_saves cs
       JOIN courses c ON c.id = cs.course_id
