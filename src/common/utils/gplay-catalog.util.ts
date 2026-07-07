@@ -80,13 +80,21 @@ export async function syncCourseToPlayCatalog(course: CourseForSync): Promise<st
     await rawClient.request({
       url,
       method: 'PATCH',
-      params: { allowMissing: true, 'regionsVersion.version': regionsVersion },
+      params: {
+        allowMissing: true,
+        'regionsVersion.version': regionsVersion,
+        // Required by the API even when allowMissing creates the product
+        // (it's ignored on create, enforced on update). Must list ≥1 path
+        // or Google rejects with "update_mask must contain at least one
+        // path". These are the only fields this sync ever writes.
+        updateMask: 'listings,purchaseOptions',
+      },
       data: {
         packageName,
         productId,
         listings: [
           {
-            languageCode: 'en-US',
+            languageCode: 'en-GB',
             title: course.title.slice(0, 55),
             description: (course.description || course.title).slice(0, 200),
           },
@@ -160,13 +168,17 @@ export async function syncMaterialToPlayCatalog(material: MaterialForSync): Prom
     await rawClient.request({
       url,
       method: 'PATCH',
-      params: { allowMissing: true, 'regionsVersion.version': regionsVersion },
+      params: {
+        allowMissing: true,
+        'regionsVersion.version': regionsVersion,
+        updateMask: 'listings,purchaseOptions',
+      },
       data: {
         packageName,
         productId,
         listings: [
           {
-            languageCode: 'en-US',
+            languageCode: 'en-GB',
             title: material.title.slice(0, 55),
             description: (material.description || material.title).slice(0, 200),
           },
