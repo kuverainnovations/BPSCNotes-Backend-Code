@@ -41,6 +41,16 @@ class QuizzesService {
 
     if (type)    { conditions.push(`q.type=$${params.length + 1}`);            params.push(type); }
     if (subject) { conditions.push(`q.subject=$${params.length + 1}`);         params.push(subject); }
+    // today=true → only quizzes FOR today (dashboard "Today's Quizzes" rail).
+    // QA 09-Jul issue 3: without this, every old daily-type quiz showed there.
+    // scheduled_for is a DATE; for unscheduled quizzes fall back to the day
+    // the quiz was created, in IST (India-only app; server clock is UTC).
+    if (String(query.today).toLowerCase() === 'true') {
+      conditions.push(`(
+        (q.scheduled_for IS NOT NULL AND q.scheduled_for = (NOW() AT TIME ZONE 'Asia/Kolkata')::date)
+        OR (q.scheduled_for IS NULL AND (q.created_at AT TIME ZONE 'Asia/Kolkata')::date = (NOW() AT TIME ZONE 'Asia/Kolkata')::date)
+      )`);
+    }
     if (exam)    {
       // A quiz with an empty/null exam_tags array is a "general" quiz
       // meant for everyone. Filtering with `$X = ANY(exam_tags)` alone

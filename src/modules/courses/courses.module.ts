@@ -1353,7 +1353,13 @@ export class CoursesService {
   }
 
   private async invalidateCache() {
-    // Short TTL approach — production should use Redis SCAN for course:* keys
+    // Drop every cached course-list variant (same pattern enroll() uses).
+    // Without this, admin delete/update kept serving the old list for the
+    // full 120s TTL — QA saw deleted courses still visible in the app.
+    try {
+      const keys = await (this.cache.store as any).keys?.('courses:*') ?? [];
+      for (const k of keys) await this.cache.del(k);
+    } catch (_) {}
   }
 }
 

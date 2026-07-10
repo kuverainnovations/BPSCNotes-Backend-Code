@@ -923,13 +923,16 @@ class UsersService {
     const [userRow, subjectStats, recentQuizzes, weeklyActivity] = await Promise.all([
       // Fetch user-level stats so Android header (rank/accuracy/study) always has data
       this.db.query(
-        `SELECT streak, accuracy, rank, total_study_minutes, quizzes_attempted,
+        `-- "today" must be the INDIA day, not the UTC server day — with
+         -- CURRENT_DATE the counter reset at 5:30 AM IST and morning
+         -- sessions landed on "yesterday" (QA 09-Jul issues 13/14)
+         SELECT streak, accuracy, rank, total_study_minutes, quizzes_attempted,
                 COALESCE((
                   SELECT SUM(active_minutes)
                   FROM study_sessions
                   WHERE user_id=$1
-                    AND started_at >= CURRENT_DATE
-                    AND started_at <  CURRENT_DATE + INTERVAL '1 day'
+                    AND (started_at AT TIME ZONE 'Asia/Kolkata')::date
+                        = (NOW() AT TIME ZONE 'Asia/Kolkata')::date
                 ), 0)::int AS today_study_minutes
          FROM users WHERE id=$1`,
         [userId]
@@ -970,8 +973,8 @@ class UsersService {
       
          WITH days AS (
            SELECT generate_series(
-             CURRENT_DATE - INTERVAL '27 days',
-             CURRENT_DATE,
+             (NOW() AT TIME ZONE 'Asia/Kolkata')::date - INTERVAL '27 days',
+             (NOW() AT TIME ZONE 'Asia/Kolkata')::date,
              INTERVAL '1 day'
            )::DATE AS day
          ),
@@ -981,45 +984,50 @@ class UsersService {
            -- Convert seconds → minutes, cap each attempt at 30 min so retakes
            -- don't inflate the count (a 4-second speed-run counts as <1 min, not 5).
            SELECT
-             DATE(qa.attempted_at) AS date,
+             DATE(qa.attempted_at AT TIME ZONE 'Asia/Kolkata') AS date,
              SUM(LEAST(CEIL(qa.time_taken_secs::numeric / 60), 30))::int AS study_mins
            FROM quiz_attempts qa
            WHERE qa.user_id = $1
              AND qa.attempted_at >= NOW() - INTERVAL '28 days'
              AND qa.total_questions > 0
-           GROUP BY DATE(qa.attempted_at)
+           GROUP BY DATE(qa.attempted_at AT TIME ZONE 'Asia/Kolkata')
          ),
       
          session_activity AS (
+           -- active_minutes, NOT duration_minutes: duration_minutes is only
+           -- written at clean session end — a session whose app was killed
+           -- stays NULL and NEVER showed in the graph, and in-progress
+           -- sessions showed 0 (QA 09-Jul: "graph not updating").
+           -- Day bucket in IST to match the today counter.
            SELECT
-             DATE(ss.started_at) AS date,
-             COALESCE(SUM(ss.duration_minutes), 0) AS study_mins
+             DATE(ss.started_at AT TIME ZONE 'Asia/Kolkata') AS date,
+             COALESCE(SUM(ss.active_minutes), 0) AS study_mins
            FROM study_sessions ss
            WHERE ss.user_id = $1
              AND ss.started_at >= NOW() - INTERVAL '28 days'
-           GROUP BY DATE(ss.started_at)
+           GROUP BY DATE(ss.started_at AT TIME ZONE 'Asia/Kolkata')
          ),
 
          ca_reading_activity AS (
            -- Current affairs reading time (logged by Android TrackStudyTime)
            SELECT
-             DATE(ca.created_at) AS date,
+             DATE(ca.created_at AT TIME ZONE 'Asia/Kolkata') AS date,
              CEIL(SUM(ca.duration_secs)::numeric / 60)::int AS study_mins
            FROM ca_activity ca
            WHERE ca.user_id = $1
              AND ca.created_at >= NOW() - INTERVAL '28 days'
-           GROUP BY DATE(ca.created_at)
+           GROUP BY DATE(ca.created_at AT TIME ZONE 'Asia/Kolkata')
          ),
 
          ca_mcq_activity AS (
            -- CA MCQ quiz time: estimate 2 min per attempt (no time_taken_secs stored)
            SELECT
-             DATE(cma.attempted_at) AS date,
+             DATE(cma.attempted_at AT TIME ZONE 'Asia/Kolkata') AS date,
              (COUNT(*) * 2)::int    AS study_mins
            FROM ca_mcq_attempts cma
            WHERE cma.user_id = $1
              AND cma.attempted_at >= NOW() - INTERVAL '28 days'
-           GROUP BY DATE(cma.attempted_at)
+           GROUP BY DATE(cma.attempted_at AT TIME ZONE 'Asia/Kolkata')
          ),
 
          lesson_activity AS (
@@ -1030,12 +1038,12 @@ class UsersService {
            -- and completed_at is updated each time a lesson is marked
            -- complete, so attribute that lesson's watch time to that day.
            SELECT
-             DATE(lp.completed_at) AS date,
+             DATE(lp.completed_at AT TIME ZONE 'Asia/Kolkata') AS date,
              CEIL(SUM(lp.watch_time_secs)::numeric / 60)::int AS study_mins
            FROM lesson_progress lp
            WHERE lp.user_id = $1
              AND lp.completed_at >= NOW() - INTERVAL '28 days'
-           GROUP BY DATE(lp.completed_at)
+           GROUP BY DATE(lp.completed_at AT TIME ZONE 'Asia/Kolkata')
          ),
 
          combined AS (
@@ -1130,7 +1138,11 @@ class UsersService {
         orderBy = 'u.rank ASC NULLS LAST, u.coins DESC';
     }
 
-    const baseSelect = `SELECT u.id, u.name, u.avatar_url, u.primary_exam,
+    // user_id alias: the app's DTO reads "user_id" and compares each row
+    // against myRank.user_id to place the "YOU" chip. Returning bare "id"
+    // made every row deserialize to the same empty user_id, so EVERY row
+    // showed "YOU" (QA 09-Jul, seen in issue 14 screenshots).
+    const baseSelect = `SELECT u.id AS user_id, u.name, u.avatar_url, u.primary_exam,
       u.streak, u.accuracy, u.rank, u.coins, u.total_study_minutes, u.quizzes_attempted${selectExtra}
       FROM users u WHERE u.status='active' AND u.deleted_at IS NULL ${examClause}
       ORDER BY ${orderBy} LIMIT 100`;
@@ -1138,7 +1150,7 @@ class UsersService {
     const [rows, myRank] = await Promise.all([
       this.db.query(baseSelect, examParams),
       this.db.query(
-        `SELECT u.rank, u.coins, u.streak, u.accuracy, u.total_study_minutes,
+        `SELECT u.id AS user_id, u.rank, u.coins, u.streak, u.accuracy, u.total_study_minutes,
           COALESCE((SELECT SUM(ct.amount) FROM coin_transactions ct
             WHERE ct.user_id=u.id AND ct.type='earned'
               AND ct.created_at >= date_trunc('week', NOW())), 0)::int AS weekly_coins
