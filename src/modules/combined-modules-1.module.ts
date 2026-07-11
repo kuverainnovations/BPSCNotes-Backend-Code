@@ -27,6 +27,7 @@ import { JwtAuthGuard, AdminJwtGuard, PermissionGuard, RequirePermission, Public
 import { PaginationDto } from '../common/dtos/pagination.dto';
 import { successResponse, paginationMeta } from '../common/utils/response.util';
 import { streamArticlePdf } from '../common/utils/article-pdf-generator.util';
+import { getOneTimeProductPurchase } from '../common/utils/gplay-purchase.util';
 import { AuthService } from './auth/auth.module';
 import { ensureFirebaseAdmin } from '../common/firebase/firebase-admin';
 
@@ -1297,6 +1298,34 @@ export class JobsModule {}
 // ════════════════════════════════════════════════════════════
 // SUBSCRIPTIONS MODULE
 // ════════════════════════════════════════════════════════════
+// ── Google Pub/Sub push OIDC verification (for the RTDN webhook) ──────
+// Proves an inbound RTDN genuinely came from Google by validating the OIDC
+// JWT Google attaches to each push (signature, expiry, issuer, audience, and
+// optionally the pushing service-account email). Returns true only if valid.
+async function verifyPubSubPushOidc(
+  authorizationHeader: string | undefined,
+  expectedAudience: string,
+  expectedEmail?: string,
+): Promise<boolean> {
+  const token = authorizationHeader?.startsWith('Bearer ')
+    ? authorizationHeader.slice(7).trim()
+    : '';
+  if (!token) return false;
+  try {
+    const { OAuth2Client } = await import('google-auth-library');
+    const client = new OAuth2Client();
+    const ticket = await client.verifyIdToken({ idToken: token, audience: expectedAudience });
+    const payload = ticket.getPayload();
+    if (!payload) return false;
+    if (payload.iss !== 'https://accounts.google.com' && payload.iss !== 'accounts.google.com') return false;
+    if (expectedEmail && (payload.email !== expectedEmail || payload.email_verified !== true)) return false;
+    return true;
+  } catch (e: any) {
+    console.warn('GPlay RTDN OIDC verify error:', e?.message);
+    return false;
+  }
+}
+
 @Injectable()
 class SubscriptionsService {
   private readonly PLANS = {
@@ -1697,30 +1726,27 @@ class SubscriptionsService {
       throw new BadRequestException('Payment verification not configured. Contact support.');
     }
 
-    let packageName: string;
+    // packageName from env; fallback matches the current applicationId in
+    // app/build.gradle.kts (com.bpscnotes.app) — verify against Play Console.
+    const packageName = process.env.ANDROID_PACKAGE_NAME || 'com.bpscnotes.app';
+    let androidpublisher: any;
+    let purchaseData: any;
     try {
       const { google } = await import('googleapis');
       const auth = new google.auth.GoogleAuth({
         credentials: JSON.parse(serviceAccountJson),
         scopes: ['https://www.googleapis.com/auth/androidpublisher'],
       });
-      const androidpublisher = google.androidpublisher({ version: 'v3', auth });
-
-      // packageName from env; fallback matches the current applicationId in
-      // app/build.gradle.kts (com.bpscnotes.app, per "Package name changed"
-      // commit 72256c9) — verify against Play Console before relying on it,
-      // applicationId has changed before and this fallback drifted silently
-      // out of sync with it last time.
-      packageName = process.env.ANDROID_PACKAGE_NAME || 'com.bpscnotes.app';
+      androidpublisher = google.androidpublisher({ version: 'v3', auth });
 
       const response = await androidpublisher.purchases.subscriptionsv2.get({
         packageName,
         token: purchaseToken,
       });
 
-      const purchase = response.data;
+      purchaseData = response.data;
       // subscriptionState: SUBSCRIPTION_STATE_ACTIVE | SUBSCRIPTION_STATE_PENDING | etc.
-      const state = purchase.subscriptionState;
+      const state = purchaseData.subscriptionState;
       if (state !== 'SUBSCRIPTION_STATE_ACTIVE' && state !== 'SUBSCRIPTION_STATE_PENDING') {
         throw new BadRequestException(`Play purchase not active (state: ${state})`);
       }
@@ -1730,15 +1756,49 @@ class SubscriptionsService {
       throw new BadRequestException('Google Play purchase verification failed. Contact support.');
     }
 
-    // Map productId → plan key
+    // ── Resolve the plan STRICTLY from Google's verified response ──────
+    // SECURITY: previously this was `planKey || planMap[productId] || 'monthly'`,
+    // both client-supplied — a user could buy the cheapest plan and claim
+    // planKey:'annual' to get an annual entitlement + annual bonus coins for
+    // the monthly price. The plan MUST come from what Google says was actually
+    // purchased: lineItems[].productId / offerDetails.basePlanId. The client
+    // `planKey`/`productId` are used only to log a mismatch, never to decide.
     const planMap: Record<string, string> = {
       'bpscnotes_monthly':   'monthly',
       'bpscnotes_quarterly': 'quarterly',
       'bpscnotes_annual':    'annual',
     };
-    const resolvedPlan = planKey || planMap[productId] || 'monthly';
+    const lineItem         = purchaseData?.lineItems?.[0];
+    const googleProductId  = lineItem?.productId;
+    const googleBasePlanId = lineItem?.offerDetails?.basePlanId;
+    let resolvedPlan: string | undefined =
+      planMap[googleProductId] ||
+      planMap[googleBasePlanId] ||
+      (this.PLANS[googleBasePlanId] ? googleBasePlanId : undefined) ||
+      (this.PLANS[googleProductId] ? googleProductId : undefined);
+
+    if (!resolvedPlan) {
+      // Google's product/base-plan naming doesn't match planMap/PLANS. Do NOT
+      // fall back to the client's claim (that's the vulnerability). Fall back
+      // to the cheapest plan as a safe floor (never over-credits) and log
+      // loudly so the mapping can be corrected. See report: verify your Play
+      // Console subscription product & base-plan IDs against planMap above.
+      console.error(
+        `GPlay sub: could not resolve plan from Google response ` +
+        `(productId=${googleProductId} basePlanId=${googleBasePlanId}); ` +
+        `defaulting to 'monthly'. Update planMap to match Play Console.`
+      );
+      resolvedPlan = 'monthly';
+    }
+    if ((planKey && planKey !== resolvedPlan) || (productId && planMap[productId] && planMap[productId] !== resolvedPlan)) {
+      console.warn(
+        `GPlay sub plan mismatch (possible spoof attempt): client claimed ` +
+        `planKey=${planKey} productId=${productId} but Google says ` +
+        `productId=${googleProductId} basePlanId=${googleBasePlanId} → crediting '${resolvedPlan}'`
+      );
+    }
     const plan = this.PLANS[resolvedPlan];
-    if (!plan) throw new BadRequestException('Unknown plan mapping for productId');
+    if (!plan) throw new BadRequestException('Could not determine subscription plan from Google Play.');
 
     const endsAt = new Date();
     if (resolvedPlan === 'monthly')   endsAt.setMonth(endsAt.getMonth() + 1);
@@ -1781,6 +1841,28 @@ class SubscriptionsService {
 
     await this.cache.del(`user:${userId}`);
 
+    // ── Acknowledge the purchase — REQUIRED within 3 days or Google
+    // automatically refunds it and revokes the entitlement. Best-effort:
+    // a failure here must not undo the entitlement we just granted, so it's
+    // logged (not thrown) for a reconciliation job / manual retry to catch.
+    try {
+      if (purchaseData?.acknowledgementState !== 'ACKNOWLEDGEMENT_STATE_ACKNOWLEDGED' && googleProductId) {
+        await androidpublisher.purchases.subscriptions.acknowledge({
+          packageName,
+          subscriptionId: googleProductId,
+          token: purchaseToken,
+          requestBody: {},
+        });
+        console.log(`GPlay sub acknowledged: user=${userId} plan=${resolvedPlan}`);
+      }
+    } catch (ackErr: any) {
+      console.error(
+        `GPlay sub ACKNOWLEDGE FAILED (Google may auto-refund in 3 days): ` +
+        `user=${userId} plan=${resolvedPlan} token=${purchaseToken}`,
+        ackErr?.response?.data ?? ackErr?.message ?? ackErr,
+      );
+    }
+
     this.notifService?.pushToUser(
       userId,
       '🎉 BPSCNotes Pro Activated!',
@@ -1795,7 +1877,29 @@ class SubscriptionsService {
   // Google sends these server-to-server (pubsub push or direct HTTP).
   // No auth header — Google signs via the X-Goog-Signature header but we
   // validate via Pub/Sub message schema + purchaseToken re-verification instead.
-  async handleGPlayWebhook(body: any) {
+  async handleGPlayWebhook(body: any, req?: any) {
+    // ── Authenticate the push request ──────────────────────────────
+    // Google signs each RTDN push with an OIDC JWT (Authorization: Bearer …)
+    // whose audience & service-account email you set on the Pub/Sub push
+    // subscription. When GPLAY_RTDN_AUDIENCE is configured we ENFORCE it and
+    // reject anything unsigned/forged. Even before it's configured, every
+    // state change below is independently re-verified against Google's own
+    // API, so a forged body still cannot mutate anything.
+    const expectedAudience = process.env.GPLAY_RTDN_AUDIENCE;
+    if (expectedAudience) {
+      const ok = await verifyPubSubPushOidc(
+        req?.headers?.authorization,
+        expectedAudience,
+        process.env.GPLAY_RTDN_SA_EMAIL,
+      );
+      if (!ok) {
+        console.warn('GPlay RTDN: rejected — OIDC verification failed');
+        return { status: 'unauthorized' };
+      }
+    } else {
+      console.warn('GPlay RTDN: GPLAY_RTDN_AUDIENCE not set — configure it to enforce Pub/Sub OIDC. Relying on Google re-verification only for now.');
+    }
+
     try {
       // Pub/Sub push format: { message: { data: base64(json) } }
       let notification: any = body;
@@ -1881,16 +1985,34 @@ class SubscriptionsService {
             [purchaseToken]
           );
           if (purchase) {
-            await this.db.query(
-              `UPDATE course_purchases SET status='refunded', updated_at=NOW() WHERE id=$1`,
-              [purchase.id]
-            );
-            await this.db.query(
-              `DELETE FROM user_enrollments WHERE user_id=$1 AND course_id=$2`,
-              [purchase.user_id, purchase.course_id]
-            );
-            await this.cache.del(`user:${purchase.user_id}`);
-            console.log(`GPlay RTDN: course purchase ${purchase.id} voided (refundType=${refundType}), access revoked`);
+            // SECURITY: re-verify with Google before the destructive revoke.
+            // A forged voided-purchase webhook must never be able to wipe a
+            // paying user's enrollment/progress — Google's own API is the
+            // authority here, not the request body.
+            let confirmedVoided = false;
+            try {
+              const p = await getOneTimeProductPurchase(purchaseToken);
+              confirmedVoided = p.purchaseState !== 'PURCHASED';
+            } catch (e: any) {
+              // A genuinely refunded/expired token may no longer resolve —
+              // that is itself consistent with a real void, so treat as voided.
+              confirmedVoided = true;
+              console.warn(`GPlay RTDN void re-verify: token no longer resolvable, treating as voided (${e?.message})`);
+            }
+            if (!confirmedVoided) {
+              console.warn(`GPlay RTDN: void for token still PURCHASED at Google — ignoring as likely forged`);
+            } else {
+              await this.db.query(
+                `UPDATE course_purchases SET status='refunded', updated_at=NOW() WHERE id=$1`,
+                [purchase.id]
+              );
+              await this.db.query(
+                `DELETE FROM user_enrollments WHERE user_id=$1 AND course_id=$2`,
+                [purchase.user_id, purchase.course_id]
+              );
+              await this.cache.del(`user:${purchase.user_id}`);
+              console.log(`GPlay RTDN: course purchase ${purchase.id} voided (refundType=${refundType}), access revoked`);
+            }
           }
         }
         // productType 1 (subscription) voided purchases aren't separately
@@ -2004,8 +2126,8 @@ class WebhookController {
   @Public()
   @Post('gplay')
   @HttpCode(200)
-  gplay(@Body() body: any) {
-    return this.s.handleGPlayWebhook(body);
+  gplay(@Req() req: any, @Body() body: any) {
+    return this.s.handleGPlayWebhook(body, req);
   }
 }
 

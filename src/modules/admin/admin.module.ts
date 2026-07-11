@@ -1067,14 +1067,21 @@ class PaymentSettingsService {
 class AdminPaymentSettingsController {
   constructor(private s: PaymentSettingsService) {}
 
+  // SECURITY: these routes read/overwrite live payment-gateway credentials
+  // and issue real refunds. Every one must carry an explicit permission —
+  // without @RequirePermission the PermissionGuard lets ANY authenticated
+  // admin (e.g. a content moderator) through.
   @Get('payment')
+  @RequirePermission('subscriptions')
   getSettings() { return this.s.getSettings(); }
 
   @Post('payment')
+  @RequirePermission('subscriptions')
   @HttpCode(200)
   saveSettings(@Body() dto: any) { return this.s.saveSettings(dto); }
 
   @Get('payment/revenue')
+  @RequirePermission('subscriptions')
   getRevenue() { return this.s.getRevenueStats(); }
 
   @Get('analytics/summary')
@@ -1084,6 +1091,7 @@ class AdminPaymentSettingsController {
   }
 
   @Post('subscriptions/:id/refund')
+  @RequirePermission('subscriptions')
   @HttpCode(200)
   refund(@Param('id', ParseUUIDPipe) id: string) { return this.s.refundSubscription(id); }
 }

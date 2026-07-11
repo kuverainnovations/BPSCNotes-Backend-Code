@@ -48,12 +48,60 @@ import { AppModule } from './app.module';
 //      Nginx adds ZERO CORS headers (see proxy_params.conf).
 // ════════════════════════════════════════════════════════════
 
+// ════════════════════════════════════════════════════════════
+// JWT secret validation — HARD FAIL in production
+//
+// The tokens are HS256. A weak/guessable/shared secret lets anyone forge
+// user tokens ({userId}) AND admin tokens ({adminId}) → total takeover.
+// In production we REFUSE TO BOOT rather than run with an insecure secret.
+// In non-production we only warn so local development isn't blocked.
+//
+// Generate strong secrets (one per type) with:
+//   node -e "console.log(require('crypto').randomBytes(48).toString('base64url'))"
+// ════════════════════════════════════════════════════════════
+function validateJwtSecrets() {
+  const isProd = process.env.NODE_ENV === 'production';
+  const required = ['JWT_SECRET', 'JWT_REFRESH_SECRET', 'ADMIN_JWT_SECRET'];
+  const knownWeak = new Set([
+    'secret', 'secret123', 'changeme', 'change_this', 'password', 'test',
+    'CHANGE_THIS_TO_64_CHAR_RANDOM_STRING_IN_PRODUCTION',
+    'CHANGE_THIS_TO_ANOTHER_64_CHAR_RANDOM_STRING',
+    'CHANGE_THIS_TO_YET_ANOTHER_64_CHAR_RANDOM_STRING',
+  ]);
+
+  const problems: string[] = [];
+  for (const name of required) {
+    const v = process.env[name];
+    if (!v)                    { problems.push(`${name} is not set`); continue; }
+    if (v.length < 32)          problems.push(`${name} is too short (${v.length} chars — need at least 32)`);
+    if (knownWeak.has(v))       problems.push(`${name} is a known-weak / placeholder value`);
+  }
+  // Distinctness: reusing one value across user/refresh/admin means a single
+  // leak compromises all three token types at once.
+  const values = required.map(n => process.env[n]).filter(Boolean) as string[];
+  if (values.length === required.length && new Set(values).size !== values.length) {
+    problems.push('JWT secrets must be DISTINCT from each other (the same value is reused across user/refresh/admin)');
+  }
+
+  if (problems.length === 0) return;
+
+  const report = `Insecure JWT configuration:\n  - ${problems.join('\n  - ')}`;
+  if (isProd) {
+    console.error(
+      `\n❌ REFUSING TO START — ${report}\n\n` +
+      `Set strong, distinct secrets in the server environment. Generate each with:\n` +
+      `  node -e "console.log(require('crypto').randomBytes(48).toString('base64url'))"\n`,
+    );
+    process.exit(1);
+  }
+  console.warn(`\n⚠️  ${report}\n(Permitted in non-production only — DO NOT ship this to production.)\n`);
+}
+
 async function bootstrap() {
   const logger = new Logger('Bootstrap');
 
-  // ── Validate required secrets (warn only — don't exit) ────
-  if (!process.env.JWT_SECRET)       console.warn('WARNING: JWT_SECRET not set');
-  if (!process.env.ADMIN_JWT_SECRET) console.warn('WARNING: ADMIN_JWT_SECRET not set');
+  // ── Validate JWT secrets — hard-fails in production on weak/shared values ──
+  validateJwtSecrets();
 
   const app = await NestFactory.create<NestExpressApplication>(AppModule, {
     logger: ['error', 'warn', 'log'],

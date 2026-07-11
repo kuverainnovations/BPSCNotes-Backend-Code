@@ -85,24 +85,16 @@ export async function createCashfreeOrder(
     ...(req.notifyUrl ? { order_meta: { notify_url: req.notifyUrl, ...req.orderMeta } } : {}),
   };
 
-  console.log("========== CASHFREE ==========");
-console.log("URL:", `${baseUrl(creds.env)}/orders`);
-console.log("ENV:", creds.env);
-console.log("APP_ID:", creds.appId);
-console.log("SECRET_PREFIX:", creds.secretKey.substring(0, 10));
-console.log("BODY:", JSON.stringify(body, null, 2));
-console.log("==============================");
-
-const res = await fetch(`${baseUrl(creds.env)}/orders`, {
+  // NOTE: never log `body` (contains customer phone/email), `creds`
+  // (secret key), or the raw response — these end up in container logs and
+  // any downstream aggregator. Log only non-sensitive identifiers.
+  const res = await fetch(`${baseUrl(creds.env)}/orders`, {
     method:  'POST',
     headers: headers(creds),
     body:    JSON.stringify(body),
   });
 
   const data = await res.json();
-
-  console.log("STATUS:", res.status);
-console.log("RESPONSE:", JSON.stringify(data, null, 2));
 
   if (!res.ok || !data.payment_session_id) {
     const msg = data?.message || data?.error_detail?.error_reason || JSON.stringify(data);
@@ -140,22 +132,12 @@ export async function verifyCashfreePayment(
   orderId: string,
 ): Promise<CashfreePaymentDetail> {
 
-  console.log("========== VERIFY PAYMENT ==========");
-  console.log("VERIFY URL:", `${baseUrl(creds.env)}/orders/${orderId}/payments`);
-  console.log("ENV:", creds.env);
-  console.log("ORDER ID:", orderId);
-
   const res = await fetch(`${baseUrl(creds.env)}/orders/${orderId}/payments`, {
     method: "GET",
     headers: headers(creds),
   });
 
-  console.log("VERIFY HTTP STATUS:", res.status);
-
   const data = await res.json();
-
-  console.log("VERIFY RESPONSE:");
-  console.log(JSON.stringify(data, null, 2));
 
   if (!res.ok) {
     const msg = data?.message || JSON.stringify(data);
@@ -281,12 +263,7 @@ export function buildCashfreeCredentials(overrides: {
   env?: string;
 }): CashfreeCredentials {
 
-  console.log("========== BUILD CASHFREE CREDS ==========");
-  console.log("OVERRIDES:", overrides);
-  console.log("ENV FILE APP_ID:", process.env.CASHFREE_APP_ID);
-  console.log("ENV FILE SECRET:", process.env.CASHFREE_SECRET_KEY?.substring(0, 10));
-  console.log("ENV FILE ENV:", process.env.CASHFREE_ENV);
-
+  // NOTE: credentials (app id / secret key) must never be logged.
   const appId =
     overrides.appId || process.env.CASHFREE_APP_ID || "";
 
@@ -296,11 +273,6 @@ export function buildCashfreeCredentials(overrides: {
   const env =
     (overrides.env || process.env.CASHFREE_ENV || "sandbox") as
       "sandbox" | "production";
-
-  console.log("FINAL APP_ID:", appId);
-  console.log("FINAL SECRET:", secretKey.substring(0, 10));
-  console.log("FINAL ENV:", env);
-  console.log("=========================================");
 
   return {
     appId,
