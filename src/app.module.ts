@@ -41,6 +41,7 @@ import { AchievementsModule } from './modules/achievements/achievements.module';
 import { StudyMaterialsModule } from '@modules/study-materials/study-materials.module';
 import { MaterialChatModule } from '@modules/study-materials/material-chat.module';
 import { MarketplaceModule }   from './modules/marketplace.module';
+import { AnswerWritingModule } from './modules/answer-writing/answer-writing.module';
 
 @Module({
   imports: [
@@ -143,6 +144,7 @@ import { MarketplaceModule }   from './modules/marketplace.module';
     StudyMaterialsModule,
     MaterialChatModule,
     MarketplaceModule,
+    AnswerWritingModule,
     CoinsModule,
     SearchModule,
     BookmarksModule,
