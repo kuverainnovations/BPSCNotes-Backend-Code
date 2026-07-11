@@ -187,7 +187,8 @@ export class CoinsService implements OnModuleInit {
   async getBalance(userId: string) {
     const [user] = await this.db.query(`
       SELECT coins, total_coins_earned, last_active_at,
-             streak, COALESCE(last_check_in_date, NULL) AS last_check_in
+             streak, COALESCE(streak_freezes, 0) AS streak_freezes,
+             COALESCE(last_check_in_date, NULL) AS last_check_in
       FROM users WHERE id = $1
     `, [userId]);
 
@@ -255,6 +256,7 @@ export class CoinsService implements OnModuleInit {
       totalSpent:        totalSpent[0]?.spent ?? 0,
       check_in_streak:   streak,        // snake_case → matches Android @SerializedName("check_in_streak")
       checked_in_today:  checkedInToday,// snake_case → matches Android @SerializedName("checked_in_today")
+      streak_freezes:    Number(user.streak_freezes) || 0,
       checkInDays,
     });
   }
@@ -341,6 +343,8 @@ export class CoinsService implements OnModuleInit {
           WHEN 'streak_30'           THEN '30-day streak bonus'
           WHEN 'mock_top10'          THEN 'Top 10 in mock test'
           WHEN 'subscription_bonus'  THEN 'Subscription bonus'
+          WHEN 'content_unlock'      THEN 'Premium content unlocked'
+          WHEN 'store_redeem'        THEN 'Coin Store redemption'
           ELSE description
         END                  AS subtitle,
         amount               AS coins,
@@ -389,11 +393,30 @@ export class CoinsService implements OnModuleInit {
     const yesterdayStr = yesterday.toISOString().slice(0, 10);
 
     const [user] = await this.db.query(
-      `SELECT coins, total_coins_earned, streak, COALESCE(last_check_in_date, NULL) AS lci FROM users WHERE id=$1`,
+      `SELECT coins, total_coins_earned, streak, COALESCE(streak_freezes, 0) AS streak_freezes,
+              COALESCE(last_check_in_date, NULL) AS lci FROM users WHERE id=$1`,
       [userId]
     );
     const lastDate = user.lci ? new Date(user.lci).toISOString().slice(0, 10) : null;
-    const newStreak = lastDate === yesterdayStr ? (user.streak ?? 0) + 1 : 1;
+
+    // Streak Freeze (Coin Store item): if the streak would break and the
+    // user holds a freeze, consume exactly one and keep the streak alive.
+    // A freeze covers any gap — it "freezes" the streak at its last value,
+    // and today's check-in extends it as if no day was missed.
+    let freezeUsed = false;
+    let newStreak: number;
+    if (lastDate === yesterdayStr) {
+      newStreak = (user.streak ?? 0) + 1;
+    } else if (lastDate && (user.streak ?? 0) > 0 && Number(user.streak_freezes) > 0) {
+      freezeUsed = true;
+      newStreak  = (user.streak ?? 0) + 1;
+      await this.db.query(
+        `UPDATE users SET streak_freezes = streak_freezes - 1 WHERE id = $1 AND streak_freezes > 0`,
+        [userId]
+      );
+    } else {
+      newStreak = 1;
+    }
 
     // Day 7 bonus or normal reward — ladder is admin-editable
     const economy   = await readEconomySettings(this.db, this.cache);
@@ -424,9 +447,11 @@ export class CoinsService implements OnModuleInit {
       VALUES ($1, 'earned', $2, $3, 'daily_checkin', $4)
     `, [userId, coinsEarned, `Daily Check-in — Day ${newStreak}`, balance]);
 
-    const message = newStreak === 7
-      ? `🎉 7-day streak! Bonus +${coinsEarned} coins!`
-      : `✅ Day ${newStreak} check-in! +${coinsEarned} coins`;
+    const message = freezeUsed
+      ? `🧊 Streak Freeze used — your ${newStreak}-day streak is safe! +${coinsEarned} coins`
+      : newStreak === 7
+        ? `🎉 7-day streak! Bonus +${coinsEarned} coins!`
+        : `✅ Day ${newStreak} check-in! +${coinsEarned} coins`;
 
     return successResponse({
       balance,
@@ -434,6 +459,7 @@ export class CoinsService implements OnModuleInit {
       check_in_streak:   newStreak,   // snake_case → Android @SerializedName("check_in_streak")
       checked_in_today:  true,        // snake_case → Android @SerializedName("checked_in_today")
       coinsEarned,
+      streak_freeze_used: freezeUsed,
     }, message);
   }
 
@@ -577,33 +603,53 @@ export class CoinsService implements OnModuleInit {
 
   // ── Coin Store ───────────────────────────────────────────────
 
+  /** How many streak freezes a user may hold at once. */
+  private static readonly MAX_STREAK_FREEZES = 2;
+
   async getStoreItems(userId: string) {
     const items = await this.db.query(`
       SELECT id, title, description, coin_cost, item_type, item_value, icon_url, stock, sort_order
       FROM coin_store_items WHERE is_active = TRUE ORDER BY sort_order ASC
     `);
-    const [{ balance }] = await this.db.query(`SELECT COALESCE(SUM(amount),0)::int AS balance FROM coin_transactions WHERE user_id=$1`, [userId]);
-    return successResponse({ items, balance: +balance });
+    // users.coins is the single source of truth for balance (same as getBalance)
+    const [u] = await this.db.query(`SELECT coins, COALESCE(streak_freezes,0) AS streak_freezes FROM users WHERE id=$1`, [userId]);
+    return successResponse({
+      items,
+      balance:         u?.coins ?? 0,
+      streak_freezes:  Number(u?.streak_freezes) || 0,
+    });
   }
 
   async redeemStoreItem(userId: string, itemId: string) {
     const [item] = await this.db.query(
       `SELECT * FROM coin_store_items WHERE id=$1 AND is_active=TRUE LIMIT 1`, [itemId]
     );
-    if (!item) throw new (await import('@nestjs/common')).NotFoundException('Item not found');
-
-    const [{ balance }] = await this.db.query(
-      `SELECT COALESCE(SUM(amount),0)::int AS balance FROM coin_transactions WHERE user_id=$1`, [userId]
-    );
-    if (+balance < item.coin_cost)
-      throw new (await import('@nestjs/common')).BadRequestException('Insufficient coins');
+    if (!item) throw new NotFoundException('Item not found');
 
     if (item.stock !== null && item.stock <= 0)
-      throw new (await import('@nestjs/common')).BadRequestException('Item out of stock');
+      throw new BadRequestException('Item out of stock');
+
+    // Streak freezes are capped — no point hoarding more than the max.
+    if (item.item_type === 'streak_freeze') {
+      const [u] = await this.db.query(`SELECT COALESCE(streak_freezes,0) AS sf FROM users WHERE id=$1`, [userId]);
+      if (Number(u?.sf) >= CoinsService.MAX_STREAK_FREEZES) {
+        throw new BadRequestException(`You already hold the maximum of ${CoinsService.MAX_STREAK_FREEZES} Streak Freezes.`);
+      }
+    }
+
+    // Atomic deduction — only succeeds if the user still has enough coins,
+    // so concurrent redeems can't double-spend (same pattern as course purchase).
+    const [deducted] = await this.db.query(
+      `UPDATE users SET coins = COALESCE(coins,0) - $1 WHERE id=$2 AND COALESCE(coins,0) >= $1 RETURNING coins`,
+      [item.coin_cost, userId]
+    );
+    if (!deducted.length) throw new BadRequestException('Insufficient coins');
+    const newBalance = Number(deducted[0].coins) || 0;
 
     await this.db.query(
-      `INSERT INTO coin_transactions(user_id,amount,action,description) VALUES($1,$2,'store_redeem',$3)`,
-      [userId, -item.coin_cost, `Redeemed: ${item.title}`]
+      `INSERT INTO coin_transactions (user_id, type, amount, description, action, balance)
+       VALUES ($1, 'spent', $2, $3, 'store_redeem', $4)`,
+      [userId, item.coin_cost, `Redeemed: ${item.title}`, newBalance]
     );
     await this.db.query(
       `INSERT INTO coin_redemptions(user_id,item_id,coins_spent) VALUES($1,$2,$3)`,
@@ -612,10 +658,102 @@ export class CoinsService implements OnModuleInit {
     if (item.stock !== null) {
       await this.db.query(`UPDATE coin_store_items SET stock=stock-1 WHERE id=$1`, [itemId]);
     }
-    const [{ newBalance }] = await this.db.query(
-      `SELECT COALESCE(SUM(amount),0)::int AS "newBalance" FROM coin_transactions WHERE user_id=$1`, [userId]
+
+    // Item-type side effects
+    let streakFreezes: number | undefined;
+    if (item.item_type === 'streak_freeze') {
+      const grant = Math.max(1, parseInt(item.item_value, 10) || 1);
+      const [u] = await this.db.query(
+        `UPDATE users SET streak_freezes = LEAST(COALESCE(streak_freezes,0) + $1, $2)
+         WHERE id=$3 RETURNING streak_freezes`,
+        [grant, CoinsService.MAX_STREAK_FREEZES, userId]
+      );
+      streakFreezes = Number(u[0]?.streak_freezes) || 0;
+    }
+
+    return successResponse({
+      balance: newBalance,
+      item: { id: item.id, title: item.title, itemType: item.item_type, itemValue: item.item_value },
+      ...(streakFreezes !== undefined ? { streak_freezes: streakFreezes } : {}),
+    }, 'Redeemed successfully! 🎉');
+  }
+
+  // ── Coin Unlocks — spend coins to permanently unlock premium content ──
+  //
+  // POST /coins/unlock {contentType:'quiz', contentId}
+  // Currently only quizzes (covers mock tests / topic quizzes / daily
+  // quizzes — they all live in the `quizzes` table); content_type is kept
+  // generic so study materials or notes can plug in later without a new
+  // table. Unlocks are permanent and idempotent — re-unlocking an owned
+  // item never charges twice.
+
+  async unlockContent(userId: string, contentType: string, contentId: string) {
+    if (contentType !== 'quiz') {
+      throw new BadRequestException(`Unsupported content type '${contentType}'`);
+    }
+    const [quiz] = await this.db.query(
+      `SELECT id, title, COALESCE(unlock_cost_coins,0) AS cost
+       FROM quizzes WHERE id=$1 AND status='published'`,
+      [contentId]
     );
-    return successResponse({ balance: +newBalance, item: { id: item.id, title: item.title, itemType: item.item_type, itemValue: item.item_value } }, 'Redeemed successfully! 🎉');
+    if (!quiz) throw new NotFoundException('Quiz not found');
+
+    const cost = Number(quiz.cost) || 0;
+    const [u]  = await this.db.query(`SELECT coins FROM users WHERE id=$1`, [userId]);
+    if (cost <= 0) {
+      // Free content — nothing to unlock
+      return successResponse({ unlocked: true, alreadyUnlocked: true, balance: u?.coins ?? 0 }, 'This content is free!');
+    }
+
+    const [existing] = await this.db.query(
+      `SELECT 1 FROM coin_unlocks WHERE user_id=$1 AND content_type=$2 AND content_id=$3`,
+      [userId, contentType, contentId]
+    );
+    if (existing) {
+      return successResponse({ unlocked: true, alreadyUnlocked: true, balance: u?.coins ?? 0 }, 'Already unlocked!');
+    }
+
+    // Atomic spend (same pattern as course purchase / store redeem)
+    const [deducted] = await this.db.query(
+      `UPDATE users SET coins = COALESCE(coins,0) - $1 WHERE id=$2 AND COALESCE(coins,0) >= $1 RETURNING coins`,
+      [cost, userId]
+    );
+    if (!deducted.length) {
+      throw new BadRequestException(`Not enough coins — you need ${cost} coins to unlock this.`);
+    }
+    const newBalance = Number(deducted[0].coins) || 0;
+
+    try {
+      await this.db.query(
+        `INSERT INTO coin_unlocks (user_id, content_type, content_id, coins_spent) VALUES ($1,$2,$3,$4)`,
+        [userId, contentType, contentId, cost]
+      );
+    } catch (err) {
+      // Unique violation from a concurrent unlock — refund and treat as owned
+      await this.db.query(`UPDATE users SET coins = COALESCE(coins,0) + $1 WHERE id=$2`, [cost, userId]);
+      return successResponse({ unlocked: true, alreadyUnlocked: true, balance: newBalance + cost }, 'Already unlocked!');
+    }
+
+    await this.db.query(
+      `INSERT INTO coin_transactions (user_id, type, amount, description, action, ref_id, balance)
+       VALUES ($1, 'spent', $2, $3, 'content_unlock', $4, $5)`,
+      [userId, cost, `Unlocked: ${quiz.title}`, contentId, newBalance]
+    );
+
+    return successResponse(
+      { unlocked: true, alreadyUnlocked: false, balance: newBalance, coinsSpent: cost },
+      `🔓 Unlocked "${quiz.title}" for ${cost} coins!`
+    );
+  }
+
+  /** GET /coins/unlocks — every content item this user has unlocked. */
+  async getUnlocks(userId: string) {
+    const rows = await this.db.query(
+      `SELECT content_type, content_id, coins_spent, created_at
+       FROM coin_unlocks WHERE user_id=$1 ORDER BY created_at DESC`,
+      [userId]
+    );
+    return successResponse({ unlocks: rows });
   }
 }
 
@@ -688,6 +826,20 @@ export class CoinsController {
   redeemStoreItem(@Param('itemId') itemId: string, @Req() r: any) {
     return this.svc.redeemStoreItem(r.user.id, itemId);
   }
+
+  // ── Coin Unlocks ─────────────────────────────────────────────
+
+  /** POST /coins/unlock — spend coins to permanently unlock premium content */
+  @Post('unlock')
+  @HttpCode(HttpStatus.OK)
+  unlockContent(@Req() r: any, @Body() body: { contentType?: string; contentId: string }) {
+    if (!body?.contentId) throw new BadRequestException('contentId is required');
+    return this.svc.unlockContent(r.user.id, body.contentType || 'quiz', body.contentId);
+  }
+
+  /** GET /coins/unlocks — content this user has unlocked */
+  @Get('unlocks')
+  getUnlocks(@Req() r: any) { return this.svc.getUnlocks(r.user.id); }
 }
 
 // ════════════════════════════════════════════════════════════
@@ -804,7 +956,11 @@ export class AdminCoinsService {
         (SELECT COALESCE(SUM(amount), 0)::int FROM coin_transactions
           WHERE type='earned' AND created_at >= NOW() - INTERVAL '24 hours') AS earned_today,
         (SELECT COALESCE(SUM(amount), 0)::int FROM coin_transactions
-          WHERE type='earned' AND created_at >= NOW() - INTERVAL '7 days')   AS earned_this_week
+          WHERE type='earned' AND created_at >= NOW() - INTERVAL '7 days')   AS earned_this_week,
+        (SELECT COALESCE(SUM(amount), 0)::int FROM coin_transactions
+          WHERE type='spent' AND created_at >= NOW() - INTERVAL '7 days')    AS spent_this_week,
+        (SELECT COUNT(*)::int FROM coin_unlocks)                             AS total_unlocks,
+        (SELECT COALESCE(SUM(coins_spent), 0)::int FROM coin_unlocks)        AS coins_spent_on_unlocks
       FROM users
       WHERE coins > 0
     `);
@@ -870,6 +1026,23 @@ export class AdminCoinsService {
     `, [limit, offset]);
     const [{ total }] = await this.db.query(`SELECT COUNT(*)::int AS total FROM coin_redemptions`);
     return successResponse({ redemptions: rows, total, page, limit });
+  }
+
+  /** GET /admin/coins/unlocks — who unlocked what, most recent first. */
+  async getUnlocks(page = 1, limit = 20) {
+    const offset = (page - 1) * limit;
+    const rows = await this.db.query(`
+      SELECT cu.id, cu.content_type, cu.content_id, cu.coins_spent, cu.created_at,
+             u.name AS user_name, u.id AS user_id,
+             q.title AS content_title
+      FROM coin_unlocks cu
+      JOIN users u ON u.id = cu.user_id
+      LEFT JOIN quizzes q ON cu.content_type = 'quiz' AND q.id = cu.content_id
+      ORDER BY cu.created_at DESC
+      LIMIT $1 OFFSET $2
+    `, [limit, offset]);
+    const [{ total }] = await this.db.query(`SELECT COUNT(*)::int AS total FROM coin_unlocks`);
+    return successResponse({ unlocks: rows, total, page, limit });
   }
 
   async getTopEarners(limit = 20) {
@@ -1023,6 +1196,11 @@ export class AdminCoinsController {
   @Get('redemptions')
   getRedemptions(@Query('page') page = 1, @Query('limit') limit = 20) {
     return this.svc.getRedemptions(+page, +limit);
+  }
+
+  @Get('unlocks')
+  getUnlocks(@Query('page') page = 1, @Query('limit') limit = 20) {
+    return this.svc.getUnlocks(+page, +limit);
   }
 }
 

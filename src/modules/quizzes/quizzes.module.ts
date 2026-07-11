@@ -72,6 +72,12 @@ class QuizzesService {
            q.exam_tags, q.scheduled_for, q.attempt_count, q.avg_score, q.status,
            q.negative_marking_enabled, q.marks_per_correct, q.marks_per_wrong,
            COALESCE(q.is_exam_mode, FALSE) AS is_exam_mode,
+           COALESCE(q.unlock_cost_coins, 0) AS unlock_cost_coins,
+           -- Coin-lock: free (cost 0) or already paid for with coins
+           (COALESCE(q.unlock_cost_coins, 0) = 0 OR EXISTS (
+              SELECT 1 FROM coin_unlocks cu
+              WHERE cu.user_id=$${params.length + 1} AND cu.content_type='quiz' AND cu.content_id=q.id
+           )) AS is_unlocked,
            -- is_attempted / my_last_score must only look at COMPLETED attempts
            -- (total_questions > 0) — /start inserts a bare stub row with
            -- score=0 on every entry into the quiz, including re-opening an
@@ -108,7 +114,7 @@ class QuizzesService {
     const cacheKey = `quiz_meta:${quizId}`;
     const cached   = await this.cache.get(cacheKey);
     if (cached) {
-      // Inject user-specific is_attempted dynamically (can't cache per-user)
+      // Inject user-specific is_attempted / is_unlocked dynamically (can't cache per-user)
       const data: any = cached;
       const attempted = await this.db.query(
         `SELECT score FROM quiz_attempts WHERE quiz_id=$1 AND user_id=$2 AND total_questions > 0 ORDER BY score DESC, attempted_at DESC LIMIT 1`,
@@ -116,6 +122,9 @@ class QuizzesService {
       );
       data.data.quiz.is_attempted  = attempted.length > 0;
       data.data.quiz.my_last_score = attempted[0]?.score ?? null;
+      data.data.quiz.is_unlocked   = await this.isQuizUnlocked(
+        quizId, userId, Number(data.data.quiz.unlock_cost_coins) || 0
+      );
       return data;
     }
 
@@ -123,7 +132,8 @@ class QuizzesService {
       `SELECT id, title, description, subject, type,
               total_questions, duration_mins, coins_reward,
               exam_tags, scheduled_for, attempt_count, avg_score, status,
-              negative_marking_enabled, marks_per_correct, marks_per_wrong
+              negative_marking_enabled, marks_per_correct, marks_per_wrong,
+              COALESCE(unlock_cost_coins, 0) AS unlock_cost_coins
        FROM quizzes WHERE id=$1 AND status='published'`,
       [quizId]
     );
@@ -138,11 +148,23 @@ class QuizzesService {
       ...quiz[0],
       is_attempted:  attempted.length > 0,
       my_last_score: attempted[0]?.score ?? null,
+      is_unlocked:   await this.isQuizUnlocked(quizId, userId, Number(quiz[0].unlock_cost_coins) || 0),
     };
 
     const result = successResponse({ quiz: quizData });
     await this.cache.set(cacheKey, result, 120);
     return result;
+  }
+
+  // Coin-lock check: a quiz is unlocked when it's free (unlock_cost_coins=0)
+  // or the user has a coin_unlocks row for it (bought via POST /coins/unlock).
+  private async isQuizUnlocked(quizId: string, userId: string, unlockCost: number): Promise<boolean> {
+    if (unlockCost <= 0) return true;
+    const rows = await this.db.query(
+      `SELECT 1 FROM coin_unlocks WHERE user_id=$1 AND content_type='quiz' AND content_id=$2 LIMIT 1`,
+      [userId, quizId]
+    );
+    return rows.length > 0;
   }
 
   // ── POST /quizzes/:id/start — creates session, returns shuffled questions ──
@@ -154,6 +176,15 @@ class QuizzesService {
     if (!quiz.length) throw new NotFoundException('Quiz not found or not published');
 
     const q = quiz[0];
+
+    // Server-side enforcement of the coin lock — the app hides the Start
+    // button for locked quizzes, but a direct API call must not bypass it.
+    const unlockCost = Number(q.unlock_cost_coins) || 0;
+    if (!(await this.isQuizUnlocked(quizId, userId, unlockCost))) {
+      throw new ForbiddenException(
+        `This quiz is locked — unlock it for ${unlockCost} coins first.`
+      );
+    }
 
     if (q.scheduled_for) {
       const today     = new Date().toISOString().split('T')[0];
@@ -661,8 +692,8 @@ return successResponse({
       `INSERT INTO quizzes
          (title, description, subject, type, total_questions,
           duration_mins, coins_reward, exam_tags, scheduled_for, status, created_by,
-          negative_marking_enabled, marks_per_correct, marks_per_wrong)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+          negative_marking_enabled, marks_per_correct, marks_per_wrong, unlock_cost_coins)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
        RETURNING *`,
       [
         data.title, data.description || null, data.subject,
@@ -676,6 +707,7 @@ return successResponse({
         data.negativeMarkingEnabled === true,
         data.marksPerCorrect != null ? +data.marksPerCorrect : 1,
         data.marksPerWrong   != null ? +data.marksPerWrong   : 0,
+        data.unlockCostCoins != null ? Math.max(0, +data.unlockCostCoins || 0) : 0,
       ]
     );
     return successResponse({ quiz: result[0] }, 'Quiz created. Add questions next.');
@@ -849,6 +881,7 @@ return successResponse({
       shuffleQuestions: 'shuffle_questions',
       shuffleOptions: 'shuffle_options',
       isExamMode: 'is_exam_mode',
+      unlockCostCoins: 'unlock_cost_coins',
     };
     for (const [key, col] of Object.entries(map)) {
       if (data[key] !== undefined) { fields.push(`${col}=$${i++}`); vals.push(data[key]); }
