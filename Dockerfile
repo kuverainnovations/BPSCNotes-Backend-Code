@@ -9,10 +9,13 @@ WORKDIR /app
 COPY package*.json ./
 RUN npm ci --legacy-peer-deps
 
-# Copy source and build
+# Copy source and build.
+# max-old-space-size: nest build OOM-killed at Node's default ~1GB heap on
+# the 2GB VPS (deploy failure 2026-07-10) — the codebase's giant combined
+# modules need more compiler headroom.
 COPY tsconfig*.json nest-cli.json ./
 COPY src ./src
-RUN npm run build
+RUN NODE_OPTIONS="--max-old-space-size=2048" npm run build
 
 # Prune dev dependencies
 RUN npm prune --omit=dev --legacy-peer-deps
