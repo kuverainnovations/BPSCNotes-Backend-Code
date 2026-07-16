@@ -15,7 +15,7 @@ export function requireEnv(name: string): string {
 // installed googleapis@144 generates, e.g. purchases.products.*) and a raw
 // authenticated request client (for endpoints it doesn't generate yet,
 // e.g. monetization.onetimeproducts.*, purchases.productsv2.*) — both
-// backed by the same credentials, so callers don't juggle two auth setups.
+// backed by the same credentials, so callers don't juggle two auth setups..
 export async function getPlayAuthClients() {
   const serviceAccountJson = requireEnv('GOOGLE_PLAY_SERVICE_ACCOUNT_JSON');
   const packageName        = requireEnv('ANDROID_PACKAGE_NAME');
