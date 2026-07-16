@@ -138,6 +138,66 @@ export class AnswerWritingService {
     );
   }
 
+  // ── GET /answer-writing/insights — personal stats dashboard ───
+  // Powers the "Insights" tab: writing volume, ratings, review
+  // activity, streak and a monthly goal. All derived — no new tables.
+  async insights(userId: string) {
+    const [row] = await this.db.query(
+      `SELECT
+         (SELECT COUNT(*)::int FROM answer_submissions WHERE user_id = $1)                                        AS answers_written,
+         (SELECT COUNT(*)::int FROM answer_submissions WHERE user_id = $1
+            AND created_at >= date_trunc('month', NOW()))                                                          AS answers_this_month,
+         (SELECT COUNT(*)::int FROM answer_peer_reviews WHERE reviewer_id = $1)                                    AS reviews_given,
+         (SELECT COUNT(*)::int FROM answer_peer_reviews pr
+            JOIN answer_submissions s ON s.id = pr.submission_id WHERE s.user_id = $1)                             AS reviews_received,
+         (SELECT ROUND(AVG(pr.rating)::numeric, 1) FROM answer_peer_reviews pr
+            JOIN answer_submissions s ON s.id = pr.submission_id WHERE s.user_id = $1)                             AS avg_rating,
+         (SELECT ROUND(AVG(score)::numeric, 1) FROM answer_submissions
+            WHERE user_id = $1 AND status = 'reviewed' AND score IS NOT NULL)                                      AS avg_mentor_score,
+         (SELECT COUNT(*)::int FROM answer_submissions WHERE user_id = $1 AND status = 'reviewed')                 AS mentor_reviewed,
+         (SELECT COALESCE(review_credits, 0) FROM users WHERE id = $1)                                             AS review_credits,
+         (SELECT COALESCE(SUM(word_count), 0)::int FROM answer_submissions WHERE user_id = $1)                     AS total_words`,
+      [userId]
+    );
+
+    // Writing streak — consecutive days (IST) ending today/yesterday
+    // with at least one submission.
+    const days = await this.db.query(
+      `SELECT DISTINCT (created_at AT TIME ZONE 'Asia/Kolkata')::date AS day
+       FROM answer_submissions WHERE user_id = $1
+       ORDER BY day DESC LIMIT 60`,
+      [userId]
+    );
+    let streak = 0;
+    if (days.length) {
+      const toKey = (d: Date) => d.toISOString().slice(0, 10);
+      const daySet = new Set(days.map((r: any) =>
+        (r.day instanceof Date ? toKey(r.day) : String(r.day).slice(0, 10))));
+      // streak may start today or yesterday (today's answer not written yet)
+      const cursor = new Date();
+      if (!daySet.has(toKey(cursor))) cursor.setDate(cursor.getDate() - 1);
+      while (daySet.has(toKey(cursor))) {
+        streak++;
+        cursor.setDate(cursor.getDate() - 1);
+      }
+    }
+
+    const monthlyGoal = 10; // answers per month — product default
+    return successResponse({
+      answersWritten:   Number(row.answers_written) || 0,
+      answersThisMonth: Number(row.answers_this_month) || 0,
+      reviewsGiven:     Number(row.reviews_given) || 0,
+      reviewsReceived:  Number(row.reviews_received) || 0,
+      avgRating:        row.avg_rating != null ? Number(row.avg_rating) : null,
+      avgMentorScore:   row.avg_mentor_score != null ? Number(row.avg_mentor_score) : null,
+      mentorReviewed:   Number(row.mentor_reviewed) || 0,
+      reviewCredits:    Number(row.review_credits) || 0,
+      totalWords:       Number(row.total_words) || 0,
+      writingStreak:    streak,
+      monthlyGoal,
+    });
+  }
+
   // ── GET /answer-writing/my — my submission history ────────────
   async mySubmissions(userId: string, page = 1, limit = 20) {
     const offset = (page - 1) * limit;
@@ -495,6 +555,10 @@ export class AnswerWritingController {
   mySubmissions(@Req() r: any, @Query('page') page = 1, @Query('limit') limit = 20) {
     return this.svc.mySubmissions(r.user.id, +page, +limit);
   }
+
+  /** GET /answer-writing/insights — personal stats for the Insights tab */
+  @Get('insights')
+  insights(@Req() r: any) { return this.svc.insights(r.user.id); }
 
   // ── Peer review (declared before :id so 'review' isn't eaten by it) ──
 
