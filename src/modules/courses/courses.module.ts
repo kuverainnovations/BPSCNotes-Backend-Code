@@ -1,6 +1,7 @@
 import * as CashfreeUtil from '../../common/utils/cashfree.util';
 import { syncCourseToPlayCatalog } from '../../common/utils/gplay-catalog.util';
 import { getOneTimeProductPurchase, acknowledgeOneTimeProductPurchase } from '../../common/utils/gplay-purchase.util';
+import { reportExternalTransaction } from '../../common/utils/gplay-external-transactions.util';
 // ════════════════════════════════════════════════════════════
 // COURSES MODULE — Repository → Service → Controller
 // ════════════════════════════════════════════════════════════
@@ -614,6 +615,7 @@ export class CoursesService {
     dto: {
       cfPaymentId:   string;   // from Cashfree SDK after payment
       paymentMethod?: string;
+      externalTransactionToken?: string;   // user choice billing — see controller
     }
   ) {
     // 1. Idempotency — already completed purchase
@@ -681,6 +683,35 @@ export class CoursesService {
        WHERE id=$3`,
       [payment.cfPaymentId, payment.paymentMethod || 'upi', purchase.id]
     );
+
+    // 4a. User choice billing: if this purchase went through Google Play's
+    // billing-choice screen, report it to the Play Developer API. Amount and
+    // time come from the Cashfree record verified above, never the client.
+    // Fire-and-forget — the entitlement below must not block on Google.
+    if (dto.externalTransactionToken) {
+      const token = dto.externalTransactionToken;
+      this.db.query(
+        `UPDATE course_purchases SET external_transaction_token=$1
+         WHERE id=$2 AND external_transaction_token IS NULL`,
+        [token, purchase.id]
+      ).then(() =>
+        reportExternalTransaction({
+          externalTransactionId:    providerOrderId,
+          externalTransactionToken: token,
+          amountInr:                payment.paymentAmount,
+          transactionTime:          payment.paymentTime,
+        })
+      ).then((reported) => {
+        if (reported) {
+          return this.db.query(
+            `UPDATE course_purchases SET external_transaction_reported_at=NOW() WHERE id=$1`,
+            [purchase.id]
+          );
+        }
+      }).catch((err: any) =>
+        console.error(`Course external-transaction report failed: order=${providerOrderId} err=${err?.message}`)
+      );
+    }
 
     // 4b. Deduct any coins that were reserved as a discount for this order.
     // FIX: wrapped in try/catch — the payment is already verified SUCCESS and
@@ -1416,6 +1447,10 @@ export class CoursesController {
     @Body() dto: {
       cfPaymentId:   string;   // from Cashfree SDK
       paymentMethod?: string;
+      // Present only when the user picked Cashfree on Google Play's
+      // billing-choice screen (user choice billing) — see
+      // gplay-external-transactions.util.ts
+      externalTransactionToken?: string;
     }
   ) {
     return this.service.confirmCoursePurchase(id, req.user.id, dto);

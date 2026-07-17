@@ -28,6 +28,7 @@ import { PaginationDto } from '../common/dtos/pagination.dto';
 import { successResponse, paginationMeta } from '../common/utils/response.util';
 import { streamArticlePdf } from '../common/utils/article-pdf-generator.util';
 import { getOneTimeProductPurchase } from '../common/utils/gplay-purchase.util';
+import { reportExternalTransaction } from '../common/utils/gplay-external-transactions.util';
 import { AuthService } from './auth/auth.module';
 import { ensureFirebaseAdmin } from '../common/firebase/firebase-admin';
 
@@ -1409,10 +1410,15 @@ class SubscriptionsService {
     }
 
     const finalAmount = Math.max(1, price - coinDiscount - couponDiscount);
+    // external_transaction_token: set when the user picked Cashfree on
+    // Google Play's billing-choice screen (user choice billing). Stored at
+    // creation — unlike courses/materials — because subscriptions can be
+    // completed by the Cashfree webhook without the app's confirm call
+    // ever running, and the report to Play must still happen then.
     const subResult = await this.db.query(
-      `INSERT INTO subscriptions (user_id, plan, amount, original_amount, coins_used, coin_discount, coupon_code, coupon_discount, final_amount, payment_status, status)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'pending','pending') RETURNING id`,
-      [userId, data.plan, price, price, coinsToUse, coinDiscount, validCoupon?.code||null, couponDiscount, finalAmount]
+      `INSERT INTO subscriptions (user_id, plan, amount, original_amount, coins_used, coin_discount, coupon_code, coupon_discount, final_amount, external_transaction_token, payment_status, status)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,'pending','pending') RETURNING id`,
+      [userId, data.plan, price, price, coinsToUse, coinDiscount, validCoupon?.code||null, couponDiscount, finalAmount, data.externalTransactionToken || null]
     );
     const subscriptionId = subResult[0].id;
 
@@ -1585,6 +1591,22 @@ class SubscriptionsService {
 
     await this.cache.del(`user:${userId}`);
 
+    // User choice billing: report the Cashfree payment to Google Play.
+    // Token was stored at initiate(); data.externalTransactionToken is a
+    // fallback for an app that only obtained it later in the flow.
+    const extToken = sub.external_transaction_token || data.externalTransactionToken;
+    if (extToken) {
+      if (!sub.external_transaction_token) {
+        await this.db.query(
+          `UPDATE subscriptions SET external_transaction_token=$1 WHERE id=$2 AND external_transaction_token IS NULL`,
+          [extToken, subId]
+        ).catch(() => {});
+      }
+      this.reportSubscriptionExternalTransaction(
+        subId, extToken, providerOrderId, payment.paymentAmount, payment.paymentTime
+      );
+    }
+
     // 🔔 Subscription welcome push
     this.notifService?.pushToUser(
       userId,
@@ -1602,6 +1624,31 @@ class SubscriptionsService {
       [userId]
     );
     return successResponse({ isActive: result.length > 0, subscription: result[0] || null });
+  }
+
+  // User choice billing: fire-and-forget report of a Cashfree subscription
+  // payment to the Play Developer API — shared by confirm() and the
+  // webhook so both completion paths stamp external_transaction_reported_at.
+  // Never throws; activation must not depend on Google accepting the report.
+  private reportSubscriptionExternalTransaction(
+    subId: string, token: string, providerOrderId: string,
+    amountInr: number, paymentTime?: string | null,
+  ) {
+    reportExternalTransaction({
+      externalTransactionId:    providerOrderId,
+      externalTransactionToken: token,
+      amountInr,
+      transactionTime:          paymentTime,
+    }).then((reported) => {
+      if (reported) {
+        return this.db.query(
+          `UPDATE subscriptions SET external_transaction_reported_at=NOW() WHERE id=$1`,
+          [subId]
+        );
+      }
+    }).catch((err: any) =>
+      console.error(`Subscription external-transaction report failed: sub=${subId} err=${err?.message}`)
+    );
   }
 
   // ── Cashfree Webhook Handler ─────────────────────────────────
@@ -1691,6 +1738,21 @@ class SubscriptionsService {
 
       await this.cache.del(`user:${sub.user_id}`);
       console.log(`Webhook: subscription ${sub.id} activated for user ${sub.user_id}`);
+
+      // User choice billing: the webhook can be the only completion path
+      // (app killed before its confirm call), so the report to Play happens
+      // here too — token was stored on the row at initiate(). Duplicate
+      // reports from confirm+webhook racing are safe: Play returns 409 for
+      // an already-reported externalTransactionId, which counts as success.
+      if (sub.external_transaction_token) {
+        this.reportSubscriptionExternalTransaction(
+          sub.id,
+          sub.external_transaction_token,
+          orderId,
+          Number(payData?.payment_amount) || Number(sub.final_amount) || 0,
+          payData?.payment_time,
+        );
+      }
     }
 
     if (eventType === 'PAYMENT_FAILED_WEBHOOK') {

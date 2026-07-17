@@ -27,6 +27,7 @@ import { ActivityLogService, ACTIONS } from '../../common/activity/activity-log.
 import { successResponse, paginationMeta } from '../../common/utils/response.util';
 import { syncMaterialToPlayCatalog, gplayProductIdForMaterial } from '../../common/utils/gplay-catalog.util';
 import { getOneTimeProductPurchase, acknowledgeOneTimeProductPurchase } from '../../common/utils/gplay-purchase.util';
+import { reportExternalTransaction } from '../../common/utils/gplay-external-transactions.util';
 import { AuthModule }             from '../auth/auth.module';
 import { CoinsModule, CoinsService } from '../coins/coins.module';
 
@@ -1415,7 +1416,13 @@ console.log("SECRET =", cfMap["cashfree_secret_key"]?.substring(0, 10));
   // ── POST: confirm a marketplace purchase after Cashfree payment ──
   async confirmPurchase(
     materialId: string, userId: string,
-    dto: { purchaseOrderId: string; cfPaymentId: string; paymentMethod?: string },
+    dto: {
+      purchaseOrderId: string; cfPaymentId: string; paymentMethod?: string;
+      // Present only when the user picked Cashfree on Google Play's
+      // billing-choice screen (user choice billing) — see
+      // gplay-external-transactions.util.ts
+      externalTransactionToken?: string;
+    },
   ) {
     // Idempotency
     const [already] = await this.db.query(
@@ -1486,6 +1493,34 @@ console.log("SECRET =", cfMap["cashfree_secret_key"]?.substring(0, 10));
        WHERE id=$3`,
       [payment.cfPaymentId, payment.paymentMethod || 'upi', order.id]
     );
+
+    // User choice billing: report the Cashfree payment to Google Play.
+    // Amount/time come from the verified Cashfree record, never the client.
+    // Fire-and-forget — unlocking the material must not block on Google.
+    if (dto.externalTransactionToken) {
+      const token = dto.externalTransactionToken;
+      this.db.query(
+        `UPDATE material_purchase_orders SET external_transaction_token=$1
+         WHERE id=$2 AND external_transaction_token IS NULL`,
+        [token, order.id]
+      ).then(() =>
+        reportExternalTransaction({
+          externalTransactionId:    providerOrderId,
+          externalTransactionToken: token,
+          amountInr:                payment.paymentAmount,
+          transactionTime:          payment.paymentTime,
+        })
+      ).then((reported) => {
+        if (reported) {
+          return this.db.query(
+            `UPDATE material_purchase_orders SET external_transaction_reported_at=NOW() WHERE id=$1`,
+            [order.id]
+          );
+        }
+      }).catch((err: any) =>
+        this.logger.error(`Material external-transaction report failed: order=${providerOrderId} err=${err?.message}`)
+      );
+    }
 
     const [material] = await this.db.query(
       `SELECT id, title, price, uploader_id FROM study_materials WHERE id=$1`, [materialId]
