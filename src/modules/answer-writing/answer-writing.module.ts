@@ -55,7 +55,18 @@ const PEER_REVIEWS_TARGET = 2;
 const PEER_REVIEWS_MAX = 5;
 
 const REVIEW_VERDICTS = ['yes', 'partly', 'no'];
-const IMPROVEMENT_AREAS = ['content', 'structure', 'analysis', 'bihar_angle', 'presentation', 'conclusion'];
+// v2 set per client notes: Introduction / Structure / Content /
+// Value Addition / Analysis / Conclusion. Old values stay accepted so
+// reviews from earlier app builds don't start failing.
+const IMPROVEMENT_AREAS = [
+  'introduction', 'structure', 'content', 'value_addition', 'analysis', 'conclusion',
+  'bihar_angle', 'presentation', // legacy
+];
+const MAX_IMPROVEMENT_AREAS = 3; // "top three weaknesses"
+
+/** IST calendar date (YYYY-MM-DD) for a timestamp */
+const istDate = (d: Date | string): string =>
+  new Date(d).toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
 
 // ── Multer storage for handwritten-answer photos ─────────────
 // Same disk layout as study materials: uploads/answers/<year>/<month>/,
@@ -116,6 +127,7 @@ export class AnswerWritingService {
         `SELECT
            q.id, q.question_text, q.subject, q.marks, q.word_limit,
            q.scheduled_for, q.created_at,
+           COALESCE(q.is_pyq, FALSE) AS is_pyq, q.pyq_year,
            (q.scheduled_for = (NOW() AT TIME ZONE 'Asia/Kolkata')::date) AS is_today,
            s.id IS NOT NULL                        AS is_submitted,
            s.status                                AS my_status,
@@ -182,8 +194,25 @@ export class AnswerWritingService {
       }
     }
 
+    // "Top three weaknesses" — most-flagged improvement areas across
+    // all peer reviews received on my answers.
+    const weaknessRows = await this.db.query(
+      `SELECT area, COUNT(*)::int AS cnt FROM (
+         SELECT unnest(
+           COALESCE(pr.improvement_areas,
+                    CASE WHEN pr.improvement_area IS NOT NULL
+                         THEN ARRAY[pr.improvement_area] ELSE ARRAY[]::text[] END)
+         ) AS area
+         FROM answer_peer_reviews pr
+         JOIN answer_submissions s ON s.id = pr.submission_id
+         WHERE s.user_id = $1
+       ) t GROUP BY area ORDER BY cnt DESC LIMIT 3`,
+      [userId]
+    );
+
     const monthlyGoal = 10; // answers per month — product default
     return successResponse({
+      topWeaknesses:    weaknessRows.map((w: any) => ({ area: w.area, count: Number(w.cnt) })),
       answersWritten:   Number(row.answers_written) || 0,
       answersThisMonth: Number(row.answers_this_month) || 0,
       reviewsGiven:     Number(row.reviews_given) || 0,
@@ -196,6 +225,39 @@ export class AnswerWritingService {
       writingStreak:    streak,
       monthlyGoal,
     });
+  }
+
+  // ── GET /answer-writing/leaderboard — community rankings ──────
+  // Top Reviewers (most reviews given) + Top Writers (best avg peer
+  // rating, min 2 rated answers). Names are public here by design —
+  // recognition is the reward; individual reviews stay anonymous.
+  async leaderboard(userId: string) {
+    const topReviewers = await this.db.query(
+      `SELECT u.name, COUNT(*)::int AS reviews_given,
+              COALESCE(u.review_credits, 0) AS review_credits,
+              (u.id = $1) AS is_me
+       FROM answer_peer_reviews pr
+       JOIN users u ON u.id = pr.reviewer_id
+       GROUP BY u.id, u.name, u.review_credits
+       ORDER BY reviews_given DESC, review_credits DESC
+       LIMIT 10`,
+      [userId]
+    );
+    const topWriters = await this.db.query(
+      `SELECT u.name,
+              COUNT(s.id)::int AS answers,
+              ROUND(AVG(s.avg_peer_rating)::numeric, 1) AS avg_rating,
+              (u.id = $1) AS is_me
+       FROM answer_submissions s
+       JOIN users u ON u.id = s.user_id
+       WHERE s.avg_peer_rating IS NOT NULL
+       GROUP BY u.id, u.name
+       HAVING COUNT(s.id) >= 1
+       ORDER BY avg_rating DESC, answers DESC
+       LIMIT 10`,
+      [userId]
+    );
+    return successResponse({ topReviewers, topWriters });
   }
 
   // ── GET /answer-writing/my — my submission history ────────────
@@ -224,12 +286,15 @@ export class AnswerWritingService {
   }
 
   // ── GET /answer-writing/:id — detail (+ my submission) ────────
-  // The model answer is anti-spoiler: only returned once this user
-  // has submitted their own attempt.
+  // Model answer reveal (client rule: "will show next day"): visible
+  // only once the user has submitted AND the IST calendar day has
+  // rolled past the day they submitted. model_answer_tomorrow tells
+  // the app to show the "unlocks tomorrow" note.
   async findOne(questionId: string, userId: string) {
     const [q] = await this.db.query(
       `SELECT id, question_text, subject, marks, word_limit, tips,
-              model_answer, scheduled_for, created_at
+              model_answer, scheduled_for, created_at,
+              COALESCE(is_pyq, FALSE) AS is_pyq, pyq_year
        FROM answer_questions WHERE id = $1 AND status = 'published'`,
       [questionId]
     );
@@ -246,18 +311,20 @@ export class AnswerWritingService {
     let peerReviews: any[] = [];
     if (sub) {
       peerReviews = await this.db.query(
-        `SELECT verdict, rating, improvement_area, suggestion, created_at
+        `SELECT verdict, rating, improvement_area, improvement_areas, suggestion, created_at
          FROM answer_peer_reviews WHERE submission_id = $1 ORDER BY created_at DESC`,
         [sub.id]
       );
     }
 
     const { model_answer, ...rest } = q;
+    const revealModelAnswer = !!sub && istDate(new Date()) > istDate(sub.created_at);
     return successResponse({
       question: {
         ...rest,
-        // revealed only after the user's own attempt is in
-        model_answer: sub ? model_answer : null,
+        model_answer: revealModelAnswer ? model_answer : null,
+        // true → submitted, model answer exists, but reveals next day
+        model_answer_tomorrow: !!sub && !revealModelAnswer && !!model_answer,
       },
       submission: sub || null,
       peerReviews,
@@ -341,37 +408,30 @@ export class AnswerWritingService {
     return successResponse({
       submission,
       coinsEarned,
-      // model answer unlocks right away so they can self-compare
-      modelAnswer: q.model_answer || null,
+      // Client rule: the model answer reveals NEXT DAY, never on submit
+      modelAnswer: null,
+      modelAnswerTomorrow: !!q.model_answer,
     }, coinsEarned > 0
-      ? `Answer submitted! 🪙 +${coinsEarned} coins — compare it with the model answer.`
-      : 'Answer submitted! Compare it with the model answer.');
+      ? `Answer submitted! 🪙 +${coinsEarned} coins — the model answer unlocks tomorrow.`
+      : 'Answer submitted! The model answer unlocks tomorrow.');
   }
 
   // ═══════════════════════════════════════════════════════════
-  // PEER REVIEW
+  // PEER REVIEW — "give one review to get review" (client rule v2)
   //
   // Gate A — you may only review answers to questions you also
   //          submitted (competence + skin in the game).
-  // Gate B — your own answer must have received ≥1 review (peer or
-  //          mentor) before you can review others. Mentor reviews
-  //          bootstrap the flywheel for the first wave of users.
+  // Give-to-get — the queue serves answers from authors who have
+  //          GIVEN reviews first; answers from authors who never
+  //          reviewed anyone only surface when nothing else is
+  //          waiting. So: give a review → your answer jumps the
+  //          queue. Soft priority (not a hard gate) so day one
+  //          isn't a deadlock where nobody can review anybody.
   // Assignment: never your own answer, never one you already
-  // reviewed, fewest-reviews-first then oldest-first, anonymous
-  // in both directions.
+  // reviewed, capped at PEER_REVIEWS_MAX, anonymous both ways.
   // ═══════════════════════════════════════════════════════════
 
-  /** Gate B: has any of MY submissions been reviewed (peer or mentor)? */
-  private async hasBeenReviewed(userId: string): Promise<boolean> {
-    const rows = await this.db.query(
-      `SELECT 1 FROM answer_submissions
-       WHERE user_id = $1 AND (status = 'reviewed' OR peer_review_count > 0) LIMIT 1`,
-      [userId]
-    );
-    return rows.length > 0;
-  }
-
-  /** WHERE clause + params for the pool of answers this user may review. */
+  /** WHERE clause for the pool of answers this user may review ($1 = userId). */
   private reviewPoolFilter(userId: string) {
     return `
       s.user_id != $1
@@ -383,6 +443,12 @@ export class AnswerWritingService {
         WHERE pr.submission_id = s.id AND pr.reviewer_id = $1
       )`;
   }
+
+  /** Give-to-get ordering: reviewers' answers first, then neediest/oldest. */
+  private static readonly POOL_ORDER = `
+    ORDER BY EXISTS (
+      SELECT 1 FROM answer_peer_reviews g WHERE g.reviewer_id = s.user_id
+    ) DESC, s.peer_review_count ASC, s.created_at ASC`;
 
   // ── GET /answer-writing/review/stats — powers the Peer Review card ──
   async reviewStats(userId: string) {
@@ -396,8 +462,9 @@ export class AnswerWritingService {
       `SELECT COUNT(*)::int AS cnt FROM answer_submissions WHERE user_id = $1`, [userId]
     );
 
-    const hasSubmission = Number(mine?.cnt) > 0;
-    const unlocked      = hasSubmission && await this.hasBeenReviewed(userId);
+    // v2: reviewing unlocks as soon as you've submitted your own answer.
+    // (Give-to-get is handled by queue priority, not a hard lock.)
+    const unlocked = Number(mine?.cnt) > 0;
 
     let pendingAvailable = 0;
     if (unlocked) {
@@ -414,19 +481,17 @@ export class AnswerWritingService {
       pendingAvailable,
       canReview:        unlocked,
       // Why reviewing is locked — the app shows a friendly explanation
-      lockedReason:     unlocked ? null : (!hasSubmission ? 'no_submission' : 'not_reviewed_yet'),
+      lockedReason:     unlocked ? null : 'no_submission',
     });
   }
 
   // ── GET /answer-writing/review/next — next answer to review ──
   async nextToReview(userId: string) {
-    if (!(await this.hasBeenReviewed(userId))) {
-      const [mine] = await this.db.query(
-        `SELECT COUNT(*)::int AS cnt FROM answer_submissions WHERE user_id = $1`, [userId]
-      );
-      throw new ForbiddenException(Number(mine?.cnt) > 0
-        ? 'Reviewing unlocks once your own answer has been reviewed.'
-        : 'Submit your own answer first to unlock peer reviewing.');
+    const [mine] = await this.db.query(
+      `SELECT COUNT(*)::int AS cnt FROM answer_submissions WHERE user_id = $1`, [userId]
+    );
+    if (Number(mine?.cnt) === 0) {
+      throw new ForbiddenException('Submit your own answer first to unlock peer reviewing.');
     }
 
     const [next] = await this.db.query(
@@ -435,7 +500,7 @@ export class AnswerWritingService {
        FROM answer_submissions s
        JOIN answer_questions q ON q.id = s.question_id
        WHERE ${this.reviewPoolFilter(userId)}
-       ORDER BY s.peer_review_count ASC, s.created_at ASC
+       ${AnswerWritingService.POOL_ORDER}
        LIMIT 1`,
       [userId]
     );
@@ -445,19 +510,28 @@ export class AnswerWritingService {
   }
 
   // ── POST /answer-writing/review/:submissionId ─────────────────
+  // v2: up to MAX_IMPROVEMENT_AREAS weaknesses per review
+  // ("top three weaknesses"). improvementArea (single) still accepted
+  // from older app builds.
   async submitPeerReview(
     submissionId: string,
     userId: string,
-    body: { verdict?: string; rating?: number; improvementArea?: string; suggestion?: string },
+    body: { verdict?: string; rating?: number; improvementArea?: string; improvementAreas?: string[]; suggestion?: string },
   ) {
     const verdict = String(body?.verdict || '').toLowerCase();
     const rating  = Math.floor(Number(body?.rating));
-    const area    = body?.improvementArea ? String(body.improvementArea).toLowerCase() : null;
     const suggestion = (body?.suggestion || '').trim().slice(0, 200) || null;
+
+    // Normalise areas: prefer the v2 array, fall back to the single field
+    const rawAreas = Array.isArray(body?.improvementAreas) && body.improvementAreas.length
+      ? body.improvementAreas
+      : (body?.improvementArea ? [body.improvementArea] : []);
+    const areas = [...new Set(rawAreas.map(a => String(a).toLowerCase().trim()).filter(Boolean))];
 
     if (!REVIEW_VERDICTS.includes(verdict)) throw new BadRequestException('verdict must be yes | partly | no');
     if (isNaN(rating) || rating < 1 || rating > 5) throw new BadRequestException('rating must be 1-5');
-    if (area && !IMPROVEMENT_AREAS.includes(area)) throw new BadRequestException('Invalid improvement area');
+    if (areas.length > MAX_IMPROVEMENT_AREAS) throw new BadRequestException(`Pick at most ${MAX_IMPROVEMENT_AREAS} improvement areas`);
+    if (areas.some(a => !IMPROVEMENT_AREAS.includes(a))) throw new BadRequestException('Invalid improvement area');
 
     const [sub] = await this.db.query(
       `SELECT id, user_id, status, peer_review_count FROM answer_submissions WHERE id = $1`,
@@ -465,15 +539,18 @@ export class AnswerWritingService {
     );
     if (!sub) throw new NotFoundException('Submission not found');
     if (sub.user_id === userId) throw new BadRequestException("You can't review your own answer");
-    if (!(await this.hasBeenReviewed(userId))) {
-      throw new ForbiddenException('Reviewing unlocks once your own answer has been reviewed.');
+    const [mine] = await this.db.query(
+      `SELECT COUNT(*)::int AS cnt FROM answer_submissions WHERE user_id = $1`, [userId]
+    );
+    if (Number(mine?.cnt) === 0) {
+      throw new ForbiddenException('Submit your own answer first to unlock peer reviewing.');
     }
 
     try {
       await this.db.query(
-        `INSERT INTO answer_peer_reviews (submission_id, reviewer_id, verdict, rating, improvement_area, suggestion)
-         VALUES ($1, $2, $3, $4, $5, $6)`,
-        [submissionId, userId, verdict, rating, area, suggestion]
+        `INSERT INTO answer_peer_reviews (submission_id, reviewer_id, verdict, rating, improvement_area, improvement_areas, suggestion)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+        [submissionId, userId, verdict, rating, areas[0] ?? null, areas.length ? areas : null, suggestion]
       );
     } catch (err: any) {
       if (String(err?.code) === '23505') {
@@ -559,6 +636,10 @@ export class AnswerWritingController {
   /** GET /answer-writing/insights — personal stats for the Insights tab */
   @Get('insights')
   insights(@Req() r: any) { return this.svc.insights(r.user.id); }
+
+  /** GET /answer-writing/leaderboard — Top Reviewers + Top Writers */
+  @Get('leaderboard')
+  leaderboard(@Req() r: any) { return this.svc.leaderboard(r.user.id); }
 
   // ── Peer review (declared before :id so 'review' isn't eaten by it) ──
 
@@ -655,8 +736,8 @@ export class AdminAnswerWritingService {
     if (!data.questionText?.trim()) throw new BadRequestException('Question text is required');
     const rows = await this.db.query(
       `INSERT INTO answer_questions
-         (question_text, subject, marks, word_limit, model_answer, tips, scheduled_for, status, created_by)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+         (question_text, subject, marks, word_limit, model_answer, tips, scheduled_for, status, created_by, is_pyq, pyq_year)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
        RETURNING *`,
       [
         data.questionText.trim(),
@@ -668,6 +749,8 @@ export class AdminAnswerWritingService {
         data.scheduledFor || null,
         data.status === 'published' ? 'published' : 'draft',
         adminId,
+        data.isPyq === true,
+        data.pyqYear ? +data.pyqYear : null,
       ]
     );
     return successResponse({ question: rows[0] }, 'Question created ✅');
@@ -683,6 +766,8 @@ export class AdminAnswerWritingService {
       tips:         'tips',
       scheduledFor: 'scheduled_for',
       status:       'status',
+      isPyq:        'is_pyq',
+      pyqYear:      'pyq_year',
     };
     const fields: string[] = []; const vals: any[] = []; let i = 1;
     for (const [key, col] of Object.entries(map)) {
