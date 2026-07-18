@@ -38,6 +38,7 @@ import {
 } from './modules/combined-modules-2.module';
 import { TierRoomsModule }    from './modules/tier-rooms/tier-rooms.module';
 import { AchievementsModule } from './modules/achievements/achievements.module';
+import { NotebookModule } from './modules/notebook/notebook.module';
 import { StudyMaterialsModule } from '@modules/study-materials/study-materials.module';
 import { MaterialChatModule } from '@modules/study-materials/material-chat.module';
 import { MarketplaceModule }   from './modules/marketplace.module';
@@ -141,6 +142,7 @@ import { AnswerWritingModule } from './modules/answer-writing/answer-writing.mod
     AdminUploadModule,
     TierRoomsModule,
     AchievementsModule,
+    NotebookModule,
     StudyMaterialsModule,
     MaterialChatModule,
     MarketplaceModule,
