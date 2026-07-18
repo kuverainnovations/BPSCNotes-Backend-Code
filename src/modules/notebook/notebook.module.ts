@@ -38,7 +38,7 @@ export class NotebookService {
       where += ` AND (title ILIKE $2 OR content ILIKE $2)`;
     }
     const notes = await this.db.query(
-      `SELECT id, title, content, color, is_pinned, created_at, updated_at
+      `SELECT id, title, content, color, subject, is_pinned, created_at, updated_at
        FROM notebook_notes
        WHERE ${where}
        ORDER BY is_pinned DESC, updated_at DESC
@@ -48,24 +48,25 @@ export class NotebookService {
     return successResponse({ notes });
   }
 
-  async create(userId: string, dto: { title?: string; content?: string; color?: string }) {
+  async create(userId: string, dto: { title?: string; content?: string; color?: string; subject?: string }) {
     const title   = (dto.title ?? '').trim().substring(0, 200);
     const content = dto.content ?? '';
     if (!title && !content.trim()) throw new BadRequestException('Note is empty');
-    const color = this.validColor(dto.color);
+    const color   = this.validColor(dto.color);
+    const subject = (dto.subject ?? '').trim().substring(0, 100) || null;
 
     const [note] = await this.db.query(
-      `INSERT INTO notebook_notes (user_id, title, content, color)
-       VALUES ($1, $2, $3, $4)
-       RETURNING id, title, content, color, is_pinned, created_at, updated_at`,
-      [userId, title, content, color]
+      `INSERT INTO notebook_notes (user_id, title, content, color, subject)
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING id, title, content, color, subject, is_pinned, created_at, updated_at`,
+      [userId, title, content, color, subject]
     );
     return successResponse({ note }, 'Note saved');
   }
 
   async update(
     userId: string, noteId: string,
-    dto: { title?: string; content?: string; color?: string | null; isPinned?: boolean },
+    dto: { title?: string; content?: string; color?: string | null; isPinned?: boolean; subject?: string | null },
   ) {
     const sets: string[] = [];
     const params: any[] = [];
@@ -75,6 +76,7 @@ export class NotebookService {
     if (dto.content  !== undefined) { sets.push(`content = $${pi++}`); params.push(dto.content); }
     if (dto.color    !== undefined) { sets.push(`color = $${pi++}`);   params.push(this.validColor(dto.color)); }
     if (dto.isPinned !== undefined) { sets.push(`is_pinned = $${pi++}`); params.push(!!dto.isPinned); }
+    if (dto.subject  !== undefined) { sets.push(`subject = $${pi++}`); params.push((dto.subject ?? '').trim().substring(0, 100) || null); }
     if (!sets.length) throw new BadRequestException('Nothing to update');
 
     // UPDATE via raw query() returns [rows, rowCount] (unlike INSERT/SELECT,
@@ -83,7 +85,7 @@ export class NotebookService {
     const [rows] = await this.db.query(
       `UPDATE notebook_notes SET ${sets.join(', ')}, updated_at = NOW()
        WHERE id = $${pi++} AND user_id = $${pi}
-       RETURNING id, title, content, color, is_pinned, created_at, updated_at`,
+       RETURNING id, title, content, color, subject, is_pinned, created_at, updated_at`,
       [...params, noteId, userId]
     );
     const note = rows[0];
