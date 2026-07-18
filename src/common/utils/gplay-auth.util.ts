@@ -16,7 +16,26 @@ export function requireEnv(name: string): string {
 // authenticated request client (for endpoints it doesn't generate yet,
 // e.g. monetization.onetimeproducts.*, purchases.productsv2.*) — both
 // backed by the same credentials, so callers don't juggle two auth setups..
-export async function getPlayAuthClients() {
+//
+// Memoized: a fresh GoogleAuth holds no cached OAuth token, so rebuilding
+// per call added a token-endpoint round trip to every Play API request.
+// External-transaction reporting now runs on the post-payment path of
+// every Cashfree purchase, so the clients are built once and reused (the
+// google-auth-library refreshes its token internally on expiry). A failed
+// build is not cached, so a bad env var can be fixed without a restart.
+let cachedClients: ReturnType<typeof buildPlayAuthClients> | null = null;
+
+export function getPlayAuthClients() {
+  if (!cachedClients) {
+    cachedClients = buildPlayAuthClients().catch((err) => {
+      cachedClients = null;
+      throw err;
+    });
+  }
+  return cachedClients;
+}
+
+async function buildPlayAuthClients() {
   const serviceAccountJson = requireEnv('GOOGLE_PLAY_SERVICE_ACCOUNT_JSON');
   const packageName        = requireEnv('ANDROID_PACKAGE_NAME');
 

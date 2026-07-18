@@ -28,7 +28,7 @@ import { PaginationDto } from '../common/dtos/pagination.dto';
 import { successResponse, paginationMeta } from '../common/utils/response.util';
 import { streamArticlePdf } from '../common/utils/article-pdf-generator.util';
 import { getOneTimeProductPurchase } from '../common/utils/gplay-purchase.util';
-import { reportExternalTransaction } from '../common/utils/gplay-external-transactions.util';
+import { storeReportAndStampExternalTransaction, ExternalTransactionTable } from '../common/utils/gplay-external-transactions.util';
 import { AuthService } from './auth/auth.module';
 import { ensureFirebaseAdmin } from '../common/firebase/firebase-admin';
 
@@ -1593,17 +1593,20 @@ class SubscriptionsService {
 
     // User choice billing: report the Cashfree payment to Google Play.
     // Token was stored at initiate(); data.externalTransactionToken is a
-    // fallback for an app that only obtained it later in the flow.
+    // fallback for an app that only obtained it later in the flow (the
+    // shared helper's guarded UPDATE makes the first writer win).
     const extToken = sub.external_transaction_token || data.externalTransactionToken;
     if (extToken) {
-      if (!sub.external_transaction_token) {
-        await this.db.query(
-          `UPDATE subscriptions SET external_transaction_token=$1 WHERE id=$2 AND external_transaction_token IS NULL`,
-          [extToken, subId]
-        ).catch(() => {});
-      }
-      this.reportSubscriptionExternalTransaction(
-        subId, extToken, providerOrderId, payment.paymentAmount, payment.paymentTime
+      void storeReportAndStampExternalTransaction(
+        (sql, params) => this.db.query(sql, params),
+        'subscriptions',
+        subId,
+        {
+          externalTransactionId:    providerOrderId,
+          externalTransactionToken: extToken,
+          amountInr:                payment.paymentAmount,
+          transactionTime:          payment.paymentTime,
+        },
       );
     }
 
@@ -1626,29 +1629,72 @@ class SubscriptionsService {
     return successResponse({ isActive: result.length > 0, subscription: result[0] || null });
   }
 
-  // User choice billing: fire-and-forget report of a Cashfree subscription
-  // payment to the Play Developer API — shared by confirm() and the
-  // webhook so both completion paths stamp external_transaction_reported_at.
-  // Never throws; activation must not depend on Google accepting the report.
-  private reportSubscriptionExternalTransaction(
-    subId: string, token: string, providerOrderId: string,
-    amountInr: number, paymentTime?: string | null,
-  ) {
-    reportExternalTransaction({
-      externalTransactionId:    providerOrderId,
-      externalTransactionToken: token,
-      amountInr,
-      transactionTime:          paymentTime,
-    }).then((reported) => {
-      if (reported) {
-        return this.db.query(
-          `UPDATE subscriptions SET external_transaction_reported_at=NOW() WHERE id=$1`,
-          [subId]
+  // ── User choice billing: retry sweep for unreported transactions ────
+  // A report can fail transiently (Play 5xx, network, process restart in
+  // the fire-and-forget gap) and Google's program gives 24h to deliver it.
+  // This sweep re-reports any completed payment whose token was stored but
+  // whose external_transaction_reported_at is still NULL. Safe to run on
+  // multiple instances / to race a live confirm: Play answers 409 for an
+  // already-reported externalTransactionId and the helper treats that as
+  // success. Window capped at 7 days — older rows are beyond salvage for
+  // the 24h deadline and stay visible (token set, reported_at NULL) for a
+  // manual audit.
+  @Cron('15 * * * *')
+  async cronRetryUnreportedExternalTransactions() {
+    const sweeps: Array<{ table: ExternalTransactionTable; sql: string }> = [
+      {
+        table: 'subscriptions',
+        sql: `SELECT id, external_transaction_token AS token, provider_order_id AS order_id,
+                     final_amount AS amount, updated_at
+              FROM subscriptions
+              WHERE external_transaction_token IS NOT NULL
+                AND external_transaction_reported_at IS NULL
+                AND payment_status='success' AND provider_order_id IS NOT NULL
+                AND updated_at > NOW() - INTERVAL '7 days' LIMIT 50`,
+      },
+      {
+        table: 'course_purchases',
+        sql: `SELECT id, external_transaction_token AS token, provider_order_id AS order_id,
+                     amount, updated_at
+              FROM course_purchases
+              WHERE external_transaction_token IS NOT NULL
+                AND external_transaction_reported_at IS NULL
+                AND status='completed' AND provider_order_id IS NOT NULL
+                AND updated_at > NOW() - INTERVAL '7 days' LIMIT 50`,
+      },
+      {
+        table: 'material_purchase_orders',
+        sql: `SELECT id, external_transaction_token AS token, provider_order_id AS order_id,
+                     amount_due_inr AS amount, updated_at
+              FROM material_purchase_orders
+              WHERE external_transaction_token IS NOT NULL
+                AND external_transaction_reported_at IS NULL
+                AND status='completed' AND provider_order_id IS NOT NULL
+                AND updated_at > NOW() - INTERVAL '7 days' LIMIT 50`,
+      },
+    ];
+
+    for (const { table, sql } of sweeps) {
+      const rows: any[] = await this.db.query(sql).catch(() => []);
+      for (const row of rows) {
+        await storeReportAndStampExternalTransaction(
+          (q, params) => this.db.query(q, params),
+          table,
+          row.id,
+          {
+            externalTransactionId:    row.order_id,
+            externalTransactionToken: row.token,
+            amountInr:                Number(row.amount) || 0,
+            // Original Cashfree payment_time isn't stored on the row; the
+            // completion timestamp is the closest persisted value.
+            transactionTime:          row.updated_at,
+          },
         );
       }
-    }).catch((err: any) =>
-      console.error(`Subscription external-transaction report failed: sub=${subId} err=${err?.message}`)
-    );
+      if (rows.length) {
+        console.log(`External-transaction retry sweep: ${table} processed ${rows.length} row(s)`);
+      }
+    }
   }
 
   // ── Cashfree Webhook Handler ─────────────────────────────────
@@ -1745,12 +1791,16 @@ class SubscriptionsService {
       // reports from confirm+webhook racing are safe: Play returns 409 for
       // an already-reported externalTransactionId, which counts as success.
       if (sub.external_transaction_token) {
-        this.reportSubscriptionExternalTransaction(
+        void storeReportAndStampExternalTransaction(
+          (sql, params) => this.db.query(sql, params),
+          'subscriptions',
           sub.id,
-          sub.external_transaction_token,
-          orderId,
-          Number(payData?.payment_amount) || Number(sub.final_amount) || 0,
-          payData?.payment_time,
+          {
+            externalTransactionId:    orderId,
+            externalTransactionToken: sub.external_transaction_token,
+            amountInr:                Number(payData?.payment_amount) || Number(sub.final_amount) || 0,
+            transactionTime:          payData?.payment_time,
+          },
         );
       }
     }

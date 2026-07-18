@@ -27,7 +27,7 @@ import { ActivityLogService, ACTIONS } from '../../common/activity/activity-log.
 import { successResponse, paginationMeta } from '../../common/utils/response.util';
 import { syncMaterialToPlayCatalog, gplayProductIdForMaterial } from '../../common/utils/gplay-catalog.util';
 import { getOneTimeProductPurchase, acknowledgeOneTimeProductPurchase } from '../../common/utils/gplay-purchase.util';
-import { reportExternalTransaction } from '../../common/utils/gplay-external-transactions.util';
+import { storeReportAndStampExternalTransaction } from '../../common/utils/gplay-external-transactions.util';
 import { AuthModule }             from '../auth/auth.module';
 import { CoinsModule, CoinsService } from '../coins/coins.module';
 
@@ -1498,27 +1498,16 @@ console.log("SECRET =", cfMap["cashfree_secret_key"]?.substring(0, 10));
     // Amount/time come from the verified Cashfree record, never the client.
     // Fire-and-forget — unlocking the material must not block on Google.
     if (dto.externalTransactionToken) {
-      const token = dto.externalTransactionToken;
-      this.db.query(
-        `UPDATE material_purchase_orders SET external_transaction_token=$1
-         WHERE id=$2 AND external_transaction_token IS NULL`,
-        [token, order.id]
-      ).then(() =>
-        reportExternalTransaction({
+      void storeReportAndStampExternalTransaction(
+        (sql, params) => this.db.query(sql, params),
+        'material_purchase_orders',
+        order.id,
+        {
           externalTransactionId:    providerOrderId,
-          externalTransactionToken: token,
+          externalTransactionToken: dto.externalTransactionToken,
           amountInr:                payment.paymentAmount,
           transactionTime:          payment.paymentTime,
-        })
-      ).then((reported) => {
-        if (reported) {
-          return this.db.query(
-            `UPDATE material_purchase_orders SET external_transaction_reported_at=NOW() WHERE id=$1`,
-            [order.id]
-          );
-        }
-      }).catch((err: any) =>
-        this.logger.error(`Material external-transaction report failed: order=${providerOrderId} err=${err?.message}`)
+        },
       );
     }
 

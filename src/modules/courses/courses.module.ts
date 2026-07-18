@@ -1,7 +1,7 @@
 import * as CashfreeUtil from '../../common/utils/cashfree.util';
 import { syncCourseToPlayCatalog } from '../../common/utils/gplay-catalog.util';
 import { getOneTimeProductPurchase, acknowledgeOneTimeProductPurchase } from '../../common/utils/gplay-purchase.util';
-import { reportExternalTransaction } from '../../common/utils/gplay-external-transactions.util';
+import { storeReportAndStampExternalTransaction } from '../../common/utils/gplay-external-transactions.util';
 // ════════════════════════════════════════════════════════════
 // COURSES MODULE — Repository → Service → Controller
 // ════════════════════════════════════════════════════════════
@@ -689,27 +689,16 @@ export class CoursesService {
     // time come from the Cashfree record verified above, never the client.
     // Fire-and-forget — the entitlement below must not block on Google.
     if (dto.externalTransactionToken) {
-      const token = dto.externalTransactionToken;
-      this.db.query(
-        `UPDATE course_purchases SET external_transaction_token=$1
-         WHERE id=$2 AND external_transaction_token IS NULL`,
-        [token, purchase.id]
-      ).then(() =>
-        reportExternalTransaction({
+      void storeReportAndStampExternalTransaction(
+        (sql, params) => this.db.query(sql, params),
+        'course_purchases',
+        purchase.id,
+        {
           externalTransactionId:    providerOrderId,
-          externalTransactionToken: token,
+          externalTransactionToken: dto.externalTransactionToken,
           amountInr:                payment.paymentAmount,
           transactionTime:          payment.paymentTime,
-        })
-      ).then((reported) => {
-        if (reported) {
-          return this.db.query(
-            `UPDATE course_purchases SET external_transaction_reported_at=NOW() WHERE id=$1`,
-            [purchase.id]
-          );
-        }
-      }).catch((err: any) =>
-        console.error(`Course external-transaction report failed: order=${providerOrderId} err=${err?.message}`)
+        },
       );
     }
 

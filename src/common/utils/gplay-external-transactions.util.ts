@@ -50,7 +50,8 @@ export async function reportExternalTransaction(report: ExternalTransactionRepor
       console.error(`Play external-transaction report skipped: bad amount ${report.amountInr} for ${externalTransactionId}`);
       return false;
     }
-    const preTaxMicros = Math.round((gross / (1 + gstRatePct() / 100)) * 1_000_000);
+    const rate         = gstRatePct();
+    const preTaxMicros = Math.round((gross / (1 + rate / 100)) * 1_000_000);
     const taxMicros    = Math.round(gross * 1_000_000) - preTaxMicros;
 
     let transactionTime: string;
@@ -83,12 +84,47 @@ export async function reportExternalTransaction(report: ExternalTransactionRepor
   } catch (e: any) {
     const status = e?.response?.status;
     // 409 = this externalTransactionId was already reported (e.g. confirm
-    // and webhook both fired) — that's success for our purposes.
+    // and webhook both fired, or the retry cron raced a live confirm) —
+    // that's success for our purposes.
     if (status === 409) return true;
     console.error(
       `Play external-transaction report failed for ${report.externalTransactionId}:`,
       e?.response?.data ?? e?.message ?? e,
     );
     return false;
+  }
+}
+
+export type ExternalTransactionTable = 'subscriptions' | 'course_purchases' | 'material_purchase_orders';
+
+// Shared store → report → stamp orchestration used by all three purchase
+// flows (courses, study materials, subscriptions) so the compliance logic
+// lives in exactly one place. Stores the token on the row (first writer
+// wins), reports to Play, and stamps external_transaction_reported_at on
+// success so the retry cron skips the row. Never throws — callers invoke
+// it fire-and-forget after the entitlement is already granted.
+export async function storeReportAndStampExternalTransaction(
+  query: (sql: string, params?: any[]) => Promise<any>,
+  table: ExternalTransactionTable,
+  rowId: string,
+  report: ExternalTransactionReport,
+): Promise<void> {
+  try {
+    await query(
+      `UPDATE ${table} SET external_transaction_token=$1
+       WHERE id=$2 AND external_transaction_token IS NULL`,
+      [report.externalTransactionToken, rowId]
+    );
+    const reported = await reportExternalTransaction(report);
+    if (reported) {
+      await query(
+        `UPDATE ${table} SET external_transaction_reported_at=NOW() WHERE id=$1`,
+        [rowId]
+      );
+    }
+  } catch (err: any) {
+    console.error(
+      `External-transaction store/report failed: table=${table} row=${rowId} err=${err?.message}`
+    );
   }
 }
