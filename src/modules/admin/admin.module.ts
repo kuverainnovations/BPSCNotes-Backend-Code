@@ -1247,6 +1247,8 @@ class AdminPaymentsService {
       this.db.query(
         `SELECT cp.id, cp.status, cp.amount, cp.coins_applied, cp.coin_discount_inr,
                 cp.provider_order_id, cp.payment_provider,
+                cp.external_transaction_token IS NOT NULL AS has_external_tx,
+                cp.external_transaction_reported_at,
                 cp.created_at, cp.updated_at,
                 u.id AS user_id, u.name AS user_name, u.mobile AS user_mobile, u.email AS user_email,
                 c.id AS course_id, c.title AS course_title, c.price AS course_price
@@ -1291,7 +1293,9 @@ class AdminPaymentsService {
                 mp.created_at,
                 u.id AS user_id, u.name AS user_name, u.mobile AS user_mobile, u.email AS user_email,
                 sm.id AS material_id, sm.title AS material_title, sm.price AS material_price,
-                mpo.provider_order_id, mpo.provider_payment_id, mpo.payment_provider, mpo.status AS order_status
+                mpo.provider_order_id, mpo.provider_payment_id, mpo.payment_provider, mpo.status AS order_status,
+                mpo.external_transaction_token IS NOT NULL AS has_external_tx,
+                mpo.external_transaction_reported_at
          FROM material_purchases mp
          JOIN users u ON u.id = mp.user_id
          JOIN study_materials sm ON sm.id = mp.material_id
@@ -1340,6 +1344,8 @@ class AdminPaymentsService {
       this.db.query(
         `SELECT s.id, s.plan, s.final_amount, s.payment_status, s.payment_method,
                 s.provider_order_id, s.provider_payment_id, s.payment_provider,
+                s.external_transaction_token IS NOT NULL AS has_external_tx,
+                s.external_transaction_reported_at,
                 s.created_at, s.ends_at,
                 u.id AS user_id, u.name AS user_name, u.mobile AS user_mobile, u.email AS user_email
          FROM subscriptions s
