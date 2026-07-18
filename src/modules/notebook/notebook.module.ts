@@ -77,22 +77,29 @@ export class NotebookService {
     if (dto.isPinned !== undefined) { sets.push(`is_pinned = $${pi++}`); params.push(!!dto.isPinned); }
     if (!sets.length) throw new BadRequestException('Nothing to update');
 
-    const [note] = await this.db.query(
+    // UPDATE via raw query() returns [rows, rowCount] (unlike INSERT/SELECT,
+    // which return rows directly) — unwrap rows first, same trap as the
+    // coin-deduction fix in courses.module.ts.
+    const [rows] = await this.db.query(
       `UPDATE notebook_notes SET ${sets.join(', ')}, updated_at = NOW()
        WHERE id = $${pi++} AND user_id = $${pi}
        RETURNING id, title, content, color, is_pinned, created_at, updated_at`,
       [...params, noteId, userId]
     );
+    const note = rows[0];
     if (!note) throw new NotFoundException('Note not found');
     return successResponse({ note }, 'Note updated');
   }
 
   async remove(userId: string, noteId: string) {
-    const result = await this.db.query(
+    // DELETE via raw query() also returns [rows, rowCount] — the old
+    // `result.length` check saw the outer pair (always 2) and could never
+    // report not-found.
+    const [rows] = await this.db.query(
       `DELETE FROM notebook_notes WHERE id = $1 AND user_id = $2 RETURNING id`,
       [noteId, userId]
     );
-    if (!result.length) throw new NotFoundException('Note not found');
+    if (!rows.length) throw new NotFoundException('Note not found');
     return successResponse(null, 'Note deleted');
   }
 
