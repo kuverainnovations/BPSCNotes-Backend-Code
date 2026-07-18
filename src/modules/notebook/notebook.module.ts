@@ -3,12 +3,17 @@ import {
   Get, Post, Patch, Delete,
   Body, Query, Req, Param,
   HttpCode, HttpStatus,
-  UseGuards, ParseUUIDPipe,
+  UseGuards, ParseUUIDPipe, UseInterceptors, UploadedFile,
   NotFoundException, BadRequestException,
 } from '@nestjs/common';
+import { FileInterceptor } from '@nestjs/platform-express';
 import { InjectDataSource } from '@nestjs/typeorm';
 import { DataSource } from 'typeorm';
 import { ApiTags, ApiBearerAuth } from '@nestjs/swagger';
+import { diskStorage } from 'multer';
+import { extname, join } from 'path';
+import * as fs from 'fs';
+import * as crypto from 'crypto';
 import { JwtAuthGuard } from '../../common/guards';
 import { successResponse } from '../../common/utils/response.util';
 import { AuthModule } from '../auth/auth.module';
@@ -20,11 +25,17 @@ import { AuthModule } from '../auth/auth.module';
 // Strictly per-user: every query is scoped to the JWT user's id,
 // so one user can never read or touch another's notes. No admin
 // surface on purpose — this is private user data.
+//
+// v3: notes are an ordered list of typed blocks (heading/text/bullet/
+// numbered/check/image) stored in `blocks` JSONB. `content` is kept as a
+// plain-text flattening for search + share + legacy render.
 // ════════════════════════════════════════════════════════════
 
 // UI palette names the app renders; anything else is rejected so the
 // column can't accumulate arbitrary client strings.
 const NOTE_COLORS = ['yellow', 'blue', 'green', 'pink', 'purple', 'orange'];
+const BLOCK_TYPES = ['heading', 'text', 'bullet', 'numbered', 'check', 'image'];
+const MAX_BLOCKS = 300;
 
 @Injectable()
 export class NotebookService {
@@ -38,7 +49,7 @@ export class NotebookService {
       where += ` AND (title ILIKE $2 OR content ILIKE $2)`;
     }
     const notes = await this.db.query(
-      `SELECT id, title, content, color, subject, is_pinned, created_at, updated_at
+      `SELECT id, title, content, color, subject, blocks, is_pinned, created_at, updated_at
        FROM notebook_notes
        WHERE ${where}
        ORDER BY is_pinned DESC, updated_at DESC
@@ -48,25 +59,26 @@ export class NotebookService {
     return successResponse({ notes });
   }
 
-  async create(userId: string, dto: { title?: string; content?: string; color?: string; subject?: string }) {
+  async create(userId: string, dto: { title?: string; content?: string; color?: string; subject?: string; blocks?: any }) {
     const title   = (dto.title ?? '').trim().substring(0, 200);
     const content = dto.content ?? '';
-    if (!title && !content.trim()) throw new BadRequestException('Note is empty');
+    const blocks  = this.normalizeBlocks(dto.blocks);
+    if (!title && !content.trim() && !blocks) throw new BadRequestException('Note is empty');
     const color   = this.validColor(dto.color);
     const subject = (dto.subject ?? '').trim().substring(0, 100) || null;
 
     const [note] = await this.db.query(
-      `INSERT INTO notebook_notes (user_id, title, content, color, subject)
-       VALUES ($1, $2, $3, $4, $5)
-       RETURNING id, title, content, color, subject, is_pinned, created_at, updated_at`,
-      [userId, title, content, color, subject]
+      `INSERT INTO notebook_notes (user_id, title, content, color, subject, blocks)
+       VALUES ($1, $2, $3, $4, $5, $6::jsonb)
+       RETURNING id, title, content, color, subject, blocks, is_pinned, created_at, updated_at`,
+      [userId, title, content, color, subject, blocks ? JSON.stringify(blocks) : null]
     );
     return successResponse({ note }, 'Note saved');
   }
 
   async update(
     userId: string, noteId: string,
-    dto: { title?: string; content?: string; color?: string | null; isPinned?: boolean; subject?: string | null },
+    dto: { title?: string; content?: string; color?: string | null; isPinned?: boolean; subject?: string | null; blocks?: any },
   ) {
     const sets: string[] = [];
     const params: any[] = [];
@@ -77,6 +89,10 @@ export class NotebookService {
     if (dto.color    !== undefined) { sets.push(`color = $${pi++}`);   params.push(this.validColor(dto.color)); }
     if (dto.isPinned !== undefined) { sets.push(`is_pinned = $${pi++}`); params.push(!!dto.isPinned); }
     if (dto.subject  !== undefined) { sets.push(`subject = $${pi++}`); params.push((dto.subject ?? '').trim().substring(0, 100) || null); }
+    if (dto.blocks   !== undefined) {
+      const blocks = this.normalizeBlocks(dto.blocks);
+      sets.push(`blocks = $${pi++}::jsonb`); params.push(blocks ? JSON.stringify(blocks) : null);
+    }
     if (!sets.length) throw new BadRequestException('Nothing to update');
 
     // UPDATE via raw query() returns [rows, rowCount] (unlike INSERT/SELECT,
@@ -85,7 +101,7 @@ export class NotebookService {
     const [rows] = await this.db.query(
       `UPDATE notebook_notes SET ${sets.join(', ')}, updated_at = NOW()
        WHERE id = $${pi++} AND user_id = $${pi}
-       RETURNING id, title, content, color, subject, is_pinned, created_at, updated_at`,
+       RETURNING id, title, content, color, subject, blocks, is_pinned, created_at, updated_at`,
       [...params, noteId, userId]
     );
     const note = rows[0];
@@ -109,6 +125,31 @@ export class NotebookService {
     if (!color) return null;
     return NOTE_COLORS.includes(color) ? color : null;
   }
+
+  // Sanitize client-supplied blocks: drop unknown types, cap length/count,
+  // keep only the fields each type uses. Returns null for an empty/absent
+  // array so the column stays NULL (legacy render path) rather than "[]".
+  private normalizeBlocks(blocks: any): any[] | null {
+    if (!Array.isArray(blocks)) return null;
+    const out = blocks
+      .slice(0, MAX_BLOCKS)
+      .filter((b) => b && BLOCK_TYPES.includes(b.type))
+      .map((b) => {
+        const block: any = { type: b.type };
+        if (b.type === 'image') {
+          block.url = String(b.url ?? '').substring(0, 500);
+        } else {
+          block.text = String(b.text ?? '').substring(0, 5000);
+          if (b.type === 'check') block.done = !!b.done;
+        }
+        return block;
+      })
+      // Drop blocks that ended up with no content (empty image / empty text
+      // is fine to keep for text so the user can have blank lines — only
+      // drop images with no url).
+      .filter((b) => b.type !== 'image' || b.url);
+    return out.length ? out : null;
+  }
 }
 
 @ApiTags('Notebook')
@@ -127,6 +168,41 @@ export class NotebookController {
   @HttpCode(HttpStatus.CREATED)
   create(@Req() r: any, @Body() dto: any) {
     return this.svc.create(r.user.id, dto);
+  }
+
+  // User-facing image upload for note image blocks. Same disk-storage
+  // pattern as AdminUploadController, but JWT-guarded and namespaced under
+  // uploads/notebook. Served statically at ${BASE_URL}/uploads/… (main.ts).
+  @Post('upload-image')
+  @HttpCode(HttpStatus.OK)
+  @UseInterceptors(
+    FileInterceptor('image', {
+      storage: diskStorage({
+        destination: (_req: any, _file: any, cb: any) => {
+          const uploadDir = process.env.UPLOAD_DIR ?? join(process.cwd(), 'uploads');
+          const dest = join(uploadDir, 'notebook');
+          fs.mkdirSync(dest, { recursive: true });
+          cb(null, dest);
+        },
+        filename: (_req: any, file: any, cb: any) => {
+          const ext  = extname(file.originalname).toLowerCase() || '.jpg';
+          const name = `${Date.now()}_${crypto.randomBytes(8).toString('hex')}${ext}`;
+          cb(null, name);
+        },
+      }),
+      limits: { fileSize: 10 * 1024 * 1024 }, // 10 MB
+      fileFilter: (_req: any, file: any, cb: any) => {
+        if (file.mimetype?.startsWith('image/')) cb(null, true);
+        else cb(new BadRequestException('Only image files are allowed'), false);
+      },
+    }),
+  )
+  uploadImage(@UploadedFile() file: Express.Multer.File) {
+    if (!file) throw new BadRequestException('No file uploaded');
+    const uploadDir = process.env.UPLOAD_DIR ?? join(process.cwd(), 'uploads');
+    const baseUrl   = process.env.BASE_URL    ?? 'https://api.bpscnotes.in';
+    const fileKey   = file.path.replace(uploadDir + '/', '').replace(/\\/g, '/');
+    return successResponse({ url: `${baseUrl}/uploads/${fileKey}`, fileKey }, 'Image uploaded');
   }
 
   @Patch(':id')
