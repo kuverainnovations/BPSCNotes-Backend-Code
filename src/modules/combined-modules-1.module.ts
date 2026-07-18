@@ -1177,38 +1177,76 @@ class JobsService implements OnModuleInit {
     const data  = { type: 'new_job', screen: 'jobs', jobId: job.id || '' };
 
     try {
-      // Get FCM tokens of users subscribed to this category
+      // Get subscribers of this category. Case-insensitive + trimmed:
+      // topic_key comes from the app (category strings scraped off live
+      // jobs) while category comes from the admin panel's DynamicSelect
+      // (free-typed) — "Bpsc" vs "BPSC" must still match, or the alert
+      // silently reaches nobody.
       const rows = await this.db.query(
-        `SELECT u.fcm_token
+        `SELECT u.id, u.fcm_token, u.notification_enabled
          FROM job_alert_prefs jap
          JOIN users u ON u.id = jap.user_id
-         WHERE jap.topic_key = $1
-           AND u.fcm_token IS NOT NULL
-           AND u.notification_enabled = TRUE
+         WHERE LOWER(TRIM(jap.topic_key)) = LOWER(TRIM($1))
            AND u.status = 'active'`,
         [job.category]
       );
 
-      const tokens: string[] = rows.map((r: any) => r.fcm_token).filter(Boolean);
-
-      if (tokens.length === 0) {
+      if (rows.length === 0) {
         this.logger.log(`pushJobAlert: no subscribers for category "${job.category}" — skipping`);
         return;
       }
 
+      // Inbox record for every subscriber (parity with pushToUser): the
+      // alert must survive in-app even when a user has no FCM token or
+      // has push disabled.
+      try {
+        const [notifRow] = await this.db.query(
+          `INSERT INTO notifications (title, body, type, target, data, status, sent_at, created_by)
+           VALUES ($1, $2, 'new_job', 'custom', $3, 'sent', NOW(), NULL)
+           RETURNING id`,
+          [title, body, JSON.stringify(data)]
+        );
+        if (notifRow?.id) {
+          for (const r of rows) {
+            await this.db.query(
+              `INSERT INTO user_notifications (user_id, notification_id, title, body)
+               VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING`,
+              [r.id, notifRow.id, title, body]
+            );
+          }
+        }
+      } catch (dbErr: any) {
+        this.logger.warn(`pushJobAlert inbox insert failed: ${dbErr.message}`);
+      }
+
+      const tokens: string[] = rows
+        .filter((r: any) => r.notification_enabled && r.fcm_token)
+        .map((r: any) => r.fcm_token);
+
+      if (tokens.length === 0) {
+        this.logger.log(`pushJobAlert: ${rows.length} subscriber(s) for "${job.category}" but none push-eligible (no token / push disabled)`);
+        return;
+      }
+
       const admin = require('firebase-admin');
-      if (!admin.apps.length) return;
+      if (!admin.apps.length) {
+        this.logger.warn(`pushJobAlert: firebase-admin not initialised — ${tokens.length} push(es) for "${job.category}" not sent`);
+        return;
+      }
 
       // Batch in chunks of 500 (FCM multicast limit)
+      let sent = 0, failed = 0;
       for (let i = 0; i < tokens.length; i += 500) {
-        await admin.messaging().sendEachForMulticast({
+        const res = await admin.messaging().sendEachForMulticast({
           tokens: tokens.slice(i, i + 500),
           notification: { title, body },
           data,
           android: { priority: 'high' },
         });
+        sent   += res.successCount ?? 0;
+        failed += res.failureCount ?? 0;
       }
-      this.logger.log(`pushJobAlert: sent to ${tokens.length} subscribers for "${job.category}"`);
+      this.logger.log(`pushJobAlert: "${job.category}" → ${sent} sent, ${failed} failed of ${tokens.length} token(s)`);
     } catch (err: any) {
       this.logger.warn(`pushJobAlert failed: ${err.message}`);
     }
