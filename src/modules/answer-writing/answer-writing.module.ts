@@ -1,10 +1,10 @@
 import {
   Module, Injectable, Controller,
   Get, Post, Put, Delete, Body, Param, Query, Req,
-  UseGuards, UseInterceptors, UploadedFiles, HttpCode, HttpStatus,
+  UseGuards, UseInterceptors, UploadedFiles, UploadedFile, HttpCode, HttpStatus,
   NotFoundException, BadRequestException, ForbiddenException, Logger,
 } from '@nestjs/common';
-import { FilesInterceptor } from '@nestjs/platform-express';
+import { FilesInterceptor, FileInterceptor } from '@nestjs/platform-express';
 import { diskStorage } from 'multer';
 import { InjectDataSource } from '@nestjs/typeorm';
 import { DataSource } from 'typeorm';
@@ -74,6 +74,8 @@ const istDate = (d: Date | string): string =>
 const ANSWER_IMAGE_TYPES = ['image/jpeg', 'image/png', 'image/webp', 'image/heic'];
 const MAX_IMAGE_BYTES = 10 * 1024 * 1024; // 10 MB per photo
 const MAX_IMAGES = 5;
+const ANSWER_PDF_TYPES = ['application/pdf'];
+const MAX_PDF_BYTES = 25 * 1024 * 1024; // 25 MB per answer PDF
 
 function answerImageStorage() {
   const now = new Date();
@@ -265,7 +267,7 @@ export class AnswerWritingService {
     const offset = (page - 1) * limit;
     const rows = await this.db.query(
       `SELECT s.id, s.question_id, s.word_count, s.status, s.score, s.feedback,
-              s.answer_images, s.peer_review_count, s.avg_peer_rating,
+              s.answer_images, s.answer_pdf, s.peer_review_count, s.avg_peer_rating,
               s.created_at, s.reviewed_at,
               q.question_text, q.subject, q.marks, q.word_limit
        FROM answer_submissions s
@@ -301,7 +303,7 @@ export class AnswerWritingService {
     if (!q) throw new NotFoundException('Question not found');
 
     const [sub] = await this.db.query(
-      `SELECT id, answer_text, answer_images, word_count, time_taken_secs, status, score,
+      `SELECT id, answer_text, answer_images, answer_pdf, word_count, time_taken_secs, status, score,
               feedback, peer_review_count, avg_peer_rating, created_at, reviewed_at
        FROM answer_submissions WHERE question_id = $1 AND user_id = $2`,
       [questionId, userId]
@@ -341,7 +343,27 @@ export class AnswerWritingService {
     return this.insertSubmission(questionId, userId, {
       answerText,
       images: null,
+      pdf: null,
       wordCount: countWords(answerText),
+      timeTakenSecs: body?.timeTakenSecs,
+    });
+  }
+
+  // ── POST /answer-writing/:id/submit-pdf ───────────────────────
+  // Handwritten/typed answer as a single PDF. wordCount is client-reported
+  // (best effort). Same insert + coin award as text/photo submissions.
+  async submitPdf(
+    questionId: string,
+    userId: string,
+    file: Express.Multer.File | undefined,
+    body: { wordCount?: number; timeTakenSecs?: number },
+  ) {
+    if (!file) throw new BadRequestException('A PDF of your answer is required');
+    return this.insertSubmission(questionId, userId, {
+      answerText: null,
+      images: null,
+      pdf: this.fileUrl(file.path),
+      wordCount: Math.max(0, Math.floor(Number(body?.wordCount) || 0)),
       timeTakenSecs: body?.timeTakenSecs,
     });
   }
@@ -360,6 +382,7 @@ export class AnswerWritingService {
     return this.insertSubmission(questionId, userId, {
       answerText: null,
       images: imageUrls,
+      pdf: null,
       wordCount: Math.max(0, Math.floor(Number(body?.wordCount) || 0)),
       timeTakenSecs: body?.timeTakenSecs,
     });
@@ -368,7 +391,7 @@ export class AnswerWritingService {
   private async insertSubmission(
     questionId: string,
     userId: string,
-    data: { answerText: string | null; images: string[] | null; wordCount: number; timeTakenSecs?: number },
+    data: { answerText: string | null; images: string[] | null; pdf: string | null; wordCount: number; timeTakenSecs?: number },
   ) {
     const [q] = await this.db.query(
       `SELECT id, question_text, marks, word_limit, model_answer
@@ -382,11 +405,11 @@ export class AnswerWritingService {
     let submission: any;
     try {
       const rows = await this.db.query(
-        `INSERT INTO answer_submissions (question_id, user_id, answer_text, answer_images, word_count, time_taken_secs)
-         VALUES ($1, $2, $3, $4, $5, $6)
-         RETURNING id, answer_text, answer_images, word_count, time_taken_secs, status, score, feedback,
+        `INSERT INTO answer_submissions (question_id, user_id, answer_text, answer_images, answer_pdf, word_count, time_taken_secs)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)
+         RETURNING id, answer_text, answer_images, answer_pdf, word_count, time_taken_secs, status, score, feedback,
                    peer_review_count, avg_peer_rating, created_at`,
-        [questionId, userId, data.answerText, data.images, data.wordCount, timeTaken]
+        [questionId, userId, data.answerText, data.images, data.pdf, data.wordCount, timeTaken]
       );
       submission = rows[0];
     } catch (err: any) {
@@ -495,7 +518,7 @@ export class AnswerWritingService {
     }
 
     const [next] = await this.db.query(
-      `SELECT s.id, s.answer_text, s.answer_images, s.word_count, s.created_at,
+      `SELECT s.id, s.answer_text, s.answer_images, s.answer_pdf, s.word_count, s.created_at,
               q.id AS question_id, q.question_text, q.subject, q.marks, q.word_limit
        FROM answer_submissions s
        JOIN answer_questions q ON q.id = s.question_id
@@ -690,6 +713,26 @@ export class AnswerWritingController {
   ) {
     return this.svc.submitPhoto(id, r.user.id, files, body);
   }
+
+  /** POST /answer-writing/:id/submit-pdf — a single PDF answer */
+  @Post(':id/submit-pdf')
+  @HttpCode(HttpStatus.OK)
+  @UseInterceptors(FileInterceptor('pdf', {
+    storage: answerImageStorage(),   // same uploads/answers/<y>/<m> layout
+    limits: { fileSize: MAX_PDF_BYTES },
+    fileFilter: (_req, file, cb) => {
+      if (ANSWER_PDF_TYPES.includes(file.mimetype)) cb(null, true);
+      else cb(new BadRequestException('Only a PDF file is allowed'), false);
+    },
+  }))
+  submitPdf(
+    @Param('id') id: string,
+    @Req() r: any,
+    @UploadedFile() file: Express.Multer.File,
+    @Body() body: any,
+  ) {
+    return this.svc.submitPdf(id, r.user.id, file, body);
+  }
 }
 
 // ════════════════════════════════════════════════════════════
@@ -802,7 +845,7 @@ export class AdminAnswerWritingService {
 
     const [rows, countResult] = await Promise.all([
       this.db.query(
-        `SELECT s.id, s.question_id, s.answer_text, s.answer_images, s.word_count, s.time_taken_secs,
+        `SELECT s.id, s.question_id, s.answer_text, s.answer_images, s.answer_pdf, s.word_count, s.time_taken_secs,
                 s.status, s.score, s.feedback, s.peer_review_count, s.avg_peer_rating,
                 s.created_at, s.reviewed_at,
                 u.name  AS user_name, u.id AS user_id,
