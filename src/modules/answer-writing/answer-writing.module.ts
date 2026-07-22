@@ -532,6 +532,32 @@ export class AnswerWritingService {
     return successResponse({ submission: next || null });
   }
 
+  // ── GET /answer-writing/review/list — the pool I can pick from ──
+  // Same eligibility as review/next, but returns up to 20 so the app can show
+  // a browsable list and let the reviewer choose which answer to review
+  // (QA 21-07 Issue 12). Still anonymous — no reviewer/author identity leaks.
+  async listToReview(userId: string) {
+    const [mine] = await this.db.query(
+      `SELECT COUNT(*)::int AS cnt FROM answer_submissions WHERE user_id = $1`, [userId]
+    );
+    if (Number(mine?.cnt) === 0) {
+      throw new ForbiddenException('Submit your own answer first to unlock peer reviewing.');
+    }
+
+    const rows = await this.db.query(
+      `SELECT s.id, s.answer_text, s.answer_images, s.answer_pdf, s.word_count, s.created_at,
+              q.id AS question_id, q.question_text, q.subject, q.marks, q.word_limit
+       FROM answer_submissions s
+       JOIN answer_questions q ON q.id = s.question_id
+       WHERE ${this.reviewPoolFilter(userId)}
+       ${AnswerWritingService.POOL_ORDER}
+       LIMIT 20`,
+      [userId]
+    );
+
+    return successResponse({ submissions: rows });
+  }
+
   // ── POST /answer-writing/review/:submissionId ─────────────────
   // v2: up to MAX_IMPROVEMENT_AREAS weaknesses per review
   // ("top three weaknesses"). improvementArea (single) still accepted
@@ -673,6 +699,10 @@ export class AnswerWritingController {
   /** GET /answer-writing/review/next — next anonymous answer to review */
   @Get('review/next')
   nextToReview(@Req() r: any) { return this.svc.nextToReview(r.user.id); }
+
+  /** GET /answer-writing/review/list — the anonymous pool to choose from */
+  @Get('review/list')
+  listToReview(@Req() r: any) { return this.svc.listToReview(r.user.id); }
 
   /** POST /answer-writing/review/:submissionId — submit a structured peer review */
   @Post('review/:submissionId')
