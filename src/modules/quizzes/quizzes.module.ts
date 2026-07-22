@@ -440,15 +440,18 @@ class QuizzesService {
     const hasEarnedCoinsBefore = priorCoinsEarned.length > 0;
     const canEarnCoins         = !hasEarnedCoinsBefore && coinsReward > 0;
 
-    // Mark quiz_session as submitted
-    if (dto.sessionId) {
-      await this.db.query(
-        `UPDATE quiz_sessions SET status='submitted', submitted_at=NOW(),
-                                  background_secs=COALESCE($3,0)
-         WHERE id=$1 AND user_id=$2 AND status='in_progress'`,
-        [dto.sessionId, userId, dto.backgroundSecs ?? 0]
-      );
-    }
+    // Mark the quiz_session as submitted. Keyed on (user, quiz) rather than
+    // only dto.sessionId: the client sometimes submits without a sessionId,
+    // which previously left the session 'in_progress' so a completed quiz kept
+    // showing as a "Resume Quiz" card on the dashboard (QA 21-07 Issue 2).
+    // Start-of-quiz abandons prior in_progress sessions, so there is at most
+    // one open session per (user, quiz) to close here.
+    await this.db.query(
+      `UPDATE quiz_sessions SET status='submitted', submitted_at=NOW(),
+                                background_secs=COALESCE($3,0)
+       WHERE user_id=$1 AND quiz_id=$2 AND status='in_progress'`,
+      [userId, quizId, dto.backgroundSecs ?? 0]
+    );
 
     const attempt = await this.db.query(
       `INSERT INTO quiz_attempts

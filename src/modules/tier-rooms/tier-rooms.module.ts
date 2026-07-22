@@ -1237,11 +1237,12 @@ export class StudySessionsService {
       if (s.active_minutes >= 1) {
         const todayUTC = new Date().toISOString().slice(0, 10);
         const [lastStudy] = await this.db.query(
-          `SELECT last_study_date FROM users WHERE id=$1`, [userId]
+          `SELECT last_study_date, streak FROM users WHERE id=$1`, [userId]
         );
         const lastDate = lastStudy?.last_study_date
           ? new Date(lastStudy.last_study_date).toISOString().slice(0, 10)
           : null;
+        const prevStreak = Number(lastStudy?.streak) || 0;
         const yesterdayUTC = new Date(Date.now() - 86400000).toISOString().slice(0, 10);
 
         // Streak logic:
@@ -1279,6 +1280,32 @@ export class StudySessionsService {
           `;
         }
         const streakResult = await this.db.query(streakSql, [userId]);
+
+        // Streak reset notice (QA 21-07 Issue 3): streaks reset lazily on the
+        // next study day, so the drop can appear "suddenly" on reopen. When a
+        // real streak (>= 2 days) is broken by a gap, tell the user why via the
+        // in-app inbox. Skipped for a first-ever session (lastDate === null).
+        if (lastDate !== null && lastDate !== todayUTC && lastDate !== yesterdayUTC && prevStreak >= 2) {
+          try {
+            const title = 'Streak reset';
+            const body  = `Your ${prevStreak}-day streak reset — you missed a day. Study today to start a new one! 🔥`;
+            const [notifRow] = await this.db.query(
+              `INSERT INTO notifications (title, body, type, target, data, status, sent_at, created_by)
+               VALUES ($1, $2, 'streak_reset', 'custom', $3, 'sent', NOW(), NULL)
+               RETURNING id`,
+              [title, body, JSON.stringify({ type: 'streak_reset', previousStreak: prevStreak, screen: 'home' })]
+            );
+            if (notifRow?.id) {
+              await this.db.query(
+                `INSERT INTO user_notifications (user_id, notification_id, title, body)
+                 VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING`,
+                [userId, notifRow.id, title, body]
+              );
+            }
+          } catch (notifErr: any) {
+            this.logger.warn(`streak reset notice failed: ${notifErr?.message}`);
+          }
+        }
 
         // Room activity feed (spec section 9) — only on a genuine increment,
         // and only at round milestones, so this doesn't fire every single

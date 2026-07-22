@@ -59,20 +59,41 @@ export class NotebookService {
     return successResponse({ notes });
   }
 
-  async create(userId: string, dto: { title?: string; content?: string; color?: string; subject?: string; blocks?: any }) {
+  async create(userId: string, dto: { title?: string; content?: string; color?: string; subject?: string; blocks?: any; sourceRef?: string }) {
     const title   = (dto.title ?? '').trim().substring(0, 200);
     const content = dto.content ?? '';
     const blocks  = this.normalizeBlocks(dto.blocks);
     if (!title && !content.trim() && !blocks) throw new BadRequestException('Note is empty');
     const color   = this.validColor(dto.color);
     const subject = (dto.subject ?? '').trim().substring(0, 100) || null;
+    // sourceRef ties a note to the mock-test/quiz question it came from so the
+    // same question can't be added twice (QA 21-07 Issue 10). Manually created
+    // notes have no sourceRef and are never deduped.
+    const sourceRef = (dto.sourceRef ?? '').trim().substring(0, 100) || null;
 
+    const cols   = ['user_id', 'title', 'content', 'color', 'subject', 'blocks', 'source_ref'];
+    const vals   = [userId, title, content, color, subject, blocks ? JSON.stringify(blocks) : null, sourceRef];
+    // With a source_ref, re-adding is idempotent: ON CONFLICT keeps the first
+    // note (no duplicate) and the existing row is returned below.
+    const conflict = sourceRef
+      ? `ON CONFLICT (user_id, source_ref) WHERE source_ref IS NOT NULL DO NOTHING`
+      : '';
     const [note] = await this.db.query(
-      `INSERT INTO notebook_notes (user_id, title, content, color, subject, blocks)
-       VALUES ($1, $2, $3, $4, $5, $6::jsonb)
+      `INSERT INTO notebook_notes (${cols.join(', ')})
+       VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7)
+       ${conflict}
        RETURNING id, title, content, color, subject, blocks, is_pinned, created_at, updated_at`,
-      [userId, title, content, color, subject, blocks ? JSON.stringify(blocks) : null]
+      vals
     );
+    if (!note && sourceRef) {
+      // Conflict — the question is already in the notebook; return the existing note.
+      const [existing] = await this.db.query(
+        `SELECT id, title, content, color, subject, blocks, is_pinned, created_at, updated_at
+           FROM notebook_notes WHERE user_id=$1 AND source_ref=$2`,
+        [userId, sourceRef]
+      );
+      return successResponse({ note: existing, duplicate: true }, 'Already in your notebook');
+    }
     return successResponse({ note }, 'Note saved');
   }
 

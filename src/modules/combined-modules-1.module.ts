@@ -117,7 +117,12 @@ class CurrentAffairsService {
     if (important === 'true') conditions.push(`ca.is_important=TRUE`);
     const where = conditions.join(' AND ');
 
-    const cacheKey = `affairs:${where}:${params.join(',')}:${page}:${limit}:${userId}`;
+    // Per-user cache version — bumped whenever the user toggles a bookmark, so
+    // the 120s list cache can't keep serving a stale is_bookmarked flag after an
+    // unsave (QA 21-07 Issue C: unsaved items stayed "saved" until the cache
+    // expired). A cache miss just triggers a fresh query — never stale.
+    const bmVer    = (await this.cache.get(`affairsBmVer:${userId}`)) ?? 0;
+    const cacheKey = `affairs:${where}:${params.join(',')}:${page}:${limit}:${userId}:${bmVer}`;
     const cached   = await this.cache.get(cacheKey);
     if (cached) return cached;
 
@@ -158,11 +163,20 @@ class CurrentAffairsService {
     if (existing.length) {
       await this.db.query(`DELETE FROM affairs_bookmarks WHERE user_id=$1 AND affair_id=$2`, [userId, affairId]);
       await this.db.query(`UPDATE current_affairs SET bookmark_count=bookmark_count-1 WHERE id=$1`, [affairId]);
+      await this.bumpBookmarkVersion(userId);
       return successResponse({ isBookmarked: false });
     }
     await this.db.query(`INSERT INTO affairs_bookmarks VALUES ($1,$2)`, [userId, affairId]);
     await this.db.query(`UPDATE current_affairs SET bookmark_count=bookmark_count+1 WHERE id=$1`, [affairId]);
+    await this.bumpBookmarkVersion(userId);
     return successResponse({ isBookmarked: true });
+  }
+
+  // Invalidate this user's cached current-affairs lists after a bookmark change
+  // by bumping the version baked into the list cache key. Long TTL so it always
+  // outlives the 120s list cache; a reset would only cause a fresh query.
+  private async bumpBookmarkVersion(userId: string) {
+    await this.cache.set(`affairsBmVer:${userId}`, Date.now(), 86400).catch(() => {});
   }
 
   async findAllAdmin(query: any) {
