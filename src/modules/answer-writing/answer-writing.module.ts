@@ -4,7 +4,7 @@ import {
   UseGuards, UseInterceptors, UploadedFiles, UploadedFile, HttpCode, HttpStatus,
   NotFoundException, BadRequestException, ForbiddenException, Logger,
 } from '@nestjs/common';
-import { FilesInterceptor, FileInterceptor } from '@nestjs/platform-express';
+import { FilesInterceptor, FileInterceptor, FileFieldsInterceptor } from '@nestjs/platform-express';
 import { diskStorage } from 'multer';
 import { InjectDataSource } from '@nestjs/typeorm';
 import { DataSource } from 'typeorm';
@@ -26,20 +26,26 @@ import { NotificationsModule, NotificationService } from '../combined-modules-1.
 //
 // Flow: admin posts a question (marks, word limit, model answer) →
 // user writes an answer in the app (one attempt per question) →
-// model answer is revealed immediately after submitting → an admin
-// grades it later with a score + feedback → user gets a push.
+// the model answer unlocks the next day → peers review the answer →
+// an admin grades it later with a score + feedback → user gets a push.
 //
 // Powers: AnswerWritingScreen (Android), admin.bpscnotes.in/answer-writing
 // Endpoints:
 //   GET  /answer-writing               — published questions + my status
 //   GET  /answer-writing/my            — my submissions (history tab)
 //   GET  /answer-writing/:id           — question detail (+ my submission,
-//                                        model answer only after submitting)
+//                                        model answer only the next day,
+//                                        peer reviews only once reciprocated)
 //   POST /answer-writing/:id/submit    — submit my answer (awards coins)
+//   GET  /answer-writing/review/questions   — questions I can review, with
+//                                        pending counts (peer review screen 1)
+//   GET  /answer-writing/review/list   — answers to review, optionally for
+//                                        one question (peer review screen 2)
 //   GET  /admin/answer-writing/questions        — admin list + stats
 //   POST /admin/answer-writing/questions        — create
 //   PUT  /admin/answer-writing/questions/:id    — update
 //   DELETE /admin/answer-writing/questions/:id  — delete
+//   POST /admin/answer-writing/questions/:id/seed — post a sample answer
 //   GET  /admin/answer-writing/submissions      — review queue
 //   PUT  /admin/answer-writing/submissions/:id/review — grade + feedback
 // ════════════════════════════════════════════════════════════
@@ -64,6 +70,11 @@ const IMPROVEMENT_AREAS = [
 ];
 const MAX_IMPROVEMENT_AREAS = 3; // "top three weaknesses"
 
+// Reserved house account that owns seed ("Sample") answers — created by
+// migration 1785000000000. Seeds keep the review pool non-empty so the
+// first student to answer a question can still unlock their own feedback.
+const SEED_USER_MOBILE = '0000000001';
+
 /** IST calendar date (YYYY-MM-DD) for a timestamp */
 const istDate = (d: Date | string): string =>
   new Date(d).toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
@@ -77,19 +88,44 @@ const MAX_IMAGES = 5;
 const ANSWER_PDF_TYPES = ['application/pdf'];
 const MAX_PDF_BYTES = 25 * 1024 * 1024; // 25 MB per answer PDF
 
-function answerImageStorage() {
-  const now = new Date();
-  const subDir = `${now.getFullYear()}/${String(now.getMonth() + 1).padStart(2, '0')}`;
-  const dest = join('./uploads', 'answers', subDir);
-  fs.mkdirSync(dest, { recursive: true });
+/** Root of the served upload tree — main.ts hands this exact dir to the static handler. */
+function uploadRoot(): string {
+  return (process.env.UPLOAD_DIR ?? join(process.cwd(), 'uploads'));
+}
+
+/**
+ * Answer photo/PDF storage.
+ *
+ * Both the destination and the year/month bucket are resolved per request:
+ * the interceptor decorators are evaluated once at module load, so anything
+ * computed out here would freeze the date at server-start (and, before this,
+ * pinned uploads to a relative ./uploads that prod's UPLOAD_DIR never sees —
+ * every handwritten answer 404'd once the two diverged).
+ */
+function answerFileStorage() {
   return diskStorage({
-    destination: (_req, _file, cb) => cb(null, dest),
+    destination: (_req, _file, cb) => {
+      const now = new Date();
+      const subDir = `${now.getFullYear()}/${String(now.getMonth() + 1).padStart(2, '0')}`;
+      const dest = join(uploadRoot(), 'answers', subDir);
+      fs.mkdirSync(dest, { recursive: true });
+      cb(null, dest);
+    },
     filename: (_req, file, cb) => {
       const uniqueId = crypto.randomUUID().replace(/-/g, '').slice(0, 16);
       const safeExt = extname(file.originalname).toLowerCase().replace(/[^a-z0-9.]/g, '') || '.jpg';
       cb(null, `${Date.now()}_${uniqueId}${safeExt}`);
     },
   });
+}
+
+/** Disk path → public URL, relative to whichever upload root is configured. */
+function answerFileUrl(diskPath: string, base: string): string {
+  const root = uploadRoot().replace(/\\/g, '/').replace(/\/+$/, '');
+  let key = diskPath.replace(/\\/g, '/');
+  if (key.startsWith(root)) key = key.slice(root.length);
+  key = key.replace(/^\/+/, '').replace(/^\.?\/?uploads\//, '');
+  return `${base}/uploads/${key}`;
 }
 
 // ════════════════════════════════════════════════════════════
@@ -107,9 +143,7 @@ export class AnswerWritingService {
   ) {}
 
   private fileUrl(diskPath: string): string {
-    const base = this.config.get<string>('BASE_URL') ?? 'https://api.bpscnotes.in';
-    const key = diskPath.replace(/\\/g, '/').replace(/^\.?\/?uploads\//, '');
-    return `${base}/uploads/${key}`;
+    return answerFileUrl(diskPath, this.config.get<string>('BASE_URL') ?? 'https://api.bpscnotes.in');
   }
 
   // ── GET /answer-writing — published questions with my status ──
@@ -134,7 +168,8 @@ export class AnswerWritingService {
            s.id IS NOT NULL                        AS is_submitted,
            s.status                                AS my_status,
            s.score                                 AS my_score,
-           (SELECT COUNT(*)::int FROM answer_submissions WHERE question_id = q.id) AS submission_count
+           (SELECT COUNT(*)::int FROM answer_submissions
+              WHERE question_id = q.id AND is_seed = FALSE) AS submission_count
          FROM answer_questions q
          LEFT JOIN answer_submissions s ON s.question_id = q.id AND s.user_id = $${params.length + 1}
          WHERE ${where}
@@ -165,7 +200,8 @@ export class AnswerWritingService {
          (SELECT COUNT(*)::int FROM answer_peer_reviews pr
             JOIN answer_submissions s ON s.id = pr.submission_id WHERE s.user_id = $1)                             AS reviews_received,
          (SELECT ROUND(AVG(pr.rating)::numeric, 1) FROM answer_peer_reviews pr
-            JOIN answer_submissions s ON s.id = pr.submission_id WHERE s.user_id = $1)                             AS avg_rating,
+            JOIN answer_submissions s ON s.id = pr.submission_id
+            WHERE s.user_id = $1 AND ${AnswerWritingService.RECIPROCATED('s.question_id')})                        AS avg_rating,
          (SELECT ROUND(AVG(score)::numeric, 1) FROM answer_submissions
             WHERE user_id = $1 AND status = 'reviewed' AND score IS NOT NULL)                                      AS avg_mentor_score,
          (SELECT COUNT(*)::int FROM answer_submissions WHERE user_id = $1 AND status = 'reviewed')                 AS mentor_reviewed,
@@ -196,8 +232,10 @@ export class AnswerWritingService {
       }
     }
 
-    // "Top three weaknesses" — most-flagged improvement areas across
-    // all peer reviews received on my answers.
+    // "Top three weaknesses" — most-flagged improvement areas across the
+    // peer reviews received on my answers. Reviews I have not yet earned
+    // the right to read (reciprocity) are excluded: the weakness list is
+    // their content in summary form.
     const weaknessRows = await this.db.query(
       `SELECT area, COUNT(*)::int AS cnt FROM (
          SELECT unnest(
@@ -207,7 +245,7 @@ export class AnswerWritingService {
          ) AS area
          FROM answer_peer_reviews pr
          JOIN answer_submissions s ON s.id = pr.submission_id
-         WHERE s.user_id = $1
+         WHERE s.user_id = $1 AND ${AnswerWritingService.RECIPROCATED('s.question_id')}
        ) t GROUP BY area ORDER BY cnt DESC LIMIT 3`,
       [userId]
     );
@@ -245,6 +283,9 @@ export class AnswerWritingService {
        LIMIT 10`,
       [userId]
     );
+    // Sample answers never appear here, and my own rows are excluded until
+    // I have reciprocated on that question — otherwise the leaderboard
+    // hands me the rating the detail screen is withholding.
     const topWriters = await this.db.query(
       `SELECT u.name,
               COUNT(s.id)::int AS answers,
@@ -253,6 +294,8 @@ export class AnswerWritingService {
        FROM answer_submissions s
        JOIN users u ON u.id = s.user_id
        WHERE s.avg_peer_rating IS NOT NULL
+         AND s.is_seed = FALSE
+         AND (u.id <> $1 OR ${AnswerWritingService.RECIPROCATED('s.question_id')})
        GROUP BY u.id, u.name
        HAVING COUNT(s.id) >= 1
        ORDER BY avg_rating DESC, answers DESC
@@ -262,18 +305,44 @@ export class AnswerWritingService {
     return successResponse({ topReviewers, topWriters });
   }
 
+  /**
+   * SQL: "I have reviewed someone's answer to this question" ($1 = userId).
+   * The reciprocity test used by the list + aggregate queries. findOne uses
+   * the fuller peerReviewUnlock(), which also unlocks when there is nothing
+   * left to review; these queries stay conservative on purpose — erring
+   * towards hiding a rating is cheaper than leaking one.
+   */
+  private static readonly RECIPROCATED = (questionCol: string) => `
+    EXISTS (
+      SELECT 1 FROM answer_peer_reviews pr
+      JOIN answer_submissions rs ON rs.id = pr.submission_id
+      WHERE pr.reviewer_id = $1 AND rs.question_id = ${questionCol}
+    )`;
+
   // ── GET /answer-writing/my — my submission history ────────────
+  // avg_peer_rating is withheld on questions I have not reciprocated on —
+  // it is a summary of the reviews the detail screen is hiding. The count
+  // stays visible: it is the reason to go and review someone.
   async mySubmissions(userId: string, page = 1, limit = 20) {
     const offset = (page - 1) * limit;
+    const reciprocated = AnswerWritingService.RECIPROCATED('ms.question_id');
     const rows = await this.db.query(
-      `SELECT s.id, s.question_id, s.word_count, s.status, s.score, s.feedback,
-              s.answer_images, s.answer_pdf, s.peer_review_count, s.avg_peer_rating,
-              s.created_at, s.reviewed_at,
+      `SELECT ms.id, ms.question_id, ms.word_count, ms.status, ms.score, ms.feedback,
+              ms.answer_images, ms.answer_pdf, ms.peer_review_count,
+              CASE WHEN ${reciprocated} OR NOT EXISTS (
+                     SELECT 1 FROM answer_submissions s
+                     WHERE s.question_id = ms.question_id AND ${this.reviewPoolFilter(userId)}
+                   ) THEN ms.avg_peer_rating ELSE NULL END          AS avg_peer_rating,
+              NOT (${reciprocated} OR NOT EXISTS (
+                     SELECT 1 FROM answer_submissions s
+                     WHERE s.question_id = ms.question_id AND ${this.reviewPoolFilter(userId)}
+                   ))                                               AS peer_reviews_locked,
+              ms.created_at, ms.reviewed_at,
               q.question_text, q.subject, q.marks, q.word_limit
-       FROM answer_submissions s
-       JOIN answer_questions q ON q.id = s.question_id
-       WHERE s.user_id = $1
-       ORDER BY s.created_at DESC
+       FROM answer_submissions ms
+       JOIN answer_questions q ON q.id = ms.question_id
+       WHERE ms.user_id = $1
+       ORDER BY ms.created_at DESC
        LIMIT $2 OFFSET $3`,
       [userId, limit, offset]
     );
@@ -309,14 +378,24 @@ export class AnswerWritingService {
       [questionId, userId]
     );
 
-    // Peer reviews received on MY submission — anonymous (no reviewer identity)
+    // Peer reviews received on MY submission — anonymous (no reviewer
+    // identity), and held back until I have reviewed someone else's answer
+    // to this same question (client reciprocity rule).
     let peerReviews: any[] = [];
+    let gate = { unlocked: true, reviewsGivenHere: 0, reviewableCount: 0 };
     if (sub) {
-      peerReviews = await this.db.query(
-        `SELECT verdict, rating, improvement_area, improvement_areas, suggestion, created_at
-         FROM answer_peer_reviews WHERE submission_id = $1 ORDER BY created_at DESC`,
-        [sub.id]
-      );
+      gate = await this.peerReviewUnlock(userId, questionId);
+      if (gate.unlocked) {
+        peerReviews = await this.db.query(
+          `SELECT verdict, rating, improvement_area, improvement_areas, suggestion, created_at
+           FROM answer_peer_reviews WHERE submission_id = $1 ORDER BY created_at DESC`,
+          [sub.id]
+        );
+      } else {
+        // Locked: the count is the carrot ("2 reviews waiting"), but the
+        // average rating summarises the hidden content, so it goes too.
+        sub.avg_peer_rating = null;
+      }
     }
 
     const { model_answer, ...rest } = q;
@@ -330,6 +409,10 @@ export class AnswerWritingService {
       },
       submission: sub || null,
       peerReviews,
+      // Reciprocity state for this question — drives the locked card + CTA
+      peerReviewsLocked: !!sub && !gate.unlocked,
+      peerReviewCount:   sub ? Number(sub.peer_review_count) || 0 : 0,
+      reviewableCount:   gate.reviewableCount,
     });
   }
 
@@ -440,18 +523,28 @@ export class AnswerWritingService {
   }
 
   // ═══════════════════════════════════════════════════════════
-  // PEER REVIEW — "give one review to get review" (client rule v2)
+  // PEER REVIEW — per-question reciprocity (client rule, 23 Jul)
+  //
+  // "The review section for your answer to a particular question
+  //  unlocks only after you review another user's answer for that
+  //  same question."
+  //
+  // Note what this gates: VISIBILITY of the feedback you received,
+  // not eligibility. Your answer enters the pool the moment you
+  // submit it, so the pool never dries up — you simply can't read
+  // your reviews until you've given one on the same question.
+  // See peerReviewUnlock().
   //
   // Gate A — you may only review answers to questions you also
   //          submitted (competence + skin in the game).
-  // Give-to-get — the queue serves answers from authors who have
-  //          GIVEN reviews first; answers from authors who never
-  //          reviewed anyone only surface when nothing else is
-  //          waiting. So: give a review → your answer jumps the
-  //          queue. Soft priority (not a hard gate) so day one
-  //          isn't a deadlock where nobody can review anybody.
   // Assignment: never your own answer, never one you already
   // reviewed, capped at PEER_REVIEWS_MAX, anonymous both ways.
+  //
+  // Seed answers (is_seed) are house-authored samples that keep the
+  // pool non-empty on a brand-new question. They are exempt from the
+  // cap — one seed must be able to unlock every student, not just the
+  // first PEER_REVIEWS_MAX of them — and they sort LAST so real
+  // students' answers always get the review capacity first.
   // ═══════════════════════════════════════════════════════════
 
   /** WHERE clause for the pool of answers this user may review ($1 = userId). */
@@ -459,7 +552,7 @@ export class AnswerWritingService {
     return `
       s.user_id != $1
       AND s.status != 'reviewed'
-      AND s.peer_review_count < ${PEER_REVIEWS_MAX}
+      AND (s.is_seed OR s.peer_review_count < ${PEER_REVIEWS_MAX})
       AND s.question_id IN (SELECT question_id FROM answer_submissions WHERE user_id = $1)
       AND NOT EXISTS (
         SELECT 1 FROM answer_peer_reviews pr
@@ -467,11 +560,80 @@ export class AnswerWritingService {
       )`;
   }
 
-  /** Give-to-get ordering: reviewers' answers first, then neediest/oldest. */
+  /** Real answers before samples, then give-to-get, then neediest/oldest. */
   private static readonly POOL_ORDER = `
-    ORDER BY EXISTS (
+    ORDER BY s.is_seed ASC, EXISTS (
       SELECT 1 FROM answer_peer_reviews g WHERE g.reviewer_id = s.user_id
     ) DESC, s.peer_review_count ASC, s.created_at ASC`;
+
+  /**
+   * Per-question reciprocity check.
+   *
+   * Unlocked when the user has given ≥1 review on this question, OR when
+   * there is nothing left for them to review on it. The second arm is the
+   * safety net behind seeding: seeding is a manual step in a daily
+   * workflow, and when it gets missed a student should see their feedback
+   * rather than be blocked by an empty pool they can do nothing about.
+   */
+  private async peerReviewUnlock(userId: string, questionId: string) {
+    const [given] = await this.db.query(
+      `SELECT COUNT(*)::int AS cnt
+       FROM answer_peer_reviews pr
+       JOIN answer_submissions s ON s.id = pr.submission_id
+       WHERE pr.reviewer_id = $1 AND s.question_id = $2`,
+      [userId, questionId]
+    );
+    const reviewsGivenHere = Number(given?.cnt) || 0;
+
+    const [pool] = await this.db.query(
+      `SELECT COUNT(*)::int AS cnt FROM answer_submissions s
+       WHERE s.question_id = $2 AND ${this.reviewPoolFilter(userId)}`,
+      [userId, questionId]
+    );
+    const reviewableCount = Number(pool?.cnt) || 0;
+
+    return {
+      unlocked: reviewsGivenHere > 0 || reviewableCount === 0,
+      reviewsGivenHere,
+      reviewableCount,
+    };
+  }
+
+  // ── GET /answer-writing/review/questions — peer review screen 1 ──
+  // Questions I have attempted that still have answers waiting for my
+  // review, neediest first. `myReviewsHere` drives the "unlocked" tick,
+  // so a student can see at a glance which of their own answers are
+  // still waiting on a review from them.
+  async reviewQuestions(userId: string) {
+    const rows = await this.db.query(
+      `SELECT q.id, q.question_text, q.subject, q.marks, q.word_limit,
+              COALESCE(q.is_pyq, FALSE) AS is_pyq, q.pyq_year,
+              (SELECT COUNT(*)::int FROM answer_submissions s
+                 WHERE s.question_id = q.id AND ${this.reviewPoolFilter(userId)}) AS pending_count,
+              (SELECT COUNT(*)::int FROM answer_peer_reviews pr
+                 JOIN answer_submissions s2 ON s2.id = pr.submission_id
+                 WHERE pr.reviewer_id = $1 AND s2.question_id = q.id)            AS my_reviews_here,
+              (SELECT COALESCE(peer_review_count, 0) FROM answer_submissions
+                 WHERE question_id = q.id AND user_id = $1)                      AS my_reviews_received
+       FROM answer_questions q
+       WHERE q.status = 'published'
+         AND q.id IN (SELECT question_id FROM answer_submissions WHERE user_id = $1)
+       ORDER BY pending_count DESC, q.scheduled_for DESC NULLS LAST, q.created_at DESC`,
+      [userId]
+    );
+
+    return successResponse({
+      questions: rows.map((r: any) => ({
+        ...r,
+        pending_count:       Number(r.pending_count) || 0,
+        my_reviews_here:     Number(r.my_reviews_here) || 0,
+        my_reviews_received: Number(r.my_reviews_received) || 0,
+        // true → reviewing here unlocks the feedback on my own answer
+        unlocks_my_reviews:  Number(r.my_reviews_here) === 0 && Number(r.my_reviews_received) > 0,
+      })),
+      totalPending: rows.reduce((n: number, r: any) => n + (Number(r.pending_count) || 0), 0),
+    });
+  }
 
   // ── GET /answer-writing/review/stats — powers the Peer Review card ──
   async reviewStats(userId: string) {
@@ -533,10 +695,16 @@ export class AnswerWritingService {
   }
 
   // ── GET /answer-writing/review/list — the pool I can pick from ──
-  // Same eligibility as review/next, but returns up to 20 so the app can show
-  // a browsable list and let the reviewer choose which answer to review
-  // (QA 21-07 Issue 12). Still anonymous — no reviewer/author identity leaks.
-  async listToReview(userId: string) {
+  // Same eligibility as review/next, but returns a browsable list so the
+  // reviewer chooses which answer to review (QA 21-07 Issue 12). Pass
+  // questionId for peer review screen 2 — the answers under one question.
+  // Still anonymous — no reviewer/author identity leaks.
+  //
+  // Deliberately NOT returned per answer: avg_peer_rating. A visible score
+  // anchors the reviewer to the existing average before they have formed
+  // their own view. peer_review_count is safe and useful — it tells the
+  // reviewer which answers still need help.
+  async listToReview(userId: string, questionId?: string) {
     const [mine] = await this.db.query(
       `SELECT COUNT(*)::int AS cnt FROM answer_submissions WHERE user_id = $1`, [userId]
     );
@@ -544,18 +712,36 @@ export class AnswerWritingService {
       throw new ForbiddenException('Submit your own answer first to unlock peer reviewing.');
     }
 
+    const params: any[] = [userId];
+    let scope = '';
+    if (questionId) { params.push(questionId); scope = `AND s.question_id = $${params.length}`; }
+
     const rows = await this.db.query(
       `SELECT s.id, s.answer_text, s.answer_images, s.answer_pdf, s.word_count, s.created_at,
+              s.peer_review_count, s.is_seed,
               q.id AS question_id, q.question_text, q.subject, q.marks, q.word_limit
        FROM answer_submissions s
        JOIN answer_questions q ON q.id = s.question_id
-       WHERE ${this.reviewPoolFilter(userId)}
+       WHERE ${this.reviewPoolFilter(userId)} ${scope}
        ${AnswerWritingService.POOL_ORDER}
-       LIMIT 20`,
-      [userId]
+       LIMIT ${questionId ? 50 : 20}`,
+      params
     );
 
-    return successResponse({ submissions: rows });
+    // On a per-question list, tell the app whether reviewing here unlocks
+    // the feedback on the user's own answer — it drives the banner copy.
+    let unlocksMyReviews = false;
+    if (questionId) {
+      const gate = await this.peerReviewUnlock(userId, questionId);
+      const [mineHere] = await this.db.query(
+        `SELECT COALESCE(peer_review_count, 0)::int AS cnt
+         FROM answer_submissions WHERE question_id = $1 AND user_id = $2`,
+        [questionId, userId]
+      );
+      unlocksMyReviews = !gate.unlocked && Number(mineHere?.cnt) > 0;
+    }
+
+    return successResponse({ submissions: rows, unlocksMyReviews });
   }
 
   // ── POST /answer-writing/review/:submissionId ─────────────────
@@ -583,16 +769,26 @@ export class AnswerWritingService {
     if (areas.some(a => !IMPROVEMENT_AREAS.includes(a))) throw new BadRequestException('Invalid improvement area');
 
     const [sub] = await this.db.query(
-      `SELECT id, user_id, status, peer_review_count FROM answer_submissions WHERE id = $1`,
+      `SELECT id, user_id, question_id, status, peer_review_count, is_seed
+       FROM answer_submissions WHERE id = $1`,
       [submissionId]
     );
     if (!sub) throw new NotFoundException('Submission not found');
     if (sub.user_id === userId) throw new BadRequestException("You can't review your own answer");
+
+    // Gate A on the write path too — the pool query enforces it when the
+    // app picks an answer, but the invariant shouldn't live in only one
+    // place. Same for the review cap (a stale list could push past it).
     const [mine] = await this.db.query(
-      `SELECT COUNT(*)::int AS cnt FROM answer_submissions WHERE user_id = $1`, [userId]
+      `SELECT COUNT(*)::int AS cnt FROM answer_submissions
+       WHERE user_id = $1 AND question_id = $2`,
+      [userId, sub.question_id]
     );
     if (Number(mine?.cnt) === 0) {
-      throw new ForbiddenException('Submit your own answer first to unlock peer reviewing.');
+      throw new ForbiddenException('Answer this question yourself before reviewing others.');
+    }
+    if (!sub.is_seed && Number(sub.peer_review_count) >= PEER_REVIEWS_MAX) {
+      throw new BadRequestException('This answer already has enough reviews — try another one.');
     }
 
     try {
@@ -640,20 +836,44 @@ export class AnswerWritingService {
       this.logger.warn(`awardCoins(peer_review) failed: ${(e as Error).message}`);
     }
 
-    // Tell the author — anonymously
-    this.notifService.pushToUser(
-      sub.user_id,
-      '🤝 Peer Review Received!',
-      `A fellow aspirant rated your answer ${'⭐'.repeat(rating)} — open the app to read it.`,
-      { type: 'peer_review_received', screen: 'answer_writing' }
-    ).catch(() => {});
+    // Tell the author — anonymously, and without leaking the rating, which
+    // they may not have unlocked yet. Sample answers have no author to tell.
+    if (!sub.is_seed) {
+      const [authorGate] = await this.db.query(
+        `SELECT ${AnswerWritingService.RECIPROCATED('$2')} AS reciprocated`,
+        [sub.user_id, sub.question_id]
+      );
+      this.notifService.pushToUser(
+        sub.user_id,
+        '🤝 Peer Review Received!',
+        authorGate?.reciprocated
+          ? 'A fellow aspirant reviewed your answer — open the app to read it.'
+          : 'A fellow aspirant reviewed your answer — review one answer on this question to unlock it.',
+        { type: 'peer_review_received', screen: 'answer_writing', questionId: sub.question_id }
+      ).catch(() => {});
+    }
+
+    // Did this review just unlock the reviewer's own feedback here?
+    const unlockedOwn = await this.peerReviewUnlock(userId, sub.question_id);
+    const [ownAnswer] = await this.db.query(
+      `SELECT COALESCE(peer_review_count, 0)::int AS cnt
+       FROM answer_submissions WHERE question_id = $1 AND user_id = $2`,
+      [sub.question_id, userId]
+    );
+    const justUnlocked = unlockedOwn.reviewsGivenHere === 1 && Number(ownAnswer?.cnt) > 0;
 
     return successResponse({
       reviewCredits: Number(me[0]?.review_credits) || 0,
       coinsEarned,
-    }, coinsEarned > 0
-      ? `Review submitted! +1 credit · 🪙 +${coinsEarned} coins`
-      : 'Review submitted! +1 review credit');
+      // true → the app pops "your reviews are now unlocked" and offers to open them
+      unlockedMyReviews: justUnlocked,
+      myReviewCount:     Number(ownAnswer?.cnt) || 0,
+      questionId:        sub.question_id,
+    }, justUnlocked
+      ? `Review submitted! Your own reviews on this question are now unlocked 🔓`
+      : coinsEarned > 0
+        ? `Review submitted! +1 credit · 🪙 +${coinsEarned} coins`
+        : 'Review submitted! +1 review credit');
   }
 }
 
@@ -700,9 +920,15 @@ export class AnswerWritingController {
   @Get('review/next')
   nextToReview(@Req() r: any) { return this.svc.nextToReview(r.user.id); }
 
-  /** GET /answer-writing/review/list — the anonymous pool to choose from */
+  /** GET /answer-writing/review/questions — questions with answers awaiting my review */
+  @Get('review/questions')
+  reviewQuestions(@Req() r: any) { return this.svc.reviewQuestions(r.user.id); }
+
+  /** GET /answer-writing/review/list?questionId= — the anonymous pool to choose from */
   @Get('review/list')
-  listToReview(@Req() r: any) { return this.svc.listToReview(r.user.id); }
+  listToReview(@Req() r: any, @Query('questionId') questionId?: string) {
+    return this.svc.listToReview(r.user.id, questionId);
+  }
 
   /** POST /answer-writing/review/:submissionId — submit a structured peer review */
   @Post('review/:submissionId')
@@ -728,7 +954,7 @@ export class AnswerWritingController {
   @Post(':id/submit-photo')
   @HttpCode(HttpStatus.OK)
   @UseInterceptors(FilesInterceptor('images', MAX_IMAGES, {
-    storage: answerImageStorage(),
+    storage: answerFileStorage(),
     limits: { fileSize: MAX_IMAGE_BYTES },
     fileFilter: (_req, file, cb) => {
       if (ANSWER_IMAGE_TYPES.includes(file.mimetype)) cb(null, true);
@@ -748,7 +974,7 @@ export class AnswerWritingController {
   @Post(':id/submit-pdf')
   @HttpCode(HttpStatus.OK)
   @UseInterceptors(FileInterceptor('pdf', {
-    storage: answerImageStorage(),   // same uploads/answers/<y>/<m> layout
+    storage: answerFileStorage(),   // same uploads/answers/<y>/<m> layout
     limits: { fileSize: MAX_PDF_BYTES },
     fileFilter: (_req, file, cb) => {
       if (ANSWER_PDF_TYPES.includes(file.mimetype)) cb(null, true);
@@ -773,6 +999,7 @@ export class AdminAnswerWritingService {
   constructor(
     @InjectDataSource() private readonly db: DataSource,
     private readonly notifService: NotificationService,
+    private readonly config: ConfigService,
   ) {}
 
   // ── Questions ────────────────────────────────────────────────
@@ -785,11 +1012,19 @@ export class AdminAnswerWritingService {
     if (status) { conditions.push(`q.status = $${params.length + 1}`);              params.push(status); }
     if (search) { conditions.push(`q.question_text ILIKE $${params.length + 1}`);   params.push(`%${search}%`); }
 
+    // pending_count counts everything a mentor still has to grade —
+    // 'peer_reviewed' answers are ungraded too, they've just been through
+    // peer review. Counting only 'submitted' hid them from the queue.
     const [rows, countResult] = await Promise.all([
       this.db.query(
         `SELECT q.*,
-           (SELECT COUNT(*)::int FROM answer_submissions WHERE question_id = q.id)                          AS submission_count,
-           (SELECT COUNT(*)::int FROM answer_submissions WHERE question_id = q.id AND status = 'submitted') AS pending_count
+           (SELECT COUNT(*)::int FROM answer_submissions
+              WHERE question_id = q.id AND is_seed = FALSE)                          AS submission_count,
+           (SELECT COUNT(*)::int FROM answer_submissions
+              WHERE question_id = q.id AND is_seed = FALSE
+                AND status IN ('submitted', 'peer_reviewed'))                        AS pending_count,
+           (SELECT COUNT(*)::int FROM answer_submissions
+              WHERE question_id = q.id AND is_seed = TRUE)                           AS seed_count
          FROM answer_questions q
          WHERE ${conditions.join(' AND ')}
          ORDER BY q.created_at DESC
@@ -807,6 +1042,13 @@ export class AdminAnswerWritingService {
 
   async createQuestion(data: any, adminId: string) {
     if (!data.questionText?.trim()) throw new BadRequestException('Question text is required');
+    // A brand-new question has no sample answer yet, so it can only start
+    // as a draft — add the sample, then publish.
+    if (data.status === 'published') {
+      throw new BadRequestException(
+        'Save the question as a draft first, add its sample answer, then publish it.'
+      );
+    }
     const rows = await this.db.query(
       `INSERT INTO answer_questions
          (question_text, subject, marks, word_limit, model_answer, tips, scheduled_for, status, created_by, is_pyq, pyq_year)
@@ -847,6 +1089,7 @@ export class AdminAnswerWritingService {
       if (data[key] !== undefined) { fields.push(`${col}=$${i++}`); vals.push(data[key] === '' ? null : data[key]); }
     }
     if (!fields.length) throw new BadRequestException('No fields to update');
+    if (data.status === 'published') await this.assertSeedBeforePublish(id);
     fields.push('updated_at=NOW()');
     // raw query() returns [rows, affectedCount] for UPDATE/DELETE RETURNING
     const [updated] = await this.db.query(
@@ -863,14 +1106,136 @@ export class AdminAnswerWritingService {
     return successResponse(null, 'Question deleted');
   }
 
+  // ── Seed ("Sample") answers ──────────────────────────────────
+  // Peer review is reciprocal per question: a student unlocks the reviews
+  // on their own answer by reviewing someone else's answer to the same
+  // question. The first student to answer has nobody to review — so every
+  // question ships with one house-authored sample answer in the pool.
+  // That is why publishing without one is refused below.
+
+  /** The reserved house account that owns every sample answer. */
+  private async seedUserId(): Promise<string> {
+    const [u] = await this.db.query(`SELECT id FROM users WHERE mobile = $1`, [SEED_USER_MOBILE]);
+    if (!u) {
+      throw new BadRequestException(
+        'The sample-answer account is missing — run migration 1785000000000 on this database.'
+      );
+    }
+    return u.id;
+  }
+
+  /** Has this question got a sample answer in the review pool yet? */
+  private async hasSeed(questionId: string): Promise<boolean> {
+    const [row] = await this.db.query(
+      `SELECT COUNT(*)::int AS cnt FROM answer_submissions
+       WHERE question_id = $1 AND is_seed = TRUE`,
+      [questionId]
+    );
+    return Number(row?.cnt) > 0;
+  }
+
+  /**
+   * Refuse to publish a question that has no sample answer.
+   *
+   * The alternative is reactive seeding ("we'll add one when someone
+   * notices"), which leaves every student who answers before that moment
+   * locked out of their own feedback. Making it a publish-time requirement
+   * means the pool is never empty by construction rather than by vigilance.
+   */
+  private async assertSeedBeforePublish(questionId: string) {
+    if (await this.hasSeed(questionId)) return;
+    throw new BadRequestException(
+      'Add a sample answer before publishing — peer review needs one answer in the pool ' +
+      'so the first student to attempt this question can unlock their own reviews.'
+    );
+  }
+
+  /**
+   * Create (or replace) the sample answer for a question. Accepts the same
+   * three formats a student can submit: typed text, up to 5 photos, or a
+   * single PDF. One sample per question — posting again replaces it.
+   */
+  async createSeedAnswer(
+    questionId: string,
+    data: any,
+    files: { images?: Express.Multer.File[]; pdf?: Express.Multer.File[] } | undefined,
+  ) {
+    const [q] = await this.db.query(
+      `SELECT id FROM answer_questions WHERE id = $1`, [questionId]
+    );
+    if (!q) throw new NotFoundException('Question not found');
+
+    const base = this.config.get<string>('BASE_URL') ?? 'https://api.bpscnotes.in';
+    const images = (files?.images ?? []).map(f => answerFileUrl(f.path, base));
+    const pdfFile = files?.pdf?.[0];
+    const pdf = pdfFile ? answerFileUrl(pdfFile.path, base) : null;
+    const text = (data?.answerText || '').trim() || null;
+
+    if (!text && !images.length && !pdf) {
+      throw new BadRequestException('A sample answer needs text, photos or a PDF');
+    }
+
+    const wordCount = text
+      ? countWords(text)
+      : Math.max(0, Math.floor(Number(data?.wordCount) || 0));
+    const userId = await this.seedUserId();
+
+    // UNIQUE(question_id, user_id) — one sample per question, so an upsert
+    // lets an admin correct a sample without deleting it first.
+    const rows = await this.db.query(
+      `INSERT INTO answer_submissions
+         (question_id, user_id, answer_text, answer_images, answer_pdf, word_count, is_seed)
+       VALUES ($1, $2, $3, $4, $5, $6, TRUE)
+       ON CONFLICT (question_id, user_id) DO UPDATE SET
+         answer_text   = EXCLUDED.answer_text,
+         answer_images = EXCLUDED.answer_images,
+         answer_pdf    = EXCLUDED.answer_pdf,
+         word_count    = EXCLUDED.word_count,
+         updated_at    = NOW()
+       RETURNING id, (xmax = 0) AS inserted`,
+      [questionId, userId, text, images.length ? images : null, pdf, wordCount]
+    );
+
+    return successResponse(
+      { seed: rows[0] },
+      rows[0]?.inserted ? 'Sample answer added ✅' : 'Sample answer replaced ✅'
+    );
+  }
+
+  async deleteSeedAnswer(questionId: string) {
+    const [row] = await this.db.query(
+      `SELECT status FROM answer_questions WHERE id = $1`, [questionId]
+    );
+    if (row?.status === 'published') {
+      throw new BadRequestException(
+        'Unpublish the question first — a published question must keep its sample answer.'
+      );
+    }
+    const [deleted] = await this.db.query(
+      `DELETE FROM answer_submissions WHERE question_id = $1 AND is_seed = TRUE RETURNING id`,
+      [questionId]
+    );
+    if (!deleted.length) throw new NotFoundException('No sample answer on this question');
+    return successResponse(null, 'Sample answer removed');
+  }
+
   // ── Submissions / review queue ───────────────────────────────
 
   async listSubmissions(query: any) {
     const { page = 1, limit = 20, status, questionId } = query;
     const offset = (page - 1) * limit;
-    const conditions = ['1=1'];
+    // Sample answers are house-authored — nobody is waiting on a grade for
+    // them, so they never enter the mentor queue.
+    const conditions = ['s.is_seed = FALSE'];
     const params: any[] = [];
-    if (status)     { conditions.push(`s.status = $${params.length + 1}`);      params.push(status); }
+    // 'pending' = everything a mentor still has to grade. An answer that has
+    // been through peer review is still ungraded — filtering on 'submitted'
+    // alone dropped it out of the queue the moment it hit two peer reviews.
+    if (status === 'pending') {
+      conditions.push(`s.status IN ('submitted', 'peer_reviewed')`);
+    } else if (status) {
+      conditions.push(`s.status = $${params.length + 1}`);      params.push(status);
+    }
     if (questionId) { conditions.push(`s.question_id = $${params.length + 1}`); params.push(questionId); }
 
     const [rows, countResult] = await Promise.all([
@@ -884,7 +1249,7 @@ export class AdminAnswerWritingService {
          JOIN users u            ON u.id = s.user_id
          JOIN answer_questions q ON q.id = s.question_id
          WHERE ${conditions.join(' AND ')}
-         ORDER BY (s.status = 'submitted') DESC, s.created_at DESC
+         ORDER BY (s.status <> 'reviewed') DESC, s.created_at DESC
          LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
         [...params, limit, offset]
       ),
@@ -957,6 +1322,40 @@ export class AdminAnswerWritingController {
   @RequirePermission('quizzes')
   @HttpCode(HttpStatus.OK)
   deleteQuestion(@Param('id') id: string) { return this.svc.deleteQuestion(id); }
+
+  /**
+   * POST /admin/answer-writing/questions/:id/seed — the sample answer that
+   * seeds peer review. Same three formats a student can submit.
+   */
+  @Post('questions/:id/seed')
+  @RequirePermission('quizzes')
+  @HttpCode(HttpStatus.OK)
+  @UseInterceptors(FileFieldsInterceptor(
+    [{ name: 'images', maxCount: MAX_IMAGES }, { name: 'pdf', maxCount: 1 }],
+    {
+      storage: answerFileStorage(),
+      limits: { fileSize: MAX_PDF_BYTES },
+      fileFilter: (_req, file, cb) => {
+        const ok = file.fieldname === 'pdf'
+          ? ANSWER_PDF_TYPES.includes(file.mimetype)
+          : ANSWER_IMAGE_TYPES.includes(file.mimetype);
+        if (ok) cb(null, true);
+        else cb(new BadRequestException('Sample answers take JPG/PNG/WebP/HEIC photos or a PDF'), false);
+      },
+    },
+  ))
+  createSeedAnswer(
+    @Param('id') id: string,
+    @UploadedFiles() files: { images?: Express.Multer.File[]; pdf?: Express.Multer.File[] },
+    @Body() dto: any,
+  ) {
+    return this.svc.createSeedAnswer(id, dto, files);
+  }
+
+  @Delete('questions/:id/seed')
+  @RequirePermission('quizzes')
+  @HttpCode(HttpStatus.OK)
+  deleteSeedAnswer(@Param('id') id: string) { return this.svc.deleteSeedAnswer(id); }
 
   @Get('submissions')
   @RequirePermission('quizzes')
