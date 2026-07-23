@@ -51,11 +51,15 @@ export class AnswerSeedAndReciprocity1785000000000 implements MigrationInterface
     // House account that owns seed answers. Named so it is obvious in any
     // admin user list — seeds are labelled "Sample answer" in the app, not
     // passed off as another student's work.
+    //
+    // Both occurrences of $1 are cast: in the SELECT list Postgres deduces
+    // the parameter as text, in `mobile = $1` as varchar, and it refuses the
+    // statement with "inconsistent types deduced for parameter $1".
     await queryRunner.query(
       `INSERT INTO users (name, mobile, mobile_verified, role, status, bio)
-       SELECT 'BPSCNotes Sample', $1, TRUE, 'student', 'active',
+       SELECT 'BPSCNotes Sample', $1::varchar, TRUE, 'student', 'active',
               'House account that owns sample answers used to seed peer review.'
-       WHERE NOT EXISTS (SELECT 1 FROM users WHERE mobile = $1)`,
+       WHERE NOT EXISTS (SELECT 1 FROM users WHERE mobile = $1::varchar)`,
       [AnswerSeedAndReciprocity1785000000000.SEED_USER_MOBILE]
     );
   }
