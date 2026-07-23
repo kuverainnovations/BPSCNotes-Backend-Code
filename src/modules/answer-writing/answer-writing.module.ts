@@ -75,6 +75,20 @@ const MAX_IMPROVEMENT_AREAS = 3; // "top three weaknesses"
 // first student to answer a question can still unlock their own feedback.
 const SEED_USER_MOBILE = '0000000001';
 
+// ── Reviewer reputation ───────────────────────────────────────
+// Only the author of a reviewed answer may vote on the review, and the
+// rating is the share of a reviewer's VOTED-ON reviews judged helpful,
+// mapped onto 1–5 stars. Reviews nobody voted on don't count either way,
+// so a reviewer is never punished for reviewing quiet answers.
+const RATING_MIN = 1;
+const RATING_MAX = 5;
+// Below this share, after enough votes to be more than noise, reviews
+// stop earning coins. The review is still recorded and still satisfies
+// the reciprocity unlock — the incentive to farm coins is what goes, not
+// the ability to participate. The app is told why.
+const LOW_REPUTATION_RATIO   = 0.25;
+const LOW_REPUTATION_MIN_VOTED = 5;
+
 /** IST calendar date (YYYY-MM-DD) for a timestamp */
 const istDate = (d: Date | string): string =>
   new Date(d).toLocaleDateString('en-CA', { timeZone: 'Asia/Kolkata' });
@@ -250,8 +264,30 @@ export class AnswerWritingService {
       [userId]
     );
 
+    // Reviewer standing + what reviewing has actually paid out, and where
+    // this user sits among reviewers (client: "Ranking #18").
+    const reputation = await this.reviewerReputation(userId);
+    const [coinRow] = await this.db.query(
+      `SELECT COALESCE(SUM(amount), 0)::int AS coins
+       FROM coin_transactions WHERE user_id = $1 AND action = 'peer_review'`,
+      [userId]
+    );
+    const [rankRow] = await this.db.query(
+      `SELECT rank FROM (
+         SELECT reviewer_id, RANK() OVER (ORDER BY COUNT(*) DESC)::int AS rank
+         FROM answer_peer_reviews GROUP BY reviewer_id
+       ) r WHERE r.reviewer_id = $1`,
+      [userId]
+    );
+
     const monthlyGoal = 10; // answers per month — product default
     return successResponse({
+      helpfulReviews:  reputation.helpfulReviews,
+      votedReviews:    reputation.votedReviews,
+      reviewerRating:  reputation.reviewerRating,
+      lowReputation:   reputation.lowReputation,
+      coinsFromReviews: Number(coinRow?.coins) || 0,
+      reviewerRank:    rankRow?.rank != null ? Number(rankRow.rank) : null,
       topWeaknesses:    weaknessRows.map((w: any) => ({ area: w.area, count: Number(w.cnt) })),
       answersWritten:   Number(row.answers_written) || 0,
       answersThisMonth: Number(row.answers_this_month) || 0,
@@ -272,14 +308,22 @@ export class AnswerWritingService {
   // rating, min 2 rated answers). Names are public here by design —
   // recognition is the reward; individual reviews stay anonymous.
   async leaderboard(userId: string) {
+    // Reviewers rank on volume, but the helpful share is shown beside it so
+    // the board rewards useful reviewing rather than fast reviewing.
     const topReviewers = await this.db.query(
       `SELECT u.name, COUNT(*)::int AS reviews_given,
               COALESCE(u.review_credits, 0) AS review_credits,
+              COUNT(*) FILTER (WHERE pr.helpful_votes > pr.unhelpful_votes)::int AS helpful_reviews,
+              CASE WHEN COUNT(*) FILTER (WHERE pr.helpful_votes + pr.unhelpful_votes > 0) > 0
+                   THEN ROUND((${RATING_MIN} + (${RATING_MAX} - ${RATING_MIN}) *
+                        (COUNT(*) FILTER (WHERE pr.helpful_votes > pr.unhelpful_votes)::numeric
+                         / NULLIF(COUNT(*) FILTER (WHERE pr.helpful_votes + pr.unhelpful_votes > 0), 0)))::numeric, 1)
+                   ELSE NULL END AS reviewer_rating,
               (u.id = $1) AS is_me
        FROM answer_peer_reviews pr
        JOIN users u ON u.id = pr.reviewer_id
        GROUP BY u.id, u.name, u.review_credits
-       ORDER BY reviews_given DESC, review_credits DESC
+       ORDER BY reviews_given DESC, helpful_reviews DESC, review_credits DESC
        LIMIT 10`,
       [userId]
     );
@@ -386,10 +430,18 @@ export class AnswerWritingService {
     if (sub) {
       gate = await this.peerReviewUnlock(userId, questionId);
       if (gate.unlocked) {
+        // Ordered most-useful-first (the client's "Top Review Highlights"):
+        // reviews the author found helpful rise, ones they marked unhelpful
+        // sink, unvoted ones sit in between by recency.
         peerReviews = await this.db.query(
-          `SELECT verdict, rating, improvement_area, improvement_areas, suggestion, created_at
-           FROM answer_peer_reviews WHERE submission_id = $1 ORDER BY created_at DESC`,
-          [sub.id]
+          `SELECT pr.id, pr.verdict, pr.rating, pr.improvement_area, pr.improvement_areas,
+                  pr.suggestion, pr.created_at, pr.helpful_votes, pr.unhelpful_votes,
+                  v.helpful AS my_vote
+           FROM answer_peer_reviews pr
+           LEFT JOIN answer_review_votes v ON v.review_id = pr.id AND v.voter_id = $2
+           WHERE pr.submission_id = $1
+           ORDER BY (pr.helpful_votes - pr.unhelpful_votes) DESC, pr.created_at DESC`,
+          [sub.id, userId]
         );
       } else {
         // Locked: the count is the carrot ("2 reviews waiting"), but the
@@ -635,6 +687,98 @@ export class AnswerWritingService {
     });
   }
 
+  // ═══════════════════════════════════════════════════════════
+  // REVIEWER REPUTATION
+  // ═══════════════════════════════════════════════════════════
+
+  /**
+   * A reviewer's standing, from the votes their reviews received.
+   *
+   * voted   — my reviews that got at least one vote
+   * helpful — of those, the ones the author judged useful
+   * rating  — helpful share on a 1–5 scale, null until anything is voted
+   */
+  private async reviewerReputation(userId: string) {
+    const [row] = await this.db.query(
+      `SELECT
+         COUNT(*) FILTER (WHERE helpful_votes + unhelpful_votes > 0)::int AS voted,
+         COUNT(*) FILTER (WHERE helpful_votes > unhelpful_votes)::int     AS helpful,
+         COUNT(*)::int                                                    AS given
+       FROM answer_peer_reviews WHERE reviewer_id = $1`,
+      [userId]
+    );
+    const voted   = Number(row?.voted) || 0;
+    const helpful = Number(row?.helpful) || 0;
+    const ratio   = voted > 0 ? helpful / voted : null;
+    return {
+      reviewsGiven:   Number(row?.given) || 0,
+      helpfulReviews: helpful,
+      votedReviews:   voted,
+      helpfulRatio:   ratio,
+      reviewerRating: ratio === null
+        ? null
+        : Math.round((RATING_MIN + (RATING_MAX - RATING_MIN) * ratio) * 10) / 10,
+      // Coins are withheld once a reviewer is demonstrably unhelpful
+      lowReputation: voted >= LOW_REPUTATION_MIN_VOTED && (ratio ?? 1) < LOW_REPUTATION_RATIO,
+    };
+  }
+
+  // ── POST /answer-writing/review/:reviewId/vote ────────────────
+  // "Was this review useful?" — answered by the author of the reviewed
+  // answer, who is the only person positioned to judge it. Voting again
+  // changes the vote rather than erroring, so a mis-tap is recoverable.
+  async voteOnReview(reviewId: string, userId: string, body: { helpful?: boolean }) {
+    if (typeof body?.helpful !== 'boolean') {
+      throw new BadRequestException('helpful must be true or false');
+    }
+
+    const [review] = await this.db.query(
+      `SELECT pr.id, pr.reviewer_id, s.user_id AS author_id, s.question_id
+       FROM answer_peer_reviews pr
+       JOIN answer_submissions s ON s.id = pr.submission_id
+       WHERE pr.id = $1`,
+      [reviewId]
+    );
+    if (!review) throw new NotFoundException('Review not found');
+    if (review.author_id !== userId) {
+      throw new ForbiddenException('Only the author of the answer can rate this review');
+    }
+    // You must be able to READ a review before judging it, so the same
+    // reciprocity gate applies here.
+    const gate = await this.peerReviewUnlock(userId, review.question_id);
+    if (!gate.unlocked) {
+      throw new ForbiddenException('Review one answer on this question to unlock your reviews first');
+    }
+
+    await this.db.query(
+      `INSERT INTO answer_review_votes (review_id, voter_id, helpful)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (review_id, voter_id)
+       DO UPDATE SET helpful = EXCLUDED.helpful, updated_at = NOW()`,
+      [reviewId, userId, body.helpful]
+    );
+
+    const [counts] = await this.db.query(
+      `UPDATE answer_peer_reviews pr SET
+         helpful_votes   = agg.helpful,
+         unhelpful_votes = agg.unhelpful
+       FROM (
+         SELECT COUNT(*) FILTER (WHERE helpful)::int     AS helpful,
+                COUNT(*) FILTER (WHERE NOT helpful)::int AS unhelpful
+         FROM answer_review_votes WHERE review_id = $1
+       ) agg
+       WHERE pr.id = $1
+       RETURNING pr.helpful_votes, pr.unhelpful_votes`,
+      [reviewId]
+    );
+
+    return successResponse({
+      helpfulVotes:   Number(counts?.[0]?.helpful_votes) || 0,
+      unhelpfulVotes: Number(counts?.[0]?.unhelpful_votes) || 0,
+      myVote:         body.helpful,
+    }, body.helpful ? 'Thanks — marked as helpful' : 'Thanks for the feedback');
+  }
+
   // ── GET /answer-writing/review/stats — powers the Peer Review card ──
   async reviewStats(userId: string) {
     const [given]  = await this.db.query(
@@ -829,11 +973,17 @@ export class AnswerWritingService {
        WHERE id = $1 RETURNING review_credits`,
       [userId]
     );
+    // Coins, unless this reviewer's own reviews are consistently voted
+    // unhelpful. The review still counts and still unlocks their feedback —
+    // what stops is the reward for churning them out.
+    const reputation = await this.reviewerReputation(userId);
     let coinsEarned = 0;
-    try {
-      coinsEarned = await this.authService.awardCoins(userId, 'peer_review');
-    } catch (e) {
-      this.logger.warn(`awardCoins(peer_review) failed: ${(e as Error).message}`);
+    if (!reputation.lowReputation) {
+      try {
+        coinsEarned = await this.authService.awardCoins(userId, 'peer_review');
+      } catch (e) {
+        this.logger.warn(`awardCoins(peer_review) failed: ${(e as Error).message}`);
+      }
     }
 
     // Tell the author — anonymously, and without leaking the rating, which
@@ -865,11 +1015,16 @@ export class AnswerWritingService {
     return successResponse({
       reviewCredits: Number(me[0]?.review_credits) || 0,
       coinsEarned,
+      // Told, not silently withheld — the app shows why
+      lowReputation:     reputation.lowReputation,
+      reviewerRating:    reputation.reviewerRating,
       // true → the app pops "your reviews are now unlocked" and offers to open them
       unlockedMyReviews: justUnlocked,
       myReviewCount:     Number(ownAnswer?.cnt) || 0,
       questionId:        sub.question_id,
-    }, justUnlocked
+    }, reputation.lowReputation
+      ? 'Review submitted. Your recent reviews were rated unhelpful, so this one earns no coins — more specific feedback earns them back.'
+      : justUnlocked
       ? `Review submitted! Your own reviews on this question are now unlocked 🔓`
       : coinsEarned > 0
         ? `Review submitted! +1 credit · 🪙 +${coinsEarned} coins`
@@ -935,6 +1090,16 @@ export class AnswerWritingController {
   @HttpCode(HttpStatus.OK)
   submitPeerReview(@Param('submissionId') submissionId: string, @Req() r: any, @Body() body: any) {
     return this.svc.submitPeerReview(submissionId, r.user.id, body);
+  }
+
+  /**
+   * POST /answer-writing/review/vote/:reviewId — "was this review useful?"
+   * Answered by the author of the reviewed answer. Body: { helpful: boolean }.
+   */
+  @Post('review/vote/:reviewId')
+  @HttpCode(HttpStatus.OK)
+  voteOnReview(@Param('reviewId') reviewId: string, @Req() r: any, @Body() body: any) {
+    return this.svc.voteOnReview(reviewId, r.user.id, body);
   }
 
   /** GET /answer-writing/:id */
