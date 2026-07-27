@@ -599,7 +599,8 @@ export class AnswerWritingService {
   // students' answers always get the review capacity first.
   // ═══════════════════════════════════════════════════════════
 
-  /** WHERE clause for the pool of answers this user may review ($1 = userId). */
+  /** WHERE clause for the pool of answers this user may STILL review ($1 = userId).
+   *  Excludes ones they've already reviewed — used for counts + reciprocity. */
   private reviewPoolFilter(userId: string) {
     return `
       s.user_id != $1
@@ -612,11 +613,31 @@ export class AnswerWritingService {
       )`;
   }
 
-  /** Real answers before samples, then give-to-get, then neediest/oldest. */
+  /** WHERE clause for the answers a user may SEE in the review list ($1 = userId).
+   *  Like the pool, but keeps answers they've already reviewed so they stay on
+   *  the list to read and learn from (client, 26 Jul) — the app shows those
+   *  read-only with the review already given. */
+  private reviewVisibleFilter(userId: string) {
+    return `
+      s.user_id != $1
+      AND s.status != 'reviewed'
+      AND s.question_id IN (SELECT question_id FROM answer_submissions WHERE user_id = $1)
+      AND (
+        s.is_seed OR s.peer_review_count < ${PEER_REVIEWS_MAX}
+        OR EXISTS (
+          SELECT 1 FROM answer_peer_reviews pr
+          WHERE pr.submission_id = s.id AND pr.reviewer_id = $1
+        )
+      )`;
+  }
+
+  /** Not-yet-reviewed first, then real answers before samples, neediest/oldest. */
   private static readonly POOL_ORDER = `
-    ORDER BY s.is_seed ASC, EXISTS (
-      SELECT 1 FROM answer_peer_reviews g WHERE g.reviewer_id = s.user_id
-    ) DESC, s.peer_review_count ASC, s.created_at ASC`;
+    ORDER BY
+      EXISTS (SELECT 1 FROM answer_peer_reviews m WHERE m.submission_id = s.id AND m.reviewer_id = $1) ASC,
+      s.is_seed ASC,
+      EXISTS (SELECT 1 FROM answer_peer_reviews g WHERE g.reviewer_id = s.user_id) DESC,
+      s.peer_review_count ASC, s.created_at ASC`;
 
   /**
    * Per-question reciprocity check.
@@ -661,7 +682,9 @@ export class AnswerWritingService {
       `SELECT q.id, q.question_text, q.subject, q.marks, q.word_limit,
               COALESCE(q.is_pyq, FALSE) AS is_pyq, q.pyq_year,
               (SELECT COUNT(*)::int FROM answer_submissions s
-                 WHERE s.question_id = q.id AND ${this.reviewPoolFilter(userId)}) AS pending_count,
+                 WHERE s.question_id = q.id AND ${this.reviewPoolFilter(userId)})    AS pending_count,
+              (SELECT COUNT(*)::int FROM answer_submissions s
+                 WHERE s.question_id = q.id AND ${this.reviewVisibleFilter(userId)}) AS answer_count,
               (SELECT COUNT(*)::int FROM answer_peer_reviews pr
                  JOIN answer_submissions s2 ON s2.id = pr.submission_id
                  WHERE pr.reviewer_id = $1 AND s2.question_id = q.id)            AS my_reviews_here,
@@ -675,14 +698,19 @@ export class AnswerWritingService {
     );
 
     return successResponse({
-      questions: rows.map((r: any) => ({
-        ...r,
-        pending_count:       Number(r.pending_count) || 0,
-        my_reviews_here:     Number(r.my_reviews_here) || 0,
-        my_reviews_received: Number(r.my_reviews_received) || 0,
-        // true → reviewing here unlocks the feedback on my own answer
-        unlocks_my_reviews:  Number(r.my_reviews_here) === 0 && Number(r.my_reviews_received) > 0,
-      })),
+      // Keep any question that still has answers I can open (to review OR to
+      // re-read), not just ones with pending reviews.
+      questions: rows
+        .filter((r: any) => Number(r.answer_count) > 0)
+        .map((r: any) => ({
+          ...r,
+          pending_count:       Number(r.pending_count) || 0,
+          answer_count:        Number(r.answer_count) || 0,
+          my_reviews_here:     Number(r.my_reviews_here) || 0,
+          my_reviews_received: Number(r.my_reviews_received) || 0,
+          // true → reviewing here unlocks the feedback on my own answer
+          unlocks_my_reviews:  Number(r.my_reviews_here) === 0 && Number(r.my_reviews_received) > 0,
+        })),
       totalPending: rows.reduce((n: number, r: any) => n + (Number(r.pending_count) || 0), 0),
     });
   }
@@ -838,11 +866,15 @@ export class AnswerWritingService {
     return successResponse({ submission: next || null });
   }
 
-  // ── GET /answer-writing/review/list — the pool I can pick from ──
-  // Same eligibility as review/next, but returns a browsable list so the
-  // reviewer chooses which answer to review (QA 21-07 Issue 12). Pass
-  // questionId for peer review screen 2 — the answers under one question.
-  // Still anonymous — no reviewer/author identity leaks.
+  // ── GET /answer-writing/review/list — the answers I can pick from ──
+  // Returns a browsable list so the reviewer chooses which answer to review
+  // (QA 21-07 Issue 12). Pass questionId for peer review screen 2 — the
+  // answers under one question. Still anonymous — no reviewer/author leaks.
+  //
+  // Answers the user has ALREADY reviewed stay on the list (client, 26 Jul):
+  // students learn from reading other answers, so a reviewed one isn't
+  // removed — it comes back with `reviewed_by_me` + the review they gave, and
+  // the app shows it read-only. Not-yet-reviewed answers sort first.
   //
   // Deliberately NOT returned per answer: avg_peer_rating. A visible score
   // anchors the reviewer to the existing average before they have formed
@@ -863,10 +895,17 @@ export class AnswerWritingService {
     const rows = await this.db.query(
       `SELECT s.id, s.answer_text, s.answer_images, s.answer_pdf, s.word_count, s.created_at,
               s.peer_review_count, s.is_seed,
-              q.id AS question_id, q.question_text, q.subject, q.marks, q.word_limit
+              q.id AS question_id, q.question_text, q.subject, q.marks, q.word_limit,
+              (mine.id IS NOT NULL)      AS reviewed_by_me,
+              mine.verdict               AS my_verdict,
+              mine.rating                AS my_rating,
+              mine.improvement_area      AS my_improvement_area,
+              mine.improvement_areas     AS my_improvement_areas,
+              mine.suggestion            AS my_suggestion
        FROM answer_submissions s
        JOIN answer_questions q ON q.id = s.question_id
-       WHERE ${this.reviewPoolFilter(userId)} ${scope}
+       LEFT JOIN answer_peer_reviews mine ON mine.submission_id = s.id AND mine.reviewer_id = $1
+       WHERE ${this.reviewVisibleFilter(userId)} ${scope}
        ${AnswerWritingService.POOL_ORDER}
        LIMIT ${questionId ? 50 : 20}`,
       params
