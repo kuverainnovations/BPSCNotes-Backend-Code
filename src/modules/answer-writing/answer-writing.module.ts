@@ -1207,13 +1207,10 @@ export class AdminAnswerWritingService {
 
   async createQuestion(data: any, adminId: string) {
     if (!data.questionText?.trim()) throw new BadRequestException('Question text is required');
-    // A brand-new question has no sample answer yet, so it can only start
-    // as a draft — add the sample, then publish.
-    if (data.status === 'published') {
-      throw new BadRequestException(
-        'Save the question as a draft first, add its sample answer, then publish it.'
-      );
-    }
+    // A sample answer seeds peer review, but it isn't mandatory: if a student
+    // has nothing to review, findOne auto-unlocks their own reviews. So a
+    // question can be published straight away; the sample is a recommended
+    // extra, nudged in the admin UI, not a hard gate.
     const rows = await this.db.query(
       `INSERT INTO answer_questions
          (question_text, subject, marks, word_limit, model_answer, tips, scheduled_for, status, created_by, is_pyq, pyq_year)
@@ -1254,7 +1251,6 @@ export class AdminAnswerWritingService {
       if (data[key] !== undefined) { fields.push(`${col}=$${i++}`); vals.push(data[key] === '' ? null : data[key]); }
     }
     if (!fields.length) throw new BadRequestException('No fields to update');
-    if (data.status === 'published') await this.assertSeedBeforePublish(id);
     fields.push('updated_at=NOW()');
     // raw query() returns [rows, affectedCount] for UPDATE/DELETE RETURNING
     const [updated] = await this.db.query(
@@ -1272,11 +1268,11 @@ export class AdminAnswerWritingService {
   }
 
   // ── Seed ("Sample") answers ──────────────────────────────────
-  // Peer review is reciprocal per question: a student unlocks the reviews
-  // on their own answer by reviewing someone else's answer to the same
-  // question. The first student to answer has nobody to review — so every
-  // question ships with one house-authored sample answer in the pool.
-  // That is why publishing without one is refused below.
+  // Peer review is reciprocal per question: a student unlocks the reviews on
+  // their own answer by reviewing someone else's answer to the same question.
+  // A house-authored sample answer gives the first student something to
+  // review. It's recommended but optional — if the pool is empty, findOne
+  // auto-unlocks the student's reviews — so it no longer gates publishing.
 
   /** The reserved house account that owns every sample answer. */
   private async seedUserId(): Promise<string> {
@@ -1287,32 +1283,6 @@ export class AdminAnswerWritingService {
       );
     }
     return u.id;
-  }
-
-  /** Has this question got a sample answer in the review pool yet? */
-  private async hasSeed(questionId: string): Promise<boolean> {
-    const [row] = await this.db.query(
-      `SELECT COUNT(*)::int AS cnt FROM answer_submissions
-       WHERE question_id = $1 AND is_seed = TRUE`,
-      [questionId]
-    );
-    return Number(row?.cnt) > 0;
-  }
-
-  /**
-   * Refuse to publish a question that has no sample answer.
-   *
-   * The alternative is reactive seeding ("we'll add one when someone
-   * notices"), which leaves every student who answers before that moment
-   * locked out of their own feedback. Making it a publish-time requirement
-   * means the pool is never empty by construction rather than by vigilance.
-   */
-  private async assertSeedBeforePublish(questionId: string) {
-    if (await this.hasSeed(questionId)) return;
-    throw new BadRequestException(
-      'Add a sample answer before publishing — peer review needs one answer in the pool ' +
-      'so the first student to attempt this question can unlock their own reviews.'
-    );
   }
 
   /**
@@ -1368,14 +1338,6 @@ export class AdminAnswerWritingService {
   }
 
   async deleteSeedAnswer(questionId: string) {
-    const [row] = await this.db.query(
-      `SELECT status FROM answer_questions WHERE id = $1`, [questionId]
-    );
-    if (row?.status === 'published') {
-      throw new BadRequestException(
-        'Unpublish the question first — a published question must keep its sample answer.'
-      );
-    }
     const [deleted] = await this.db.query(
       `DELETE FROM answer_submissions WHERE question_id = $1 AND is_seed = TRUE RETURNING id`,
       [questionId]
