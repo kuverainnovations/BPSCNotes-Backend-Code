@@ -161,8 +161,11 @@ export class AnswerWritingService {
   }
 
   // ── GET /answer-writing — published questions with my status ──
-  // "Today's question" = the one scheduled for today (IST); the app
-  // pins it as the hero card. Unscheduled questions just list below.
+  // Each question has an EFFECTIVE DAY (IST): its scheduled_for if set,
+  // otherwise the day it was created. Questions for today's day sit at the
+  // top ("Today"); older days fall into history — all by date, so the roll
+  // to a new day is automatic and needs no cron. Admin can post any number
+  // of questions for the same day; the app groups them under that day.
   async findAll(userId: string, page = 1, limit = 20, subject?: string) {
     const offset = (page - 1) * limit;
     const conditions = [`q.status = 'published'`];
@@ -172,13 +175,18 @@ export class AnswerWritingService {
     conditions.push(`(q.scheduled_for IS NULL OR q.scheduled_for <= (NOW() AT TIME ZONE 'Asia/Kolkata')::date)`);
     const where = conditions.join(' AND ');
 
+    // effective day = scheduled_for, else the IST calendar day it was created
+    const effDay = `COALESCE(q.scheduled_for, (q.created_at AT TIME ZONE 'Asia/Kolkata')::date)`;
+    const today  = `(NOW() AT TIME ZONE 'Asia/Kolkata')::date`;
+
     const [rows, countResult] = await Promise.all([
       this.db.query(
         `SELECT
            q.id, q.question_text, q.subject, q.marks, q.word_limit,
            q.scheduled_for, q.created_at,
+           ${effDay}              AS effective_date,
            COALESCE(q.is_pyq, FALSE) AS is_pyq, q.pyq_year,
-           (q.scheduled_for = (NOW() AT TIME ZONE 'Asia/Kolkata')::date) AS is_today,
+           (${effDay} = ${today}) AS is_today,
            s.id IS NOT NULL                        AS is_submitted,
            s.status                                AS my_status,
            s.score                                 AS my_score,
@@ -187,7 +195,7 @@ export class AnswerWritingService {
          FROM answer_questions q
          LEFT JOIN answer_submissions s ON s.question_id = q.id AND s.user_id = $${params.length + 1}
          WHERE ${where}
-         ORDER BY q.scheduled_for DESC NULLS LAST, q.created_at DESC
+         ORDER BY ${effDay} DESC, q.created_at DESC
          LIMIT $${params.length + 2} OFFSET $${params.length + 3}`,
         [...params, userId, limit, offset]
       ),
