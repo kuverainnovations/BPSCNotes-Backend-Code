@@ -815,6 +815,60 @@ export class AnswerWritingService {
     }, body.helpful ? 'Thanks — marked as helpful' : 'Thanks for the feedback');
   }
 
+  // ── POST /answer-writing/answer/:submissionId/helpful ─────────
+  // "Helpful? 👍👎" on an ANSWER while reviewing it (client Screen 3).
+  // Any peer who attempted the same question can react; not your own
+  // answer. Voting again flips it. Counts are denormalised for the list.
+  async voteAnswerHelpful(submissionId: string, userId: string, body: { helpful?: boolean }) {
+    if (typeof body?.helpful !== 'boolean') {
+      throw new BadRequestException('helpful must be true or false');
+    }
+
+    const [sub] = await this.db.query(
+      `SELECT id, user_id, question_id FROM answer_submissions WHERE id = $1`,
+      [submissionId]
+    );
+    if (!sub) throw new NotFoundException('Answer not found');
+    if (sub.user_id === userId) throw new BadRequestException("You can't rate your own answer");
+    // Same competence gate as reviewing: you must have attempted this question.
+    const [mine] = await this.db.query(
+      `SELECT COUNT(*)::int AS cnt FROM answer_submissions
+       WHERE user_id = $1 AND question_id = $2`,
+      [userId, sub.question_id]
+    );
+    if (Number(mine?.cnt) === 0) {
+      throw new ForbiddenException('Answer this question yourself before rating others.');
+    }
+
+    await this.db.query(
+      `INSERT INTO answer_helpful_votes (submission_id, voter_id, helpful)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (submission_id, voter_id)
+       DO UPDATE SET helpful = EXCLUDED.helpful, updated_at = NOW()`,
+      [submissionId, userId, body.helpful]
+    );
+
+    const [counts] = await this.db.query(
+      `UPDATE answer_submissions s SET
+         helpful_count     = agg.helpful,
+         not_helpful_count = agg.not_helpful
+       FROM (
+         SELECT COUNT(*) FILTER (WHERE helpful)::int     AS helpful,
+                COUNT(*) FILTER (WHERE NOT helpful)::int AS not_helpful
+         FROM answer_helpful_votes WHERE submission_id = $1
+       ) agg
+       WHERE s.id = $1
+       RETURNING s.helpful_count, s.not_helpful_count`,
+      [submissionId]
+    );
+
+    return successResponse({
+      helpfulCount:    Number(counts?.[0]?.helpful_count) || 0,
+      notHelpfulCount: Number(counts?.[0]?.not_helpful_count) || 0,
+      myVote:          body.helpful,
+    }, body.helpful ? 'Thanks — marked as helpful' : 'Thanks for the feedback');
+  }
+
   // ── GET /answer-writing/review/stats — powers the Peer Review card ──
   async reviewStats(userId: string) {
     const [given]  = await this.db.query(
@@ -909,10 +963,14 @@ export class AnswerWritingService {
               mine.rating                AS my_rating,
               mine.improvement_area      AS my_improvement_area,
               mine.improvement_areas     AS my_improvement_areas,
-              mine.suggestion            AS my_suggestion
+              mine.suggestion            AS my_suggestion,
+              COALESCE(s.helpful_count, 0)     AS helpful_count,
+              COALESCE(s.not_helpful_count, 0) AS not_helpful_count,
+              hv.helpful                       AS my_helpful_vote
        FROM answer_submissions s
        JOIN answer_questions q ON q.id = s.question_id
        LEFT JOIN answer_peer_reviews mine ON mine.submission_id = s.id AND mine.reviewer_id = $1
+       LEFT JOIN answer_helpful_votes hv ON hv.submission_id = s.id AND hv.voter_id = $1
        WHERE ${this.reviewVisibleFilter(userId)} ${scope}
        ${AnswerWritingService.POOL_ORDER}
        LIMIT ${questionId ? 50 : 20}`,
@@ -1147,6 +1205,16 @@ export class AnswerWritingController {
   @HttpCode(HttpStatus.OK)
   voteOnReview(@Param('reviewId') reviewId: string, @Req() r: any, @Body() body: any) {
     return this.svc.voteOnReview(reviewId, r.user.id, body);
+  }
+
+  /**
+   * POST /answer-writing/answer/:submissionId/helpful — "Helpful? 👍👎" on an
+   * answer while reviewing it. Body: { helpful: boolean }.
+   */
+  @Post('answer/:submissionId/helpful')
+  @HttpCode(HttpStatus.OK)
+  voteAnswerHelpful(@Param('submissionId') submissionId: string, @Req() r: any, @Body() body: any) {
+    return this.svc.voteAnswerHelpful(submissionId, r.user.id, body);
   }
 
   /** GET /answer-writing/:id */
