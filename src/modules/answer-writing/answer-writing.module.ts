@@ -458,6 +458,28 @@ export class AnswerWritingService {
       }
     }
 
+    // Sample answer — the house-authored reference the admin uploaded, shown
+    // on the detail screen as a readable "Sample answer" so students can learn
+    // from it. Revealed only AFTER the student submits their own answer (same
+    // spirit as the model answer), so it can't just be copied.
+    let sampleAnswer: any = null;
+    if (sub) {
+      const [seed] = await this.db.query(
+        `SELECT answer_text, answer_images, answer_pdf, word_count
+         FROM answer_submissions WHERE question_id = $1 AND is_seed = TRUE
+         ORDER BY created_at ASC LIMIT 1`,
+        [questionId]
+      );
+      if (seed) {
+        sampleAnswer = {
+          answer_text:   seed.answer_text,
+          answer_images: seed.answer_images,
+          answer_pdf:    seed.answer_pdf,
+          word_count:    seed.word_count,
+        };
+      }
+    }
+
     const { model_answer, ...rest } = q;
     const revealModelAnswer = !!sub && istDate(new Date()) > istDate(sub.created_at);
     return successResponse({
@@ -468,6 +490,7 @@ export class AnswerWritingService {
         model_answer_tomorrow: !!sub && !revealModelAnswer && !!model_answer,
       },
       submission: sub || null,
+      sampleAnswer,
       peerReviews,
       // Reciprocity state for this question — drives the locked card + CTA
       peerReviewsLocked: !!sub && !gate.unlocked,
@@ -571,12 +594,27 @@ export class AnswerWritingService {
       this.logger.warn(`awardCoins(answer_writing) failed: ${(e as Error).message}`);
     }
 
+    // Sample answer unlocks the moment they submit — return it so the app can
+    // show the reference straight away, not only on the next open.
+    const [seed] = await this.db.query(
+      `SELECT answer_text, answer_images, answer_pdf, word_count
+       FROM answer_submissions WHERE question_id = $1 AND is_seed = TRUE
+       ORDER BY created_at ASC LIMIT 1`,
+      [questionId]
+    );
+
     return successResponse({
       submission,
       coinsEarned,
       // Client rule: the model answer reveals NEXT DAY, never on submit
       modelAnswer: null,
       modelAnswerTomorrow: !!q.model_answer,
+      sampleAnswer: seed ? {
+        answer_text:   seed.answer_text,
+        answer_images: seed.answer_images,
+        answer_pdf:    seed.answer_pdf,
+        word_count:    seed.word_count,
+      } : null,
     }, coinsEarned > 0
       ? `Answer submitted! 🪙 +${coinsEarned} coins — the model answer unlocks tomorrow.`
       : 'Answer submitted! The model answer unlocks tomorrow.');
