@@ -19,6 +19,37 @@ import { successResponse, paginationMeta } from '../../common/utils/response.uti
 import { AuthModule, AuthService } from '../auth/auth.module';
 import { NotificationsModule, NotificationService } from '../combined-modules-1.module';
 
+// The model answer is now authored in the same rich-text editor as Current
+// Affairs (client, 29 Jul), so it arrives as HTML. Sanitise it server-side
+// with the same allowlist CA uses — never trust the client, since the app
+// renders it in a WebView.
+const sanitizeHtml = require('sanitize-html');
+const MODEL_ANSWER_SANITIZE = {
+  allowedTags: [
+    'p', 'br', 'strong', 'em', 'u', 's', 'span', 'a', 'ul', 'ol', 'li', 'mark',
+    'h1', 'h2', 'h3', 'blockquote', 'img', 'table', 'thead', 'tbody', 'tr', 'th', 'td',
+  ],
+  allowedAttributes: {
+    a: ['href', 'target', 'rel'], img: ['src', 'alt', 'style'], span: ['style'], mark: ['style'],
+    p: ['style'], h1: ['style'], h2: ['style'], h3: ['style'], table: ['style'], td: ['style'], th: ['style'],
+  },
+  allowedStyles: {
+    '*': {
+      color: [/^#[0-9a-fA-F]{3,8}$/, /^rgba?\(/],
+      'background-color': [/^#[0-9a-fA-F]{3,8}$/, /^rgba?\(/],
+      'text-align': [/^left$|^center$|^right$/],
+      width: [/^\d+(%|px)$/],
+    },
+  },
+  allowedSchemes: ['http', 'https'],
+  transformTags: { a: sanitizeHtml.simpleTransform('a', { rel: 'noopener noreferrer nofollow', target: '_blank' }) },
+};
+const sanitizeModelAnswer = (html: any): string | null => {
+  const s = typeof html === 'string' ? html.trim() : '';
+  if (!s) return null;
+  return sanitizeHtml(s, MODEL_ANSWER_SANITIZE) || null;
+};
+
 // ════════════════════════════════════════════════════════════
 // FILE: backend/src/modules/answer-writing/answer-writing.module.ts
 //
@@ -1374,7 +1405,7 @@ export class AdminAnswerWritingService {
         data.subject || null,
         Math.max(1, +data.marks || 10),
         Math.max(50, +data.wordLimit || 250),
-        data.modelAnswer || null,
+        sanitizeModelAnswer(data.modelAnswer),
         data.tips || null,
         data.scheduledFor || null,
         data.status === 'published' ? 'published' : 'draft',
@@ -1401,7 +1432,11 @@ export class AdminAnswerWritingService {
     };
     const fields: string[] = []; const vals: any[] = []; let i = 1;
     for (const [key, col] of Object.entries(map)) {
-      if (data[key] !== undefined) { fields.push(`${col}=$${i++}`); vals.push(data[key] === '' ? null : data[key]); }
+      if (data[key] !== undefined) {
+        // Model answer is rich HTML now — sanitise it like every other field's raw value stays as-is.
+        const raw = key === 'modelAnswer' ? sanitizeModelAnswer(data[key]) : (data[key] === '' ? null : data[key]);
+        fields.push(`${col}=$${i++}`); vals.push(raw);
+      }
     }
     if (!fields.length) throw new BadRequestException('No fields to update');
     fields.push('updated_at=NOW()');
