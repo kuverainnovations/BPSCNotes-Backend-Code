@@ -145,7 +145,7 @@ export class AdminDashboardService {
         SELECT
           (SELECT COUNT(*) FROM courses WHERE status='published') AS courses,
           (SELECT COUNT(*) FROM library_notes WHERE status='published') AS notes,
-          (SELECT COUNT(*) FROM quizzes WHERE status='published') AS quizzes,
+          (SELECT COUNT(*) FROM quizzes WHERE status='published' AND is_custom = FALSE) AS quizzes,
           (SELECT COUNT(*) FROM current_affairs WHERE status='published') AS affairs,
           (SELECT COUNT(*) FROM job_vacancies WHERE status='active') AS jobs,
           (SELECT COUNT(*) FROM study_materials WHERE status='approved') AS study_materials,

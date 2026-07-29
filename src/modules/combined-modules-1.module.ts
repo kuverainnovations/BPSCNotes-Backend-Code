@@ -2898,7 +2898,7 @@ class SearchService {
       types.includes('quizzes')
         ? this.db.query(
             `SELECT id, title, subject, type, total_questions, duration_mins
-             FROM quizzes WHERE status='published' AND (title ILIKE $1 OR subject ILIKE $1)
+             FROM quizzes WHERE status='published' AND is_custom = FALSE AND (title ILIKE $1 OR subject ILIKE $1)
              LIMIT 10`,
             [term]
           )

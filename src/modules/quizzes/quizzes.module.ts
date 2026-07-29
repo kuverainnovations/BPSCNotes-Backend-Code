@@ -37,7 +37,9 @@ class QuizzesService {
   async findAll(query: PaginationDto & any, userId: string) {
     const { page = 1, limit = 20, type, subject, exam } = query;
     const offset = (page - 1) * limit;
-    const conditions = [`q.status = 'published'`, `q.total_questions > 0`];
+    // is_custom rows are user-generated practice tests — private to their
+    // creator, never catalogue content.
+    const conditions = [`q.status = 'published'`, `q.total_questions > 0`, `q.is_custom = FALSE`];
     const params: any[] = [];
 
     if (type)    { conditions.push(`q.type=$${params.length + 1}`);            params.push(type); }
@@ -270,6 +272,114 @@ class QuizzesService {
       );
     }
     return successResponse(null, 'Session abandoned');
+  }
+
+  // ── POST /quizzes/custom ──────────────────────────────────────
+  // Builds a practice test on demand from the existing question pool.
+  //
+  // The result is a real `quizzes` row, so start/resume/submit/negative
+  // marking/review all work through the normal pipeline with no special
+  // cases. It's flagged is_custom so it stays out of every listing, and
+  // carries coins_reward=0 — otherwise a user could mint unlimited
+  // self-built quizzes and farm the perfect-score coin award.
+  async createCustomQuiz(userId: string, dto: any) {
+    const subjects = Array.isArray(dto?.subjects)
+      ? dto.subjects.map((s: any) => String(s)).filter(Boolean)
+      : [];
+    const requested    = Math.min(100, Math.max(5,  parseInt(dto?.questionCount, 10) || 30));
+    const durationMins = Math.min(300, Math.max(1,  parseInt(dto?.durationMins,  10) || 45));
+    const negative     = dto?.negativeMarking === true || dto?.negativeMarking === 'true';
+
+    // Draw from published, non-custom quizzes only — a previously generated
+    // test must never become source material for the next one.
+    const params: any[] = [];
+    let subjectFilter = '';
+    if (subjects.length) {
+      subjectFilter = `AND qq.subject = ANY($${params.length + 1})`;
+      params.push(subjects);
+    }
+    params.push(requested);
+
+    const pool = await this.db.query(
+      `SELECT qq.question_text, qq.option_a, qq.option_b, qq.option_c, qq.option_d,
+              qq.correct_option, qq.explanation, qq.subject, qq.difficulty
+         FROM quiz_questions qq
+         JOIN quizzes q ON q.id = qq.quiz_id
+        WHERE q.status = 'published' AND q.is_custom = FALSE ${subjectFilter}
+        ORDER BY RANDOM()
+        LIMIT $${params.length}`,
+      params
+    );
+
+    if (pool.length < 5) {
+      throw new BadRequestException(
+        subjects.length
+          ? `Not enough questions for ${subjects.join(', ')} yet. Try more subjects or fewer questions.`
+          : 'Not enough questions available yet to build a custom test.'
+      );
+    }
+
+    const title = subjects.length === 1
+      ? `Custom Test — ${subjects[0]}`
+      : `Custom Test — ${subjects.length ? `${subjects.length} subjects` : 'All Subjects'}`;
+
+    const [quiz] = await this.db.query(
+      `INSERT INTO quizzes
+         (title, description, subject, type, total_questions, duration_mins, coins_reward,
+          status, is_custom, created_by_user_id,
+          negative_marking_enabled, marks_per_correct, marks_per_wrong)
+       VALUES ($1,$2,$3,'topic',$4,$5,0,'published',TRUE,$6,$7,1,$8)
+       RETURNING id`,
+      [
+        title,
+        `Self-built practice test · ${pool.length} questions · ${durationMins} min`,
+        subjects.length === 1 ? subjects[0] : null,
+        pool.length,
+        durationMins,
+        userId,
+        negative,
+        negative ? 0.33 : 0,
+      ]
+    );
+
+    // Questions are COPIED rather than referenced: the source quiz can be
+    // edited or unpublished later, and a test already taken must keep the
+    // exact wording it was answered against.
+    const values: string[] = [];
+    const qParams: any[] = [];
+    pool.forEach((q: any, i: number) => {
+      const b = i * 10;
+      values.push(`($${b+1},$${b+2},$${b+3},$${b+4},$${b+5},$${b+6},$${b+7},$${b+8},$${b+9},$${b+10})`);
+      qParams.push(
+        quiz.id, q.question_text, q.option_a, q.option_b, q.option_c, q.option_d,
+        q.correct_option, q.explanation, q.subject, i,
+      );
+    });
+    await this.db.query(
+      `INSERT INTO quiz_questions
+         (quiz_id, question_text, option_a, option_b, option_c, option_d,
+          correct_option, explanation, subject, sort_order)
+       VALUES ${values.join(',')}`,
+      qParams
+    );
+
+    // Self-cleaning: one row per generated test adds up. Drop this user's
+    // older abandoned generations — never any that were actually attempted,
+    // since quiz_attempts cascades and that would erase their history.
+    await this.db.query(
+      `DELETE FROM quizzes
+        WHERE is_custom = TRUE AND created_by_user_id = $1 AND id <> $2
+          AND created_at < NOW() - INTERVAL '1 day'
+          AND NOT EXISTS (SELECT 1 FROM quiz_attempts a WHERE a.quiz_id = quizzes.id)`,
+      [userId, quiz.id]
+    ).catch(() => {});
+
+    return successResponse(
+      { quizId: quiz.id, totalQuestions: pool.length, durationMins, requestedQuestions: requested },
+      pool.length < requested
+        ? `Built with ${pool.length} questions — that's all we have for this selection.`
+        : 'Custom test ready',
+    );
   }
 
   // ── POST /quizzes/:id/submit ─────────────────────────────────
@@ -649,7 +759,9 @@ return successResponse({
   async findAllAdmin(query: any) {
     const { page = 1, limit = 20, status, type, search } = query;
     const offset = (page - 1) * limit;
-    const conditions = ['1=1'];
+    // Hide user-generated practice tests from the admin catalogue too —
+    // they're private and would otherwise swamp the real quizzes.
+    const conditions = ['is_custom = FALSE'];
     const params: any[] = [];
     if (status) { conditions.push(`status=$${params.length + 1}`); params.push(status); }
     if (type)   { conditions.push(`type=$${params.length + 1}`);   params.push(type); }
@@ -1144,6 +1256,20 @@ class QuizzesController {
   @Header('Cache-Control', 'no-store')
   findAll(@Query() q: any, @Req() r: any) {
     return this.s.findAll(q, r.user.id);
+  }
+
+  /**
+   * POST /quizzes/custom — build a practice test from the question pool.
+   * Body: { subjects?: string[], questionCount?: number, durationMins?: number,
+   *         negativeMarking?: boolean }
+   * Returns { quizId } — the caller then starts it like any other quiz.
+   *
+   * Declared above the ':id' routes so "custom" is never swallowed as an id.
+   */
+  @Post('custom')
+  @HttpCode(HttpStatus.OK)
+  createCustom(@Req() r: any, @Body() dto: any) {
+    return this.s.createCustomQuiz(r.user.id, dto);
   }
 
   /** GET /quizzes/:id — quiz info only, NO questions */
