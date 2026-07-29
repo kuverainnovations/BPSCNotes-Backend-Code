@@ -30,6 +30,7 @@ class QuizzesService {
     private readonly achievementsService: AchievementsService,
     private readonly challengesService: WeeklyChallengesService,
     private readonly notifService: NotificationService,
+    private readonly activityLog: ActivityLogService,
   ) {}
 
   // ── GET /quizzes — list with is_attempted flag ──────────────
@@ -244,6 +245,11 @@ class QuizzesService {
     await this.db.query(
       `INSERT INTO quiz_attempts (user_id, quiz_id, attempted_at) VALUES ($1, $2, NOW())`,
       [userId, quizId]
+    );
+
+    await this.activityLog.log(
+      userId, ACTIONS.QUIZ_STARTED, `Started quiz: ${q.title}`,
+      { quizId, sessionId, subject: q.subject || null, questionCount: questions.length },
     );
 
     return successResponse({ quiz: q, questions, sessionId });
@@ -599,6 +605,11 @@ const percentile = Number(
       correct: s.correct,
       score:   s.total > 0 ? Math.round((s.correct / s.total) * 100) : 0,
     }));
+
+    await this.activityLog.log(
+      userId, ACTIONS.QUIZ_SUBMITTED, `Scored ${score}% on quiz: ${q.title}`,
+      { quizId, attemptId: attempt[0].id, score, correct, total, coinsEarned, timeTakenSecs },
+    );
 
 return successResponse({
   attemptId: attempt[0].id,

@@ -28,6 +28,7 @@ import { PaginationDto } from '../common/dtos/pagination.dto';
 import { successResponse, paginationMeta } from '../common/utils/response.util';
 import { streamArticlePdf } from '../common/utils/article-pdf-generator.util';
 import { getOneTimeProductPurchase } from '../common/utils/gplay-purchase.util';
+import { ActivityLogService, ACTIONS } from '../common/activity/activity-log.service';
 import { storeReportAndStampExternalTransaction, ExternalTransactionTable } from '../common/utils/gplay-external-transactions.util';
 import { AuthService } from './auth/auth.module';
 import { ensureFirebaseAdmin } from '../common/firebase/firebase-admin';
@@ -1390,6 +1391,7 @@ class SubscriptionsService {
     @InjectDataSource() private readonly db: DataSource,
     private readonly config: ConfigService,
     @Inject(CACHE_MANAGER) private readonly cache: Cache,
+    private readonly activityLog: ActivityLogService,
     @Inject('NOTIFICATION_SERVICE') @Optional() private readonly notifService?: {
       pushToUser: (userId: string, title: string, body: string, data?: Record<string, string>) => Promise<boolean>;
     },
@@ -1643,6 +1645,12 @@ class SubscriptionsService {
 
     await this.cache.del(`user:${userId}`);
 
+    await this.activityLog.log(
+      userId, ACTIONS.SUBSCRIPTION_STARTED,
+      `Subscribed to the ${sub.plan} plan`,
+      { subscriptionId: subId, plan: sub.plan, amount: sub.final_amount, provider: 'cashfree', source: 'verify' },
+    );
+
     // User choice billing: report the Cashfree payment to Google Play.
     // Token was stored at initiate(); data.externalTransactionToken is a
     // fallback for an app that only obtained it later in the flow (the
@@ -1837,6 +1845,12 @@ class SubscriptionsService {
       await this.cache.del(`user:${sub.user_id}`);
       console.log(`Webhook: subscription ${sub.id} activated for user ${sub.user_id}`);
 
+      await this.activityLog.log(
+        sub.user_id, ACTIONS.SUBSCRIPTION_STARTED,
+        `Subscribed to the ${sub.plan} plan`,
+        { subscriptionId: sub.id, plan: sub.plan, amount: sub.final_amount, provider: 'cashfree', source: 'webhook' },
+      );
+
       // User choice billing: the webhook can be the only completion path
       // (app killed before its confirm call), so the report to Play happens
       // here too — token was stored on the row at initiate(). Duplicate
@@ -2004,6 +2018,12 @@ class SubscriptionsService {
     }
 
     await this.cache.del(`user:${userId}`);
+
+    await this.activityLog.log(
+      userId, ACTIONS.SUBSCRIPTION_STARTED,
+      `Subscribed to the ${resolvedPlan} plan`,
+      { plan: resolvedPlan, amount: plan.price, provider: 'gplay', productId, source: 'gplay_verify' },
+    );
 
     // ── Acknowledge the purchase — REQUIRED within 3 days or Google
     // automatically refunds it and revokes the entitlement. Best-effort:
@@ -2306,7 +2326,7 @@ class AdminSubscriptionsController {
   @Delete('coupons/:id') @RequirePermission('subscriptions') deleteCoupon(@Param('id', ParseUUIDPipe) id: string) { return this.s.deleteCoupon(id); }
 }
 
-@Module({ imports:[ConfigModule], controllers:[SubscriptionsController, WebhookController, AdminSubscriptionsController], providers:[SubscriptionsService] })
+@Module({ imports:[ConfigModule], controllers:[SubscriptionsController, WebhookController, AdminSubscriptionsController], providers:[SubscriptionsService, ActivityLogService] })
 export class SubscriptionsModule {}
 
 // ════════════════════════════════════════════════════════════

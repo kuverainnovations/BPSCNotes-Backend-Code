@@ -91,7 +91,7 @@ export class StudyMaterialsService {
     @Inject(CACHE_MANAGER) private readonly cache:  Cache,
     private readonly config: ConfigService,
     private readonly coinsService: CoinsService,
-
+    private readonly activityLog: ActivityLogService,
   ) {
     // UPLOAD_DIR defaults to <project-root>/uploads — change in .env for production
     this.uploadDir = './uploads';
@@ -433,6 +433,12 @@ export class StudyMaterialsService {
     ]);
 
     this.logger.log(`📤 Material uploaded: ${result.id} by user ${userId} — file: ${fileKey} — pages: ${pageCount}`);
+
+    await this.activityLog.log(
+      userId, ACTIONS.MATERIAL_UPLOADED, `Uploaded material: ${result.title}`,
+      { materialId: result.id, subject: dto.subject.trim(), materialType: matType, price, pageCount },
+    );
+
     return successResponse({
       id:        result.id,
       title:     result.title,
@@ -502,6 +508,11 @@ export class StudyMaterialsService {
     // Record in history (creates table if needed)
     await this.recordDownloadHistory(id, userId);
 
+    await this.activityLog.log(
+      userId, ACTIONS.MATERIAL_DOWNLOADED, `Downloaded material: ${mat.title}`,
+      { materialId: id },
+    );
+
     return successResponse({ downloadUrl: this.fileUrl(fileKey), title: mat.title });
   }
 
@@ -515,6 +526,12 @@ export class StudyMaterialsService {
       return successResponse({ bookmarked: false });
     } else {
       await this.db.query(`INSERT INTO material_bookmarks (material_id, user_id) VALUES ($1,$2) ON CONFLICT DO NOTHING`, [materialId, userId]);
+      // Only the bookmark half is logged — un-bookmarking isn't an activity
+      // worth a feed row, and logging both would double every toggle.
+      await this.activityLog.log(
+        userId, ACTIONS.MATERIAL_BOOKMARKED, 'Bookmarked a study material',
+        { materialId },
+      );
       return successResponse({ bookmarked: true });
     }
   }
@@ -1279,6 +1296,11 @@ console.log("==============================");
         [materialId, userId]
       );
       const fileUrl = await this.fileUrlForMaterial(materialId);
+      // Free materials skip finalizeMaterialPurchase, so they need their own log call.
+      await this.activityLog.log(
+        userId, ACTIONS.MATERIAL_PURCHASED, `Added free material: ${material.title}`,
+        { materialId, price: 0, coinsApplied: 0 },
+      );
       return successResponse({ purchased: true, alreadyPurchased: false, coinsSpent: 0, amountDueInr: 0, fileUrl },
         '🎉 Added to your library!');
     }
@@ -1671,6 +1693,16 @@ console.log("SECRET =", cfMap["cashfree_secret_key"]?.substring(0, 10));
 
 
     const fileUrl = await this.fileUrlForMaterial(material.id);
+
+    // Single funnel for every paid path (coins-only, Cashfree, GPlay), so one
+    // log call here covers them all.
+    await this.activityLog.log(
+      userId, ACTIONS.MATERIAL_PURCHASED, `Purchased material: ${material.title}`,
+      {
+        materialId: material.id, purchaseOrderId, price: fullPrice,
+        coinsApplied, coinDiscountInr, amountPaidInr: fullPrice - coinDiscountInr,
+      },
+    );
 
     return successResponse({
       purchased: true, alreadyPurchased: false,

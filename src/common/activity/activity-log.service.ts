@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, Logger } from '@nestjs/common';
 import { InjectDataSource } from '@nestjs/typeorm';
 import { DataSource } from 'typeorm';
 
@@ -34,6 +34,8 @@ export const ACTIONS = {
 
 @Injectable()
 export class ActivityLogService {
+  private readonly logger = new Logger(ActivityLogService.name);
+
   constructor(@InjectDataSource() private readonly db: DataSource) {}
 
   async log(
@@ -49,6 +51,12 @@ export class ActivityLogService {
         'INSERT INTO user_activity_log (user_id, action, description, metadata, ip_address) VALUES ($1,$2,$3,$4,$5)',
         [userId || null, action, description || null, JSON.stringify(metadata || {}), ipAddress || null]
       );
-    } catch (_) { /* non-blocking */ }
+    } catch (err: any) {
+      // Still non-blocking — an audit row must never fail a user's request.
+      // But it is logged now: this used to swallow silently, which is how
+      // course/quiz/material/session/premium logging sat broken for weeks
+      // while the admin Activity page looked healthy on auth rows alone.
+      this.logger.warn(`activity log failed (action=${action}): ${err?.message ?? err}`);
+    }
   }
 }

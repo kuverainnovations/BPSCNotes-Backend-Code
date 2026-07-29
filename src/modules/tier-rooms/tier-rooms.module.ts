@@ -921,7 +921,6 @@ export class StudySessionsService {
   private readonly BASE_XP_PER_MINUTE  = 1;
   private readonly HEARTBEAT_INTERVAL_S = 300;
   private readonly AFK_THRESHOLD_S     = 420;
-  activityLog: any;
 
   constructor(
     @InjectDataSource() private readonly db: DataSource,
@@ -930,6 +929,7 @@ export class StudySessionsService {
     private readonly notifService: TierNotificationsService,
     private readonly gateway: TierRoomsGateway,
     private readonly antiCheat: AntiCheatService,
+    private readonly activityLog: ActivityLogService,
   ) {}
 
   // Converts an anti-cheat BLOCK result into a human-readable message
@@ -1015,7 +1015,7 @@ export class StudySessionsService {
         .catch(() => {});
     }
 
-    await this.activityLog?.log(userId, ACTIONS.STUDY_SESSION_STARTED, 'Study session started', { sessionId: session[0].id, mode: sessionMode }).catch(()=>{});
+    await this.activityLog.log(userId, ACTIONS.STUDY_SESSION_STARTED, 'Study session started', { sessionId: session[0].id, mode: sessionMode });
     return successResponse({
       sessionId: session[0].id, startedAt: session[0].started_at,
       mode: session[0].mode, tierId: session[0].tier_id,
@@ -1363,7 +1363,7 @@ export class StudySessionsService {
         }
       }
 
-      await this.activityLog?.log(userId, ACTIONS.STUDY_SESSION_ENDED, `Study session ended - ${s.active_minutes} active mins`, { sessionId, activeMinutes: s.active_minutes, coins: s.coins_earned }).catch(()=>{});
+      await this.activityLog.log(userId, ACTIONS.STUDY_SESSION_ENDED, `Study session ended - ${s.active_minutes} active mins`, { sessionId, activeMinutes: s.active_minutes, coins: s.coins_earned });
     } catch (err: any) {
       // The session is already ended in the DB at this point — log and
       // continue so the client still gets a successful response instead

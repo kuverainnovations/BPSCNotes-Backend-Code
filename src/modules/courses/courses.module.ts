@@ -388,7 +388,7 @@ export class CoursesService {
     @Inject(CACHE_MANAGER) private readonly cache: Cache,
     @InjectDataSource() private readonly db: DataSource,
     private readonly notifService: NotificationService,
-    private readonly activityLog?: ActivityLogService,
+    private readonly activityLog: ActivityLogService,
   ) {}
 
   // Reads a numeric value from app_settings (e.g. coin_to_inr_rate,
@@ -600,6 +600,11 @@ export class CoursesService {
       `You've been enrolled in your new course. Tap to start your first lesson! 🎯`,
       { type: 'course_enrolled', courseId, screen: 'my_courses' }
     ).catch(() => {});
+
+    await this.activityLog.log(
+      userId, ACTIONS.COURSE_ENROLLED, `Enrolled in course: ${course[0].title}`,
+      { courseId, isPaid: course[0].is_paid, price: course[0].price, coinsApplied: coinsToApply },
+    );
 
     return successResponse(null, 'Enrolled successfully! Start learning 🚀');
   }
@@ -999,6 +1004,12 @@ export class CoursesService {
       }
     }
 
+    await this.activityLog.log(
+      userId, ACTIONS.LESSON_COMPLETED,
+      `Completed lesson ${completedLessons} of ${totalLessons}`,
+      { courseId, lessonId, completedLessons, totalLessons, courseCompleted: isCompleted, watchTimeSecs: newWatchSecs },
+    );
+
     return successResponse({ completedLessons, totalLessons, isCompleted });
   }
 
@@ -1169,6 +1180,12 @@ export class CoursesService {
       [courseId]
     );
     await this.cache.del(`course:${courseId}:*`);
+
+    await this.activityLog.log(
+      userId, ACTIONS.COURSE_REVIEW_SUBMITTED, `Rated a course ${dto.rating}★`,
+      { courseId, rating: dto.rating, hasComment: !!dto.comment },
+    );
+
     return successResponse(null, 'Review submitted');
   }
 
