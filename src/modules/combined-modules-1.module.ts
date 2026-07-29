@@ -807,6 +807,7 @@ class JobsService implements OnModuleInit {
     @InjectDataSource() private readonly db: DataSource,
     @Inject(CACHE_MANAGER) private readonly cache: Cache,
     private readonly config: ConfigService,
+    private readonly activityLog: ActivityLogService,
   ) {
     this.uploadDir = this.config.get('UPLOAD_DIR') || './uploads';
   }
@@ -935,6 +936,12 @@ class JobsService implements OnModuleInit {
     );
     if (inserted.length) {
       await this.db.query(`UPDATE job_vacancies SET save_count=save_count+1 WHERE id=$1`, [jobId]);
+      // Guarded by `inserted` for the same reason as the count bump — a repeat
+      // save is a no-op, not a new activity.
+      const [job] = await this.db.query(`SELECT title FROM job_vacancies WHERE id=$1`, [jobId]);
+      await this.activityLog.log(
+        userId, ACTIONS.JOB_SAVED, `Saved job: ${job?.title ?? jobId}`, { jobId },
+      );
     }
     return successResponse({ isSaved: true }, 'Job saved');
   }
@@ -1346,7 +1353,7 @@ class AdminJobsController {
   ) { return this.s.adminUploadAdvertPdf(id, file); }
 }
 
-@Module({ controllers:[JobsController, AdminJobsController], providers:[JobsService] })
+@Module({ controllers:[JobsController, AdminJobsController], providers:[JobsService, ActivityLogService] })
 export class JobsModule {}
 
 // ════════════════════════════════════════════════════════════

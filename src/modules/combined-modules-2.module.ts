@@ -29,6 +29,7 @@ import { generateCertificatePdf } from '../common/utils/certificate-generator.ut
 import * as crypto         from 'crypto';
 import { PaginationDto } from '../common/dtos/pagination.dto';
 import { successResponse, paginationMeta } from '../common/utils/response.util';
+import { ActivityLogService, ACTIONS } from '../common/activity/activity-log.service';
 
 import {
   UseInterceptors,
@@ -816,6 +817,7 @@ class UsersService {
     @InjectDataSource() private readonly db: DataSource,
     @Inject(CACHE_MANAGER) private readonly cache: Cache,
     private readonly config: ConfigService,
+    private readonly activityLog: ActivityLogService,
   ) {}
 
   async getProfile(userId: string) {
@@ -1267,8 +1269,23 @@ class UsersService {
   }
 
   async registerLiveClass(classId: string, userId: string) {
-    await this.db.query(`INSERT INTO live_class_registrations VALUES ($1,$2) ON CONFLICT DO NOTHING`, [classId, userId]);
+    // RETURNING tells us whether this was a genuinely new registration, so a
+    // repeat tap doesn't add a second activity row.
+    const inserted = await this.db.query(
+      `INSERT INTO live_class_registrations VALUES ($1,$2) ON CONFLICT DO NOTHING RETURNING user_id`,
+      [classId, userId]
+    );
     await this.db.query(`UPDATE live_classes SET registered_count=registered_count+1 WHERE id=$1`, [classId]);
+
+    if (inserted.length) {
+      const [cls] = await this.db.query(`SELECT title, scheduled_at FROM live_classes WHERE id=$1`, [classId]);
+      await this.activityLog.log(
+        userId, ACTIONS.LIVE_CLASS_REGISTERED,
+        `Registered for live class: ${cls?.title ?? classId}`,
+        { classId, scheduledAt: cls?.scheduled_at ?? null },
+      );
+    }
+
     return successResponse(null, 'Registered for live class!');
   }
 
@@ -1532,7 +1549,7 @@ class StreakReminderService {
   }
 }
 
-@Module({ imports:[ConfigModule], controllers:[UsersController, AdminUsersExtraController], providers:[UsersService, LeaderboardCronService, StreakReminderService], exports:[UsersService] })
+@Module({ imports:[ConfigModule], controllers:[UsersController, AdminUsersExtraController], providers:[UsersService, LeaderboardCronService, StreakReminderService, ActivityLogService], exports:[UsersService] })
 export class UsersModule {}
 
 // ════════════════════════════════════════════════════════════

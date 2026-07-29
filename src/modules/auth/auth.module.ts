@@ -411,6 +411,14 @@ export class AuthService {
       // Welcome bonus to the new user for signing up via referral
       // (action='referral_joined', admin-editable on the Coins page).
       await this.awardCoins(newUser.id, 'referral_joined');
+
+      // Logged against the referrer — they're the one whose code was used,
+      // and the referee already gets a user_registered row just below.
+      await this.activityLog.log(
+        referrerId, ACTIONS.REFERRAL_USED,
+        `Their referral code was used by ${dto.name}`,
+        { refereeId: newUser.id, referralCode: dto.referralCode || null },
+      );
     }
 
     await this.activityLog.log(newUser.id, ACTIONS.USER_REGISTERED, `New user registered: ${dto.name}`, { mobile, referralCode: dto.referralCode || null });
@@ -868,7 +876,7 @@ export class AuthService {
         maxPerDay === 1 ? `${action}:${today}` :
         null;
 
-      return await this.db.transaction(async (em) => {
+      const awarded = await this.db.transaction(async (em) => {
         // Lock the user row for the duration of this transaction.
         // Concurrent awardCoins() calls for the same user serialize here —
         // the second call sees the first call's committed idempotency record.
@@ -927,6 +935,19 @@ export class AuthService {
         await this.cache.del(`user:${userId}`);
         return coinsToAward;
       });
+
+      // Outside the transaction on purpose — the user row is locked inside it,
+      // and an audit insert must not extend that lock. A non-zero return means
+      // coins genuinely moved (idempotency key and daily cap both return 0),
+      // so this can't double-log a replayed event.
+      if (awarded > 0) {
+        await this.activityLog.log(
+          userId, ACTIONS.COINS_AWARDED, `Earned ${awarded} coins — ${action.replace(/_/g, ' ')}`,
+          { action, coins: awarded, refId: refId ?? null },
+        );
+      }
+
+      return awarded;
 
     } catch (err: any) {
       console.error('awardCoins error:', err.message);

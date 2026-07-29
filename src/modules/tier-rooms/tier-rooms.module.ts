@@ -40,6 +40,7 @@ export class TierRoomsService {
     private readonly authService: AuthService,
     private readonly gateway: TierRoomsGateway,
     private readonly notifService: TierNotificationsService,
+    private readonly activityLog: ActivityLogService,
   ) {}
 
   private computeProgress(user: any, rule: any, totalHours: number): number {
@@ -86,6 +87,11 @@ export class TierRoomsService {
         toTierId, t.tier_key, userId, userRow?.name ?? 'Member',
         'promoted', { tierName: t.name, tierEmoji: t.icon_emoji },
       ).catch(() => {});
+
+      await this.activityLog.log(
+        userId, ACTIONS.TIER_PROMOTED, `Promoted to ${t.name} ${t.icon_emoji ?? ''}`.trim(),
+        { toTierId, fromTierId, tierKey: t.tier_key, tierName: t.name },
+      );
     }
   }
 
@@ -1473,6 +1479,7 @@ export class TierRoomsCronService {
     private readonly antiCheat: AntiCheatService,
     private readonly gateway: TierRoomsGateway,
     private readonly notifService: TierNotificationsService,
+    private readonly activityLog: ActivityLogService,
   ) {}
 
   @Cron('*/5 * * * *')
@@ -1765,6 +1772,11 @@ export class TierRoomsCronService {
         toTierId, t.tier_key, userId, userRow?.name ?? 'Member',
         'promoted', { tierName: t.name, tierEmoji: t.icon_emoji },
       ).catch(() => {});
+
+      await this.activityLog.log(
+        userId, ACTIONS.TIER_PROMOTED, `Promoted to ${t.name} ${t.icon_emoji ?? ''}`.trim(),
+        { toTierId, fromTierId, tierKey: t.tier_key, tierName: t.name },
+      );
     }
   }
 
