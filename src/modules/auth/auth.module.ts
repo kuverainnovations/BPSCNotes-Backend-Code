@@ -335,6 +335,16 @@ export class AuthService {
   }
 
   async register(dto: RegisterDto) {
+    // Admin "New Registrations" switch. The app disables the signup button too,
+    // but that is only a courtesy — the switch has to be enforced here or an
+    // older build (or anything hitting the API directly) walks straight past it.
+    const [flag] = await this.db.query(
+      `SELECT value FROM app_settings WHERE key = 'new_registrations'`,
+    );
+    if (flag && flag.value === 'false') {
+      throw new BadRequestException('New registrations are temporarily closed. Please try again later.');
+    }
+
     let decoded: any;
     try {
       decoded = this.jwtService.verify(dto.tempToken, {

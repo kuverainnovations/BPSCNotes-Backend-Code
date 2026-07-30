@@ -329,6 +329,7 @@ export class AdminSettingsService {
       SELECT key, value FROM app_settings
       WHERE key IN ('maintenance_mode','force_update','app_version','min_app_version',
                     'new_registrations','android_store_url','support_email',
+                    'study_rooms_enabled',
                     'daily_quiz_limit','leaderboard_enabled','ads_enabled',
                     'coin_system_enabled','coin_to_inr_rate',
                     'rank_tier_0','rank_tier_1','rank_tier_2','rank_tier_3',
@@ -338,8 +339,29 @@ export class AdminSettingsService {
                     'notif_daily_quiz_enabled','notif_streak_risk_enabled','notif_target_reminder_enabled')
     `);
     const rawConfig = Object.fromEntries(result.map(r => [r.key, r.value]));
-    // Provide defaults for keys not yet set by admin
+    // Provide defaults for keys not yet set by admin.
+    //
+    // EVERY key the app reads MUST have a default here. A key that is absent
+    // from both app_settings and this map is simply not sent, and the client
+    // silently falls back to its own hardcoded value — which is how the update
+    // gate sat dead in production: app_version/min_app_version/force_update
+    // were never seeded, so the app always compared itself against "1.0.0"
+    // and never prompted anyone. Seeded for real in 1785400000000.
     const defaults: Record<string, string> = {
+      // ── App controls ────────────────────────────────────────
+      maintenance_mode:      'false',
+      new_registrations:     'true',
+      study_rooms_enabled:   'true',
+      support_email:         'admin@bpscnotes.in',
+      // ── Update gate ─────────────────────────────────────────
+      // force_update is the kill-switch; min_app_version is the hard floor.
+      // Keep min_app_version at the lowest published version — raising it
+      // locks every user below it out of the app until they update.
+      force_update:          'false',
+      app_version:           '1.0.4',
+      min_app_version:       '1.0.0',
+      android_store_url:     'https://play.google.com/store/apps/details?id=com.bpscnotes.app',
+      // ── Everything else ─────────────────────────────────────
       daily_quiz_limit:      '5',
       leaderboard_enabled:   'true',
       ads_enabled:           'true',
