@@ -358,10 +358,14 @@ class DailyTargetsService {
   // ── GET /users/daily-targets/history/:date ────────────────
   async getHistoryByDate(userId: string, date: string) {
     const rows = await this.db.query(
+      // NB: keep this column list in step with the daily_targets schema. It used
+      // to select coins_earned, which has never existed on this table — the
+      // endpoint 500'd on every call, unnoticed because nothing called it until
+      // the Target History detail view shipped.
       `SELECT
          id, title, subject, difficulty, time_slot, estimated_minutes,
-         total_questions, is_completed, completed_at, coins_earned,
-         target_date::text AS date
+         total_questions, attempted_questions, is_completed, is_carried_forward,
+         completed_at, target_date::text AS date
        FROM daily_targets
        WHERE user_id=$1
          AND target_date=$2::date
