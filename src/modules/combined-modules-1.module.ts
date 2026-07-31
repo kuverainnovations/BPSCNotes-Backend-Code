@@ -212,6 +212,7 @@ class CurrentAffairsService {
     const [rows, countResult, prelimsResult, mainsResult, importantResult] = await Promise.all([
       this.db.query(
         `SELECT ca.id, ca.title, ca.summary, ca.full_content, ca.key_points, ca.exam_relevance, ca.important_facts,
+                ca.major_issues, ca.govt_initiatives, ca.bihar_specific, ca.way_forward, ca.quotes,
                 ca.category, ca.categories, ca.date, ca.is_important, ca.exam_tags, ca.tags, ca.status,
                 ca.view_count, ca.bookmark_count, ca.created_at, ca.read_time,
                 ca.mcq_negative_marking_override, ca.mcq_marks_per_correct_override, ca.mcq_marks_per_wrong_override,
@@ -275,8 +276,9 @@ class CurrentAffairsService {
     const result = await this.db.query(
       `INSERT INTO current_affairs
          (title, summary, full_content, key_points, exam_relevance, important_facts,
+          major_issues, govt_initiatives, bihar_specific, way_forward, quotes,
           category, categories, source, date, is_important, exam_tags, tags, status, author, read_time, created_by)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17) RETURNING *`,
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22) RETURNING *`,
       [
         sanitizeCaInline(data.title),
         sanitizeCaInline(data.summary),
@@ -284,6 +286,11 @@ class CurrentAffairsService {
         data.keyPoints   ? sanitizeCaContent(data.keyPoints)   : null,
         data.examRelevance ? sanitizeCaContent(data.examRelevance) : null,
         data.importantFacts ? sanitizeCaContent(data.importantFacts) : null,
+        data.majorIssues     ? sanitizeCaContent(data.majorIssues)     : null,
+        data.govtInitiatives ? sanitizeCaContent(data.govtInitiatives) : null,
+        data.biharSpecific   ? sanitizeCaContent(data.biharSpecific)   : null,
+        data.wayForward      ? sanitizeCaContent(data.wayForward)      : null,
+        data.quotes          ? sanitizeCaContent(data.quotes)          : null,
         categories[0] ?? data.category ?? null, categories, data.source,
         data.date||new Date().toISOString().split('T')[0],
         data.isImportant||false, mergedTags, data.tags||[],
@@ -299,12 +306,19 @@ class CurrentAffairsService {
     const map: any = {
       title:'title', summary:'summary', fullContent:'full_content',
       keyPoints:'key_points', examRelevance:'exam_relevance', importantFacts:'important_facts',
+      majorIssues:'major_issues', govtInitiatives:'govt_initiatives',
+      biharSpecific:'bihar_specific', wayForward:'way_forward', quotes:'quotes',
       category:'category', source:'source', date:'date', isImportant:'is_important',
       status:'status', readTime:'read_time',
     };
+    // Every section is admin-authored rich HTML and must go through the sanitizer.
+    const RICH_HTML_KEYS = new Set([
+      'fullContent', 'keyPoints', 'examRelevance', 'importantFacts',
+      'majorIssues', 'govtInitiatives', 'biharSpecific', 'wayForward', 'quotes',
+    ]);
     for (const [key, col] of Object.entries(map)) {
       if (data[key] !== undefined) {
-        const val = (key === 'fullContent' || key === 'keyPoints' || key === 'examRelevance' || key === 'importantFacts')
+        const val = RICH_HTML_KEYS.has(key)
           ? sanitizeCaContent(data[key])
           : (key === 'title' || key === 'summary') ? sanitizeCaInline(data[key])
           : data[key];
@@ -548,7 +562,9 @@ class CurrentAffairsService {
   // ── PDF export ───────────────────────────────────────────────
   async streamPdf(affairId: string, res: Response, uploadDir: string) {
     const result = await this.db.query(
-      `SELECT title, summary, category, date, source, tags, full_content, key_points, exam_relevance, important_facts FROM current_affairs
+      `SELECT title, summary, category, date, source, tags, full_content, key_points, exam_relevance, important_facts,
+              major_issues, govt_initiatives, bihar_specific, way_forward, quotes
+       FROM current_affairs
        WHERE id=$1 AND status='published'`,
       [affairId]
     );
@@ -565,9 +581,14 @@ class CurrentAffairsService {
       source:             row.source,
       tags:               row.tags || [],
       fullContentHtml:    row.full_content || '',
-      keyPointsHtml:      row.key_points      || null,
-      examRelevanceHtml:  row.exam_relevance  || null,
-      importantFactsHtml: row.important_facts || null,
+      keyPointsHtml:       row.key_points       || null,
+      majorIssuesHtml:     row.major_issues     || null,
+      govtInitiativesHtml: row.govt_initiatives || null,
+      biharSpecificHtml:   row.bihar_specific   || null,
+      examRelevanceHtml:   row.exam_relevance   || null,
+      wayForwardHtml:      row.way_forward      || null,
+      quotesHtml:          row.quotes           || null,
+      importantFactsHtml:  row.important_facts  || null,
     }, uploadDir);
   }
 
@@ -1098,6 +1119,7 @@ class JobsService implements OnModuleInit {
     const map: Record<string, string> = {
       title: 'title', organization: 'organization', category: 'category',
       totalPosts: 'total_posts', totalVacancies: 'total_posts',
+      notificationDate: 'notification_date',
       lastDate: 'last_date', examDate: 'exam_date', status: 'status',
       applicationLink: 'application_link', applicationUrl: 'application_link',
       description: 'description', briefDescription: 'brief_description',
@@ -1110,8 +1132,26 @@ class JobsService implements OnModuleInit {
       isRemote: 'is_remote', isFeatured: 'is_featured', isNew: 'is_new',
       notificationUrl: 'notification_url',
     };
+    // Several keys are aliases for the same column (totalPosts/totalVacancies,
+    // applicationLink/applicationUrl, salary/salaryRange). Assigning both in one
+    // UPDATE is a Postgres error (42701, "multiple assignments to same column"),
+    // which the admin panel hit on *every* job edit because its payload sends
+    // totalPosts and totalVacancies together. Collapse per column, first alias wins.
+    const assigned = new Set<string>();
+    // These are DATE columns — an empty string is not valid date input, and the
+    // admin form sends '' for any date the editor left blank.
+    const dateCols = new Set(['notification_date', 'last_date', 'exam_date']);
     for (const [key, col] of Object.entries(map)) {
-      if (data[key] !== undefined) { fields.push(`${col}=$${i++}`); vals.push(data[key]); }
+      if (data[key] === undefined || assigned.has(col)) continue;
+      let val = data[key];
+      if (dateCols.has(col) && (val === '' || val === null)) {
+        // last_date is NOT NULL — blanking it would fail at the DB with a 500,
+        // so reject it up front with a message the admin can act on.
+        if (col === 'last_date') throw new BadRequestException('Last date to apply is required');
+        val = null;  // exam_date / notification_date are nullable = "not announced yet"
+      }
+      assigned.add(col);
+      fields.push(`${col}=$${i++}`); vals.push(val);
     }
     // Recompute display location if any location field changed
     if (data.jobState !== undefined || data.jobDistrict !== undefined ||

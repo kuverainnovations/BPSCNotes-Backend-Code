@@ -1073,7 +1073,14 @@ export class AnswerWritingService {
   ) {
     const verdict = String(body?.verdict || '').toLowerCase();
     const rating  = Math.floor(Number(body?.rating));
-    const suggestion = (body?.suggestion || '').trim().slice(0, 200) || null;
+    // Cap in words, not characters — the client counts words too (200 word limit).
+    // The column is TEXT, so the only job here is to stop an unbounded body.
+    const suggestion = (() => {
+      const raw = (body?.suggestion || '').trim();
+      if (!raw) return null;
+      const words = raw.split(/\s+/);
+      return words.length > 200 ? words.slice(0, 200).join(' ') : raw;
+    })();
 
     // Normalise areas: prefer the v2 array, fall back to the single field
     const rawAreas = Array.isArray(body?.improvementAreas) && body.improvementAreas.length

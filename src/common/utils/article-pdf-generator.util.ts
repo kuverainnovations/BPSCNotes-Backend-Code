@@ -21,9 +21,14 @@ export interface ArticlePdfData {
   fullContentHtml: string;
   // Optional pre-parsed sections — when present, rendered as colour-coded
   // boxes that mirror the Android WebView section-block style.
-  keyPointsHtml?:     string | null;
-  examRelevanceHtml?: string | null;
-  importantFactsHtml?: string | null;
+  keyPointsHtml?:       string | null;
+  majorIssuesHtml?:     string | null;
+  govtInitiativesHtml?: string | null;
+  biharSpecificHtml?:   string | null;
+  examRelevanceHtml?:   string | null;   // rendered as "Value Addition"
+  wayForwardHtml?:      string | null;
+  quotesHtml?:          string | null;
+  importantFactsHtml?:  string | null;   // legacy, retired from the admin form
 }
 
 // ── Palette (mirrors RichContentView.tsx admin + app WebView CSS) ──────
@@ -439,9 +444,15 @@ interface SectionBlockSpec {
   bgColor:     string;   // background fill
 }
 const SECTION_SPECS: Record<string, SectionBlockSpec> = {
-  keyPoints:     { label: '🔑  KEY POINTS',              accentColor: '#1565C0', bgColor: '#F0F7FF' },
-  examRelevance: { label: '🎯  EXAM RELEVANCE',           accentColor: '#E65100', bgColor: '#FFF8E6' },
-  importantFacts:{ label: '📊  IMPORTANT FACTS & FIGURES',accentColor: '#2E7D32', bgColor: '#F3F9F3' },
+  keyPoints:      { label: '🔑  KEY POINTS',                 accentColor: '#1565C0', bgColor: '#F0F7FF' },
+  majorIssues:    { label: '⚠️  MAJOR ISSUES & CHALLENGES',  accentColor: '#C62828', bgColor: '#FDF2F2' },
+  govtInitiatives:{ label: '🏛️  GOVERNMENT INITIATIVES',     accentColor: '#00695C', bgColor: '#EFF7F6' },
+  biharSpecific:  { label: '📍  BIHAR SPECIFIC',             accentColor: '#6A1B9A', bgColor: '#F7F1FA' },
+  // exam_relevance is relabelled "Value Addition" — same column, same content.
+  examRelevance:  { label: '🎯  VALUE ADDITION',             accentColor: '#E65100', bgColor: '#FFF8E6' },
+  wayForward:     { label: '🛤️  WAY FORWARD & CONCLUSION',   accentColor: '#283593', bgColor: '#F1F3FB' },
+  quotes:         { label: '❝  QUOTES',                      accentColor: '#455A64', bgColor: '#F4F6F7' },
+  importantFacts: { label: '📊  IMPORTANT FACTS & FIGURES',   accentColor: '#2E7D32', bgColor: '#F3F9F3' },
 };
 
 function renderSectionBlock(
@@ -812,15 +823,20 @@ export async function streamArticlePdf(
   const ctx: RenderCtx = { contentX: PAGE_MARGIN, contentWidth: cw, imageMap };
 
   // ── Render in the same order as the Android WebView buildArticleHtml() ──
-  // summary (lead) is already in the header; sections follow this order:
-  //   1. Key Points box
-  //   2. Main article body (fullContent)
-  //   3. Exam Relevance box
-  //   4. Important Facts box
-  if (data.keyPointsHtml)      renderSectionBlock(doc, data.keyPointsHtml,      'keyPoints',      ctx);
+  // and as the admin panel's form. Summary (lead) is already in the header:
+  //   2. Key Points   3. Multidimensional Analysis (= fullContent, the body)
+  //   4. Major Issues 5. Government Initiatives    6. Bihar Specific
+  //   7. Value Addition (= examRelevance)          8. Way Forward   9. Quotes
+  if (data.keyPointsHtml)       renderSectionBlock(doc, data.keyPointsHtml,       'keyPoints',       ctx);
   renderNodes(doc, dom.children as any[], ctx);
-  if (data.examRelevanceHtml)  renderSectionBlock(doc, data.examRelevanceHtml,  'examRelevance',  ctx);
-  if (data.importantFactsHtml) renderSectionBlock(doc, data.importantFactsHtml, 'importantFacts', ctx);
+  if (data.majorIssuesHtml)     renderSectionBlock(doc, data.majorIssuesHtml,     'majorIssues',     ctx);
+  if (data.govtInitiativesHtml) renderSectionBlock(doc, data.govtInitiativesHtml, 'govtInitiatives', ctx);
+  if (data.biharSpecificHtml)   renderSectionBlock(doc, data.biharSpecificHtml,   'biharSpecific',   ctx);
+  if (data.examRelevanceHtml)   renderSectionBlock(doc, data.examRelevanceHtml,   'examRelevance',   ctx);
+  if (data.wayForwardHtml)      renderSectionBlock(doc, data.wayForwardHtml,      'wayForward',      ctx);
+  if (data.quotesHtml)          renderSectionBlock(doc, data.quotesHtml,          'quotes',          ctx);
+  // Legacy — no longer authored in the admin panel, but old articles still have it.
+  if (data.importantFactsHtml)  renderSectionBlock(doc, data.importantFactsHtml,  'importantFacts',  ctx);
 
   drawTagsFooter(doc, data, cw);
 
