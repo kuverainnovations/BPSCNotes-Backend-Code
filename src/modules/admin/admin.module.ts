@@ -330,6 +330,7 @@ export class AdminSettingsService {
       WHERE key IN ('maintenance_mode','force_update','app_version','min_app_version',
                     'new_registrations','android_store_url','support_email',
                     'study_rooms_enabled',
+                    'social_instagram','social_telegram','social_facebook','social_whatsapp',
                     'daily_quiz_limit','leaderboard_enabled','ads_enabled',
                     'coin_system_enabled','coin_to_inr_rate',
                     'rank_tier_0','rank_tier_1','rank_tier_2','rank_tier_3',
@@ -353,6 +354,13 @@ export class AdminSettingsService {
       new_registrations:     'true',
       study_rooms_enabled:   'true',
       support_email:         'admin@bpscnotes.in',
+      // ── Social links ────────────────────────────────────────
+      // Empty = that icon is hidden in the app, so an unset channel never
+      // ships a dead link. Set them from Admin → Settings.
+      social_instagram:      '',
+      social_telegram:       '',
+      social_facebook:       '',
+      social_whatsapp:       '',
       // ── Update gate ─────────────────────────────────────────
       // force_update is the kill-switch; min_app_version is the hard floor.
       // Keep min_app_version at the lowest published version — raising it
