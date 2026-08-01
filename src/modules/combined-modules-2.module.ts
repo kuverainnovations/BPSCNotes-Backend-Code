@@ -1980,7 +1980,7 @@ class FlashcardsService {
     await this.invalidateCache();
     // Auto-push notification when sendNotification !== false
     if (data.sendNotification !== false) {
-      this.pushFlashcardNotification(data.subject || 'General').catch(() => {});
+      this.pushFlashcardNotification('').catch(() => {});
     }
     return successResponse({ flashcard: result[0] }, 'Flashcard created ✅');
   }
@@ -2089,21 +2089,26 @@ class FlashcardsService {
   // ── Publish batch + notify ─────────────────────────────────
   async publishAndNotify(subject: string, count: number) {
     await this.pushFlashcardNotification(subject, count);
-    return successResponse({ notified: true }, `Notification sent for ${subject} flashcards`);
+    return successResponse({ notified: true }, 'Notification sent to flashcard subscribers');
   }
 
-  private async pushFlashcardNotification(subject: string, count?: number) {
-    const title = count && count > 1 ? `📚 ${count} New Flashcards: ${subject}` : `📚 New Flashcards Available`;
-    const body  = `New ${subject} flashcards are ready for your Active Recall session!`;
-    const data  = { type: 'new_flashcards', screen: 'flashcards', subject };
+  /**
+   * Flashcards are no longer split by subject, so this is one push to everyone
+   * subscribed to flashcard alerts. The subject argument is ignored — kept in
+   * the signature so an older admin build calling with a subject still works.
+   */
+  private async pushFlashcardNotification(_subject: string, count?: number) {
+    const title = count && count > 1 ? `📚 ${count} New Flashcards` : `📚 New Flashcards Available`;
+    const body  = 'New flashcards are ready for your Active Recall session!';
+    const data  = { type: 'new_flashcards', screen: 'flashcards' };
     try {
+      // Any subscriber, whatever topic_key they signed up under — the
+      // per-subject keys are historical now.
       const rows = await this.db.query(
         `SELECT DISTINCT u.fcm_token
          FROM flashcard_notif_prefs fnp
          JOIN users u ON u.id = fnp.user_id
-         WHERE fnp.topic_key IN ($1, 'all')
-           AND u.fcm_token IS NOT NULL AND u.notification_enabled = TRUE AND u.status = 'active'`,
-        [subject]
+         WHERE u.fcm_token IS NOT NULL AND u.notification_enabled = TRUE AND u.status = 'active'`
       ).catch(() => []);
       const tokens: string[] = rows.map((r: any) => r.fcm_token).filter(Boolean);
       if (tokens.length === 0) {
@@ -2118,7 +2123,7 @@ class FlashcardsService {
           notification: { title, body }, data, android: { priority: 'high' },
         });
       }
-      this.logger.log(`pushFlashcard: sent to ${tokens.length} subscribers for "${subject}"`);
+      this.logger.log(`pushFlashcard: sent to ${tokens.length} subscribers`);
     } catch (err: any) {
       this.logger.warn(`pushFlashcardNotification: ${err.message}`);
     }
