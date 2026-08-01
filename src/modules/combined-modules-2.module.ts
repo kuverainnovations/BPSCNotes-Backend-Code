@@ -1974,8 +1974,11 @@ class FlashcardsService {
     const result = await this.db.query(
       `INSERT INTO flashcards (front, back, subject, exam_tags, card_type, image_url, back_image_url, topic, hint, created_by)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *`,
-      [front, back, data.subject || 'General', data.examTags || data.exam_tags || [],
-       cardType, imageUrl, backImageUrl, data.topic || data.subject || 'General', data.hint || '', adminId]
+      // Topic is free text and genuinely optional — it used to fall back to the
+      // subject and then to 'General', so a card with no topic was labelled
+      // "General" twice on the admin card. Blank stays blank now.
+      [front, back, data.subject || null, data.examTags || data.exam_tags || [],
+       cardType, imageUrl, backImageUrl, (data.topic || '').trim() || null, data.hint || '', adminId]
     );
     await this.invalidateCache();
     // Auto-push notification when sendNotification !== false
@@ -2008,10 +2011,30 @@ class FlashcardsService {
     return successResponse(null, 'Flashcard updated ✅');
   }
 
+  /**
+   * Permanent delete. This used to set is_active=FALSE, so "Delete" only hid the
+   * card — it stayed in the list marked Hidden and there was no way to actually
+   * remove it. Hiding is now the separate setActive() below.
+   *
+   * Progress rows reference the card, so they go first; a student's mastery of a
+   * card that no longer exists is meaningless.
+   */
   async remove(id: string) {
-    await this.db.query(`UPDATE flashcards SET is_active=FALSE WHERE id=$1`, [id]);
+    await this.db.query(`DELETE FROM user_flashcard_progress WHERE flashcard_id=$1`, [id]).catch(() => {});
+    const res = await this.db.query(`DELETE FROM flashcards WHERE id=$1 RETURNING id`, [id]);
+    if (!res.length) throw new NotFoundException('Flashcard not found');
     await this.invalidateCache();
-    return successResponse(null, 'Flashcard deleted ✅');
+    return successResponse(null, 'Flashcard deleted permanently ✅');
+  }
+
+  /** Hide/unhide — what Delete used to do. Hidden cards stay out of the app. */
+  async setActive(id: string, isActive: boolean) {
+    const res = await this.db.query(
+      `UPDATE flashcards SET is_active=$1 WHERE id=$2 RETURNING id`, [isActive, id]
+    );
+    if (!res.length) throw new NotFoundException('Flashcard not found');
+    await this.invalidateCache();
+    return successResponse(null, isActive ? 'Flashcard visible ✅' : 'Flashcard hidden 🙈');
   }
 
   private async invalidateCache() {
@@ -2148,6 +2171,11 @@ class AdminFlashcardsController {
   @Post()    @RequirePermission('library') @HttpCode(201) create(@Body() dto: any, @Req() r: any) { return this.s.create(dto, r.admin.id); }
   @Put(':id')  @RequirePermission('library') update(@Param('id', ParseUUIDPipe) id: string, @Body() dto: any) { return this.s.update(id, dto); }
   @Delete(':id') @RequirePermission('library') remove(@Param('id', ParseUUIDPipe) id: string) { return this.s.remove(id); }
+  /** Hide/unhide — what DELETE used to do before it became a real delete. */
+  @Patch(':id/visibility') @RequirePermission('library') @HttpCode(HttpStatus.OK)
+  setActive(@Param('id', ParseUUIDPipe) id: string, @Body() dto: any) {
+    return this.s.setActive(id, dto?.isActive !== false);
+  }
   @Post('publish-notify') @RequirePermission('library') @HttpCode(HttpStatus.OK)
   publishNotify(@Body() body: { subject: string; count?: number }) {
     return this.s.publishAndNotify(body.subject || 'General', body.count ?? 1);
