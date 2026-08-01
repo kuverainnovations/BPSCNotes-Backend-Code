@@ -445,12 +445,32 @@ export class AuthService {
              VALUES ($1,$2,'signup',$3)`,
             [referrerId, newUser.id, signupCoins]
           );
+          this.notifyUser(
+            referrerId,
+            '🎉 Your friend joined!',
+            `${dto.name} signed up with your referral code. You earned ${signupCoins} coins (1/3).`,
+          ).catch(() => {});
+        } else {
+          // awardCoins returns 0 when the daily cap for referral_signup is hit.
+          // Say so, otherwise a referral that genuinely worked looks broken.
+          this.notifyUser(
+            referrerId,
+            '🎉 Your friend joined!',
+            `${dto.name} signed up with your referral code. You've hit today's referral coin limit — invite more tomorrow.`,
+          ).catch(() => {});
         }
       }
 
       // Welcome bonus to the new user for signing up via referral
       // (action='referral_joined', admin-editable on the Coins page).
-      await this.awardCoins(newUser.id, 'referral_joined');
+      const joinBonus = await this.awardCoins(newUser.id, 'referral_joined');
+      if (joinBonus > 0) {
+        this.notifyUser(
+          newUser.id,
+          '🎁 Welcome bonus',
+          `You joined with a referral code and earned ${joinBonus} coins. Start a quiz to earn more!`,
+        ).catch(() => {});
+      }
 
       // Logged against the referrer — they're the one whose code was used,
       // and the referee already gets a user_registered row just below.
@@ -697,6 +717,51 @@ export class AuthService {
   // milestone-triggering action happens (enrollment, upload, quiz)
   // Safe to call multiple times — UNIQUE constraint prevents double-award
   // ─────────────────────────────────────────────────────────────
+  /**
+   * Tells a user something happened, in-app and by push.
+   *
+   * Referral payouts used to be silent: coins landed in the balance with only a
+   * transaction row to show for it, so the referrer had no reason to believe
+   * inviting anyone had worked. Mirrors NotificationService.pushToUser; kept
+   * local because importing that module here would close a dependency cycle
+   * (it already depends on AuthModule for its guards).
+   */
+  private async notifyUser(userId: string, title: string, body: string, type = 'referral') {
+    try {
+      const [notif] = await this.db.query(
+        `INSERT INTO notifications (title, body, type, target, data, status, sent_at, created_by)
+         VALUES ($1,$2,$3,'user',$4,'sent',NOW(),NULL) RETURNING id`,
+        [title, body, type, JSON.stringify({ type, screen: 'coin_wallet' })]
+      );
+      if (notif?.id) {
+        await this.db.query(
+          `INSERT INTO user_notifications (user_id, notification_id, title, body)
+           VALUES ($1,$2,$3,$4) ON CONFLICT DO NOTHING`,
+          [userId, notif.id, title, body]
+        );
+      }
+
+      const [u] = await this.db.query(
+        `SELECT fcm_token, notification_enabled FROM users
+          WHERE id=$1 AND fcm_token IS NOT NULL AND deleted_at IS NULL LIMIT 1`,
+        [userId]
+      );
+      if (!u?.fcm_token || !u.notification_enabled) return;
+
+      const admin = require('firebase-admin');
+      if (!admin.apps.length) return;
+      await admin.messaging().send({
+        token: u.fcm_token,
+        notification: { title, body },
+        data: { type, screen: 'coin_wallet' },
+        android: { priority: 'high', notification: { channelId: type } },
+      });
+    } catch (err: any) {
+      // Never let a notification failure roll back a coin award.
+      console.error('notifyUser failed:', err?.message);
+    }
+  }
+
   async awardReferralMilestone(refereeId: string, milestone: 'engagement' | 'active') {
     try {
       if (!(await this.isCoinSystemEnabled())) return;
@@ -748,6 +813,14 @@ export class AuthService {
         [referrerId, coins, descriptions[milestone], `referral_${milestone}`, refereeId, bal]
       );
       await this.cache.del(`user:${referrerId}`);
+
+      const [referee] = await this.db.query(`SELECT name FROM users WHERE id=$1`, [refereeId]);
+      const friend = referee?.name || 'Your friend';
+      const headlines: Record<string, string> = {
+        engagement: `${friend} started learning — you earned ${coins} coins (2/3).`,
+        active:     `${friend} completed 5 quizzes — you earned ${coins} coins (3/3)!`,
+      };
+      this.notifyUser(referrerId, '🪙 Referral reward', headlines[milestone]).catch(() => {});
     } catch (err: any) {
       console.error('awardReferralMilestone error:', err.message);
     }
