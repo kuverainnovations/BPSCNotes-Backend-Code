@@ -1479,7 +1479,7 @@ export class AuthController {
  * to parse in the first place.
  */
 @Controller('users')
-export class UserReferralsController {
+export class UserSelfController {
   constructor(private readonly authService: AuthService) {}
 
   @Get('referrals')
@@ -1487,6 +1487,36 @@ export class UserReferralsController {
   async getReferralStats(@Req() req: any) {
     const stats = await this.authService.getReferralStats(req.user.id);
     return successResponse(stats);
+  }
+
+  /**
+   * Account deletion. Google Play requires an in-app deletion path for any app
+   * that lets users create an account — the button existed in Settings but its
+   * request 404'd, so deletion was impossible from inside the app.
+   */
+  @Delete('account')
+  @UseGuards(JwtAuthGuard)
+  @HttpCode(HttpStatus.OK)
+  async deleteAccount(@Req() req: any) {
+    return this.authService.deleteAccount(req.user.id);
+  }
+
+  /** Resume card on the dashboard — 404'd for the same reason. */
+  @Get('me/learning-progress')
+  @UseGuards(JwtAuthGuard)
+  async getLearningProgress(@Req() req: any) {
+    return this.authService.getLearningProgress(req.user.id);
+  }
+
+  /**
+   * The app calls auth/users/profile, matching the original mis-prefixed route,
+   * so this one was never broken. Mirrored here so all user-scoped routes are
+   * reachable under the prefix they document.
+   */
+  @Patch('profile')
+  @UseGuards(JwtAuthGuard)
+  async updateProfile(@Req() req: any, @Body() dto: any) {
+    return this.authService.updateProfile(req.user.id, dto);
   }
 }
 
@@ -1502,7 +1532,7 @@ export class UserReferralsController {
       }),
     }),
   ],
-  controllers: [AuthController, UserReferralsController],
+  controllers: [AuthController, UserSelfController],
   providers:   [AuthService, OtpService, UserJwtStrategy, AdminJwtStrategy, ActivityLogService],
   exports:     [AuthService, UserJwtStrategy, AdminJwtStrategy, ActivityLogService],
 })
