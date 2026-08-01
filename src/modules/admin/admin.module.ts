@@ -356,11 +356,11 @@ export class AdminSettingsService {
       support_email:         'admin@bpscnotes.in',
       // ── Social links ────────────────────────────────────────
       // Empty = that icon is hidden in the app, so an unset channel never
-      // ships a dead link. Set them from Admin → Settings.
-      social_instagram:      '',
-      social_telegram:       '',
-      social_facebook:       '',
-      social_whatsapp:       '',
+      // ships a dead link. Override from Admin → Settings.
+      social_instagram:      'https://www.instagram.com/bpscnotes',
+      social_telegram:       'https://t.me/BPSCnotes',
+      social_facebook:       'https://www.facebook.com/BPSCnotes',
+      social_whatsapp:       '',   // none supplied yet — icon stays hidden
       // ── Update gate ─────────────────────────────────────────
       // force_update is the kill-switch; min_app_version is the hard floor.
       // Keep min_app_version at the lowest published version — raising it
