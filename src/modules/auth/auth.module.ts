@@ -1424,6 +1424,12 @@ export class AuthController {
     return successResponse(data, 'MPIN updated successfully!');
   }
 
+  /**
+   * NOTE: this lives under @Controller('auth'), so the path is /auth/referrals.
+   * The app has always called /users/referrals — see UserReferralsController
+   * below, which is the route that actually gets used. Kept for any caller that
+   * already depends on this path.
+   */
   @Get('referrals')
   @UseGuards(JwtAuthGuard)
   async getReferralStats(@Req() req: any) {
@@ -1463,6 +1469,27 @@ export class AuthController {
 }
 
 // ── Auth Module ───────────────────────────────────────────────
+/**
+ * GET /users/referrals — the referral stats the Android wallet reads.
+ *
+ * The handler was only ever mounted under @Controller('auth'), i.e. at
+ * /auth/referrals, while every build of the app has called /users/referrals.
+ * That request 404'd for the entire life of the feature, which is why the
+ * Referrals tab showed no code, no friends and no earnings: there was nothing
+ * to parse in the first place.
+ */
+@Controller('users')
+export class UserReferralsController {
+  constructor(private readonly authService: AuthService) {}
+
+  @Get('referrals')
+  @UseGuards(JwtAuthGuard)
+  async getReferralStats(@Req() req: any) {
+    const stats = await this.authService.getReferralStats(req.user.id);
+    return successResponse(stats);
+  }
+}
+
 @Module({
   imports: [
    // PassportModule.register({ defaultStrategy: 'jwt' }),
@@ -1475,7 +1502,7 @@ export class AuthController {
       }),
     }),
   ],
-  controllers: [AuthController],
+  controllers: [AuthController, UserReferralsController],
   providers:   [AuthService, OtpService, UserJwtStrategy, AdminJwtStrategy, ActivityLogService],
   exports:     [AuthService, UserJwtStrategy, AdminJwtStrategy, ActivityLogService],
 })
