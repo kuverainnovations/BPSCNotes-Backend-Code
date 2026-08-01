@@ -361,12 +361,24 @@ export class AuthService {
     const existing = await this.db.query(`SELECT id FROM users WHERE mobile = $1`, [mobile]);
     if (existing.length) throw new ConflictException('Mobile already registered. Please login.');
 
-    const refCode = this.generateReferralCode(dto.name);
+    const refCode = await this.generateReferralCode(dto.name);
     let referrerId = null;
 
     if (dto.referralCode) {
-      const ref = await this.db.query(`SELECT id FROM users WHERE referral_code = $1`, [dto.referralCode]);
-      if (ref.length) referrerId = ref[0].id;
+      // Match case-insensitively and ignore surrounding whitespace. Codes are
+      // generated uppercase but arrive typed by hand from a WhatsApp forward,
+      // and a lowercase or padded code silently registered the user with no
+      // referrer at all — the referrer was simply never paid, and neither side
+      // was told why.
+      const ref = await this.db.query(
+        `SELECT id FROM users WHERE UPPER(referral_code) = UPPER(TRIM($1))`,
+        [dto.referralCode]
+      );
+      if (ref.length) {
+        referrerId = ref[0].id;
+      } else {
+        console.warn(`Registration used an unknown referral code: ${dto.referralCode}`);
+      }
     }
 
     const newUser = await this.db.transaction(async (em) => {
@@ -1167,10 +1179,42 @@ export class AuthService {
     return safe;
   }
 
-  private generateReferralCode(name: string): string {
-    const base = name.replace(/\s+/g, '').toUpperCase().slice(0, 6);
-    const num  = Math.floor(1000 + Math.random() * 9000);
-    return `${base}${num}`;
+  /**
+   * Builds a referral code that is unique, shareable and typeable.
+   *
+   * The previous version took the first six characters of the name verbatim and
+   * appended four random digits. Two problems, both live:
+   *
+   *  - users.referral_code is UNIQUE, and nothing checked for a clash. Two
+   *    people with the same name prefix had a 1-in-9000 chance of colliding per
+   *    pair, and a collision threw a unique-violation out of the INSERT, so
+   *    registration failed outright with a 500 that a retry could not fix.
+   *  - a Devanagari name produced a Devanagari code, since toUpperCase() leaves
+   *    those characters untouched. In a Hindi-first app that is a code the user
+   *    cannot read back to a friend over the phone.
+   *
+   * Non-A-Z characters are now stripped, short or empty bases are padded, and
+   * the code is checked against the table with a bounded number of retries
+   * before falling back to a longer random suffix.
+   */
+  private async generateReferralCode(name: string): Promise<string> {
+    const base = (name || '')
+      .toUpperCase()
+      .replace(/[^A-Z]/g, '')     // drops spaces, digits, punctuation and non-Latin scripts
+      .slice(0, 6);
+    // Names that leave nothing usable (e.g. written entirely in Devanagari)
+    // still need a pronounceable prefix.
+    const prefix = base.length >= 3 ? base : `BPSC${base}`.slice(0, 6);
+
+    for (let attempt = 0; attempt < 8; attempt++) {
+      const code = `${prefix}${Math.floor(1000 + Math.random() * 9000)}`;
+      const [clash] = await this.db.query(
+        `SELECT 1 FROM users WHERE referral_code = $1 LIMIT 1`, [code]
+      );
+      if (!clash) return code;
+    }
+    // Vanishingly unlikely; widen the random space rather than fail the signup.
+    return `${prefix}${Date.now().toString(36).toUpperCase().slice(-6)}`;
   }
 }
 

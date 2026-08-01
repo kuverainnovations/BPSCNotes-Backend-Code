@@ -690,7 +690,12 @@ const percentile = Number(
       const attemptCount = await this.db.query(
         `SELECT COUNT(*) FROM quiz_attempts WHERE user_id=$1`, [userId]
       );
-      if (parseInt(attemptCount[0].count) === 5) {
+      // >= 5, not === 5. Exact equality meant the milestone was awarded only if
+      // a submission observed the count at precisely five: two concurrent
+      // submissions, a retry, or any attempt recorded before the referral
+      // existed would step over the boundary and the referrer would never be
+      // paid. awardReferralMilestone is idempotent, so re-entering is harmless.
+      if (parseInt(attemptCount[0].count) >= 5) {
         this.authService?.awardReferralMilestone?.(userId, 'active').catch(() => {});
       }
     } catch (_) {}

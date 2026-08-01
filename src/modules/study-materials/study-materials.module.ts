@@ -618,10 +618,28 @@ if (query.search)  { conditions.push(`(sm.title ILIKE $${pi} OR sm.subject ILIKE
   // Avoids circular dependency with AuthService by using DB directly
   private async awardReferralMilestoneInline(refereeId: string, milestone: string) {
     try {
+      // Respect the global coin switch. Without this, turning the coin system
+      // off still paid out referral bonuses through this path — AuthService's
+      // version checks it, this copy did not.
+      const [coinToggle] = await this.db.query(
+        `SELECT value FROM app_settings WHERE key='coin_system_enabled'`
+      );
+      if (coinToggle && String(coinToggle.value) === 'false') return;
+
       const rows = await this.db.query(`SELECT referred_by FROM users WHERE id=$1`, [refereeId]);
       if (!rows.length || !rows[0].referred_by) return;
       const referrerId = rows[0].referred_by;
-      const coins = 50;
+
+      // Read the admin-configured amount, same as AuthService does. This was
+      // hardcoded to 50, so changing "Referral — Friend Engaged" on the Coins
+      // page moved the payout for course enrolments but not for note uploads —
+      // the same milestone paid two different amounts depending on how it fired.
+      const [rule] = await this.db.query(
+        `SELECT coins_awarded FROM coin_rules WHERE action=$1 AND is_active=TRUE`,
+        [`referral_${milestone}`]
+      );
+      const coins = Number(rule?.coins_awarded ?? 50);
+      if (coins <= 0) return;
 
       // Idempotency — UNIQUE constraint prevents double-award
       const existing = await this.db.query(
