@@ -505,8 +505,18 @@ export class AdminUsersService {
   }
 
   async deleteAccount(userId: string) {
+    // EXTRACT(EPOCH...) is a numeric with six decimal places; ::text gave
+    // "1785500000.123456". Cast through bigint so the suffix stays short and
+    // matches what AuthService writes. The column had to be widened for any of
+    // this to fit at all — see migration 1785800000000.
+    // AND deleted_at IS NULL keeps a second delete from stacking suffixes.
     await this.db.query(
-      `UPDATE users SET deleted_at = NOW(), status = 'deleted', email = NULL, mobile = CONCAT(mobile, '_deleted_', EXTRACT(EPOCH FROM NOW())::text) WHERE id = $1`,
+      `UPDATE users
+          SET deleted_at = NOW(),
+              status     = 'deleted',
+              email      = NULL,
+              mobile     = CONCAT(mobile, '_deleted_', EXTRACT(EPOCH FROM NOW())::bigint::text)
+        WHERE id = $1 AND deleted_at IS NULL`,
       [userId]
     );
     await this.cache.del(`user:${userId}`);

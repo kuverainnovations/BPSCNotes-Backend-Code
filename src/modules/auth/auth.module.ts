@@ -358,8 +358,26 @@ export class AuthService {
     }
 
     const mobile = decoded.mobile;
-    const existing = await this.db.query(`SELECT id FROM users WHERE mobile = $1`, [mobile]);
+
+    // Only a LIVE account blocks registration. verify-otp already filters on
+    // deleted_at, so it hands a deleted user a registration token and the app
+    // shows the name screen — but this check counted deleted rows too and threw
+    // "already registered, please login". The account could not log in (it looks
+    // new) and could not register (it looks taken): a permanent dead end.
+    const existing = await this.db.query(
+      `SELECT id FROM users WHERE mobile = $1 AND deleted_at IS NULL`, [mobile]
+    );
     if (existing.length) throw new ConflictException('Mobile already registered. Please login.');
+
+    // A soft-deleted row keeps the number, and users.mobile is UNIQUE, so the
+    // INSERT below would still fail. Release it first — the account is deleted,
+    // its number is not reserved.
+    await this.db.query(
+      `UPDATE users
+          SET mobile = CONCAT(mobile, '_deleted_', EXTRACT(EPOCH FROM NOW())::bigint::text)
+        WHERE mobile = $1 AND deleted_at IS NOT NULL`,
+      [mobile]
+    );
 
     const refCode = await this.generateReferralCode(dto.name);
     let referrerId = null;
@@ -521,8 +539,18 @@ export class AuthService {
   // Soft-delete: sets deleted_at so user cannot log in again.
   // Hard-deletes happen via a scheduled job after 30 days.
   async deleteAccount(userId: string) {
+    // Release the mobile and email so the person can sign up again later — a
+    // deleted account must not keep its number reserved by the UNIQUE
+    // constraint. This matched the admin path in intent but not in effect: the
+    // admin version renames the number, this one left it in place.
     await this.db.query(
-      `UPDATE users SET deleted_at=NOW(), status='deleted', refresh_token=NULL WHERE id=$1`,
+      `UPDATE users
+          SET deleted_at = NOW(),
+              status     = 'deleted',
+              refresh_token = NULL,
+              email      = NULL,
+              mobile     = CONCAT(mobile, '_deleted_', EXTRACT(EPOCH FROM NOW())::bigint::text)
+        WHERE id = $1 AND deleted_at IS NULL`,
       [userId]
     );
     await this.cache.del(`user:${userId}`);
