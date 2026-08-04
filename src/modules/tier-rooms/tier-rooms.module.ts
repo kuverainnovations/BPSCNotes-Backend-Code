@@ -217,16 +217,30 @@ export class TierRoomsService {
   }
 
   // ── Online/idle threshold for the 3-state status column ───
-  // Studying = open session right now. Online = not studying, but was
-  // active in this room within the last N minutes (i.e. likely still has
-  // the app open / just stepped away). Offline = neither. This is a
-  // time-based heuristic rather than true socket presence — the gateway's
-  // per-user connection state is in-process and not currently exposed to
-  // the REST layer, and wiring that through would mean injecting the
-  // gateway into TierRoomsService for a single derived field. The
-  // heuristic gets the same practical answer for the leaderboard's
-  // purposes without that extra coupling.
+  // Studying = open session right now. Online = not studying, but active
+  // within the last N minutes. Offline = neither. This is a time-based
+  // heuristic rather than true socket presence — the gateway's per-user
+  // connection state is in-process and not currently exposed to the REST
+  // layer, and wiring that through would mean injecting the gateway into
+  // TierRoomsService for a single derived field. The heuristic gets the
+  // same practical answer for the leaderboard's purposes without that
+  // extra coupling.
+  //
+  // "Active" deliberately means users.last_active_at, not just a study
+  // session in this room. Scoped to room sessions only, a member reading
+  // this very leaderboard counted as Offline, because looking at a room is
+  // not studying in it — which is how a whole room could report
+  // "Studying 0 · Online 0 · Offline 15" with people plainly using the app.
   private static readonly ONLINE_WINDOW_MINUTES = 30;
+
+  // ── Day boundaries ───────────────────────────────────────
+  // Every "today"/"this month" bucket below is cut in IST, not in the
+  // database's own timezone. On a UTC server, bare CURRENT_DATE rolls over
+  // at 05:30 IST, so between midnight and half five a member's morning
+  // study landed on yesterday and "Today" read as stale. GetProfile's
+  // today_study_minutes was converted for exactly this reason back in
+  // QA 09-Jul; the room leaderboard was left on CURRENT_DATE, so the two
+  // screens could report different totals for the same day.
 
   async getTierMembers(tierKey: string, query: any) {
     const { page = 1, limit = 20 } = query;
@@ -259,9 +273,14 @@ export class TierRoomsService {
                -- THIS ROOM (not users.last_active_at, which is global
                -- across all rooms and would misreport a member as
                -- "active" here from time spent in a different room).
+               -- COALESCE with last_heartbeat so a session that is still open
+               -- counts. Restricted to ended_at, a member who was studying
+               -- right now was reported as last seen whenever their previous
+               -- session finished — "1h ago" while they were sitting in the room.
                (
-                 SELECT MAX(ss.ended_at) FROM study_sessions ss
-                 WHERE ss.user_id=u.id AND ss.ended_at IS NOT NULL
+                 SELECT MAX(COALESCE(ss.ended_at, ss.last_heartbeat, ss.started_at))
+                 FROM study_sessions ss
+                 WHERE ss.user_id=u.id
                    AND COALESCE(ss.room_tier_id, ss.tier_id) = (SELECT id FROM this_tier)
                ) AS last_active_at,
                -- All-time contribution to this specific room (not the
@@ -277,7 +296,7 @@ export class TierRoomsService {
                COALESCE((
                  SELECT SUM(ss.active_minutes) FROM study_sessions ss
                  WHERE ss.user_id=u.id AND COALESCE(ss.room_tier_id, ss.tier_id)=(SELECT id FROM this_tier)
-                   AND ss.started_at::date = CURRENT_DATE
+                   AND (ss.started_at AT TIME ZONE 'Asia/Kolkata')::date = (NOW() AT TIME ZONE 'Asia/Kolkata')::date
                ), 0)::int AS today_minutes,
                COALESCE((
                  SELECT SUM(ss.active_minutes) FROM study_sessions ss
@@ -287,7 +306,7 @@ export class TierRoomsService {
                COALESCE((
                  SELECT SUM(ss.active_minutes) FROM study_sessions ss
                  WHERE ss.user_id=u.id AND COALESCE(ss.room_tier_id, ss.tier_id)=(SELECT id FROM this_tier)
-                   AND ss.started_at >= date_trunc('month', CURRENT_DATE)
+                   AND (ss.started_at AT TIME ZONE 'Asia/Kolkata') >= date_trunc('month', (NOW() AT TIME ZONE 'Asia/Kolkata')::date)
                ), 0)::int AS month_minutes,
                -- Rank by this week's room minutes — matches the existing
                -- default leaderboard period. Ties broken by streak so the
@@ -305,11 +324,16 @@ export class TierRoomsService {
                    SELECT 1 FROM study_sessions ss WHERE ss.user_id=u.id AND ss.ended_at IS NULL
                      AND COALESCE(ss.room_tier_id, ss.tier_id) = (SELECT id FROM this_tier)
                  ) THEN 'studying'
-                 WHEN EXISTS(
-                   SELECT 1 FROM study_sessions ss WHERE ss.user_id=u.id
-                     AND COALESCE(ss.room_tier_id, ss.tier_id) = (SELECT id FROM this_tier)
-                     AND COALESCE(ss.ended_at, ss.last_heartbeat) >= NOW() - (${onlineWindow}||' minutes')::interval
-                 ) THEN 'online'
+                 -- Online = using the app recently, whether or not that use
+                 -- was a study session in this room. u.last_active_at is the
+                 -- general signal; the session clause stays as a fallback for
+                 -- rows where last_active_at was never written.
+                 WHEN u.last_active_at >= NOW() - (${onlineWindow}||' minutes')::interval
+                   OR EXISTS(
+                     SELECT 1 FROM study_sessions ss WHERE ss.user_id=u.id
+                       AND COALESCE(ss.room_tier_id, ss.tier_id) = (SELECT id FROM this_tier)
+                       AND COALESCE(ss.ended_at, ss.last_heartbeat) >= NOW() - (${onlineWindow}||' minutes')::interval
+                   ) THEN 'online'
                  ELSE 'offline'
                END AS status,
                -- Achievement badge count (spec wants badges on each row;
@@ -372,7 +396,7 @@ export class TierRoomsService {
              COALESCE((
                SELECT SUM(ss.active_minutes) FROM study_sessions ss
                WHERE ss.user_id = u.id AND COALESCE(ss.room_tier_id, ss.tier_id) = rl.tier_id
-                 AND ss.started_at::date = CURRENT_DATE
+                 AND (ss.started_at AT TIME ZONE 'Asia/Kolkata')::date = (NOW() AT TIME ZONE 'Asia/Kolkata')::date
              ), 0)::int AS study_minutes_today
       FROM room_leaderboard rl
       JOIN users u      ON u.id  = rl.user_id
@@ -427,7 +451,7 @@ export class TierRoomsService {
         COALESCE((
           SELECT SUM(ss3.active_minutes) FROM study_sessions ss3
           WHERE ss3.user_id = u.id AND COALESCE(ss3.room_tier_id, ss3.tier_id) = $1
-            AND ss3.started_at::date = CURRENT_DATE
+            AND (ss3.started_at AT TIME ZONE 'Asia/Kolkata')::date = (NOW() AT TIME ZONE 'Asia/Kolkata')::date
         ), 0)::int AS study_minutes_today
       FROM users u
       -- FIX: was joining study_sessions on user_id alone and gating the
@@ -499,21 +523,29 @@ export class TierRoomsService {
           (SELECT COUNT(DISTINCT ss.user_id) FROM study_sessions ss
              WHERE COALESCE(ss.room_tier_id, ss.tier_id)=(SELECT id FROM this_tier)
                AND ss.ended_at IS NULL)::int AS studying_now,
-          -- "Online" mirrors getTierMembers' status heuristic: active in
-          -- this room (open OR just-ended session / heartbeat) within the
-          -- online window, whether or not they're studying right now.
-          (SELECT COUNT(DISTINCT ss.user_id) FROM study_sessions ss
-             WHERE COALESCE(ss.room_tier_id, ss.tier_id)=(SELECT id FROM this_tier)
-               AND COALESCE(ss.ended_at, ss.last_heartbeat) >= NOW() - INTERVAL '30 minutes')::int AS online_members,
+          -- "Online" mirrors getTierMembers' status heuristic and must be
+          -- counted over the same population: any roster member seen using
+          -- the app in the last 30 minutes, plus anyone with a live session
+          -- in this room. Counting only room sessions made this 0 for a room
+          -- full of people who had the app open but were not mid-session.
+          (SELECT COUNT(*) FROM roster r
+             WHERE EXISTS(SELECT 1 FROM users u2
+                            WHERE u2.id = r.id
+                              AND u2.last_active_at >= NOW() - INTERVAL '30 minutes')
+                OR EXISTS(SELECT 1 FROM study_sessions ss
+                            WHERE ss.user_id = r.id
+                              AND COALESCE(ss.room_tier_id, ss.tier_id)=(SELECT id FROM this_tier)
+                              AND COALESCE(ss.ended_at, ss.last_heartbeat) >= NOW() - INTERVAL '30 minutes')
+          )::int AS online_members,
           COALESCE((SELECT SUM(ss.active_minutes) FROM study_sessions ss
              WHERE COALESCE(ss.room_tier_id, ss.tier_id)=(SELECT id FROM this_tier)
-               AND ss.started_at::date = CURRENT_DATE), 0)::int AS minutes_today,
+               AND (ss.started_at AT TIME ZONE 'Asia/Kolkata')::date = (NOW() AT TIME ZONE 'Asia/Kolkata')::date), 0)::int AS minutes_today,
           COALESCE((SELECT SUM(ss.active_minutes) FROM study_sessions ss
              WHERE COALESCE(ss.room_tier_id, ss.tier_id)=(SELECT id FROM this_tier)
                AND ss.started_at >= NOW() - INTERVAL '7 days'), 0)::int AS minutes_this_week,
           COALESCE((SELECT SUM(ss.active_minutes) FROM study_sessions ss
              WHERE COALESCE(ss.room_tier_id, ss.tier_id)=(SELECT id FROM this_tier)
-               AND ss.started_at >= date_trunc('month', CURRENT_DATE)), 0)::int AS minutes_this_month,
+               AND (ss.started_at AT TIME ZONE 'Asia/Kolkata') >= date_trunc('month', (NOW() AT TIME ZONE 'Asia/Kolkata')::date)), 0)::int AS minutes_this_month,
           COALESCE((SELECT MAX(streak) FROM roster), 0)::int AS highest_streak
       `, [tierId]),
       this.db.query(`
@@ -565,9 +597,9 @@ export class TierRoomsService {
     `, [tierId]);
 
     const [today, week, month, improvedRows] = await Promise.all([
-      championQuery(`AND ss.started_at::date = CURRENT_DATE`),
+      championQuery(`AND (ss.started_at AT TIME ZONE 'Asia/Kolkata')::date = (NOW() AT TIME ZONE 'Asia/Kolkata')::date`),
       championQuery(`AND ss.started_at >= NOW() - INTERVAL '7 days'`),
-      championQuery(`AND ss.started_at >= date_trunc('month', CURRENT_DATE)`),
+      championQuery(`AND (ss.started_at AT TIME ZONE 'Asia/Kolkata') >= date_trunc('month', (NOW() AT TIME ZONE 'Asia/Kolkata')::date)`),
       this.db.query(`
         SELECT u.id AS user_id, u.name AS user_name, u.avatar_url,
                COALESCE(thisWeek.minutes,0)::int - COALESCE(lastWeek.minutes,0)::int AS delta_minutes
@@ -640,13 +672,13 @@ export class TierRoomsService {
              SELECT u.id, u.streak,
                COALESCE((SELECT SUM(ss.active_minutes) FROM study_sessions ss
                  WHERE ss.user_id=u.id AND COALESCE(ss.room_tier_id, ss.tier_id)=(SELECT id FROM this_tier)
-                   AND ss.started_at::date = CURRENT_DATE), 0)::int AS today_minutes,
+                   AND (ss.started_at AT TIME ZONE 'Asia/Kolkata')::date = (NOW() AT TIME ZONE 'Asia/Kolkata')::date), 0)::int AS today_minutes,
                COALESCE((SELECT SUM(ss.active_minutes) FROM study_sessions ss
                  WHERE ss.user_id=u.id AND COALESCE(ss.room_tier_id, ss.tier_id)=(SELECT id FROM this_tier)
                    AND ss.started_at >= NOW() - INTERVAL '7 days'), 0)::int AS week_minutes,
                COALESCE((SELECT SUM(ss.active_minutes) FROM study_sessions ss
                  WHERE ss.user_id=u.id AND COALESCE(ss.room_tier_id, ss.tier_id)=(SELECT id FROM this_tier)
-                   AND ss.started_at >= date_trunc('month', CURRENT_DATE)), 0)::int AS month_minutes
+                   AND (ss.started_at AT TIME ZONE 'Asia/Kolkata') >= date_trunc('month', (NOW() AT TIME ZONE 'Asia/Kolkata')::date)), 0)::int AS month_minutes
              FROM users u WHERE u.status='active' AND (
                EXISTS(SELECT 1 FROM user_room_tier urt JOIN room_tiers t ON t.id=urt.current_tier_id
                       WHERE urt.user_id=u.id AND t.id=(SELECT id FROM this_tier))
@@ -1382,7 +1414,7 @@ export class StudySessionsService {
     // on the session summary screen.
     const [todayRow] = await this.db.query(
       `SELECT COALESCE(SUM(active_minutes),0)::int AS total
-       FROM study_sessions WHERE user_id=$1 AND started_at::date=CURRENT_DATE`,
+       FROM study_sessions WHERE user_id=$1 AND (started_at AT TIME ZONE 'Asia/Kolkata')::date = (NOW() AT TIME ZONE 'Asia/Kolkata')::date`,
       [userId]
     );
     const todayStudyMinutes = todayRow?.total ?? s.active_minutes;

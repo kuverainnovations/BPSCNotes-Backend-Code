@@ -822,6 +822,11 @@ class UsersService {
     @Inject(CACHE_MANAGER) private readonly cache: Cache,
     private readonly config: ConfigService,
     private readonly activityLog: ActivityLogService,
+    // Optional so the module still boots if notifications are unavailable —
+    // failing to send a confirmation must never fail the registration itself.
+    @Inject('NOTIFICATION_SERVICE') @Optional() private readonly notifService?: {
+      pushToUser: (userId: string, title: string, body: string, data?: Record<string, string>) => Promise<boolean>;
+    },
   ) {}
 
   async getProfile(userId: string) {
@@ -1279,15 +1284,40 @@ class UsersService {
       `INSERT INTO live_class_registrations VALUES ($1,$2) ON CONFLICT DO NOTHING RETURNING user_id`,
       [classId, userId]
     );
-    await this.db.query(`UPDATE live_classes SET registered_count=registered_count+1 WHERE id=$1`, [classId]);
 
     if (inserted.length) {
-      const [cls] = await this.db.query(`SELECT title, scheduled_at FROM live_classes WHERE id=$1`, [classId]);
+      // Only count a registration that actually happened. This ran
+      // unconditionally, so every repeat tap on an already-registered class
+      // inflated registered_count — the seat total admins see was wrong by
+      // however many times students re-opened the card.
+      await this.db.query(`UPDATE live_classes SET registered_count=registered_count+1 WHERE id=$1`, [classId]);
+
+      const [cls] = await this.db.query(
+        `SELECT title, scheduled_at,
+                to_char(scheduled_at AT TIME ZONE 'Asia/Kolkata', 'DD Mon, hh12:mi AM') AS when_label
+           FROM live_classes WHERE id=$1`,
+        [classId]
+      );
       await this.activityLog.log(
         userId, ACTIONS.LIVE_CLASS_REGISTERED,
         `Registered for live class: ${cls?.title ?? classId}`,
         { classId, scheduledAt: cls?.scheduled_at ?? null },
       );
+
+      // Confirm it. Registering was silent: the card flipped to "Registered"
+      // and nothing else happened, so students had no record of it and no
+      // reminder of when to turn up. Fire-and-forget — a push failure must not
+      // turn a successful registration into an error.
+      // Formatted in IST in SQL rather than in JS, so the time shown is the
+      // time the class actually starts for a Bihar student.
+      this.notifService?.pushToUser(
+        userId,
+        '✅ You are registered',
+        cls?.when_label
+          ? `${cls.title} · ${cls.when_label}. We'll remind you before it starts.`
+          : `You are registered for ${cls?.title ?? 'the live class'}.`,
+        { type: 'live_class', screen: 'live_classes', classId },
+      ).catch(() => {});
     }
 
     return successResponse(null, 'Registered for live class!');
@@ -1553,7 +1583,9 @@ class StreakReminderService {
   }
 }
 
-@Module({ imports:[ConfigModule], controllers:[UsersController, AdminUsersExtraController], providers:[UsersService, LeaderboardCronService, StreakReminderService, ActivityLogService], exports:[UsersService] })
+// NotificationsModule supplies the 'NOTIFICATION_SERVICE' token UsersService
+// injects to confirm live-class registrations.
+@Module({ imports:[ConfigModule, NotificationsModule], controllers:[UsersController, AdminUsersExtraController], providers:[UsersService, LeaderboardCronService, StreakReminderService, ActivityLogService], exports:[UsersService] })
 export class UsersModule {}
 
 // ════════════════════════════════════════════════════════════
