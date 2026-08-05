@@ -528,6 +528,23 @@ export class CoinsService implements OnModuleInit {
   // it just reports today's status. This also closes a real exploit
   // where tapping "Invite" used to grant a referral bonus with no
   // friend ever having signed up.
+  /**
+   * Credits a coin rule for something the user actually did, from another
+   * module. Unlike [claimTask] this is not a tap — it is the real flow
+   * reporting completion, so it always pays (subject to the rule's daily cap
+   * and the global coin switch, both enforced by awardCoins).
+   *
+   * Exists because other modules cannot inject AuthService without closing a
+   * dependency cycle, and reaching for claimTask() instead is what broke study
+   * material uploads: it was called with a task id that does not exist, threw
+   * NotFoundException into a bare catch, and silently paid nobody.
+   *
+   * @returns coins credited, or 0 if capped/disabled.
+   */
+  async awardActivity(userId: string, action: string, refId?: string): Promise<number> {
+    return this.authService.awardCoins(userId, action, refId);
+  }
+
   async claimTask(taskId: string, userId: string) {
     const task = WALLET_TASKS.find(t => t.action === taskId);
     if (!task) throw new NotFoundException(`Task '${taskId}' not found`);

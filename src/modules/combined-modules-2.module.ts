@@ -1962,9 +1962,19 @@ class FlashcardsService {
     if (subject) { conditions.push(`f.subject = $${params.length + 1}`); params.push(subject); }
     if (exam) { conditions.push(`$${params.length + 1} = ANY(f.exam_tags)`); params.push(exam); }
     const rows = await this.db.query(
-      `SELECT f.id, f.subject,
-         COALESCE(NULLIF(f.topic,''), f.subject) AS topic,
-         f.front AS question, f.back AS answer,
+      // Never send a JSON null for a text field. The Android FlashcardDto types
+      // these as non-null Kotlin Strings with "" defaults, but Gson builds the
+      // object by reflection and writes an explicit null straight over the
+      // default — so the field ends up null despite its type, and the first
+      // Text() that renders it throws NullPointerException in Compose's layout
+      // pass and takes the whole app down. That is exactly what happened when
+      // the admin form stopped sending a subject: every card created after that
+      // crashed Active Recall on display.
+      `SELECT f.id,
+         COALESCE(f.subject, '') AS subject,
+         COALESCE(NULLIF(f.topic,''), f.subject, '') AS topic,
+         f.front AS question,
+         COALESCE(f.back, '') AS answer,
          COALESCE(f.hint,'') AS hint,
          COALESCE(f.card_type,'text') AS card_type,
          f.image_url, f.back_image_url,

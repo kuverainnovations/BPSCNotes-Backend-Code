@@ -775,14 +775,22 @@ if (query.search)  { conditions.push(`(sm.title ILIKE $${pi} OR sm.subject ILIKE
     await this.db.query(`UPDATE study_materials SET status='approved', updated_at=NOW() WHERE id=$1`, [id]);
     this.syncMaterialGPlayProduct(id).catch(() => {});
 
-    // Award coins to the uploader for the upload_note task (once per material approved)
-    // Only award if they haven't already been awarded for this material's upload action
+    // Award the uploader for the "Upload Study Notes" wallet task, once per
+    // approved material.
+    //
+    // This called claimTask('upload_note', …). There is no task with that id —
+    // the action is 'material_upload' — so claimTask threw NotFoundException
+    // straight into the bare catch below and no one was ever paid. The wallet
+    // card also stayed permanently incomplete, because "completed" is defined
+    // as having a coin_transactions row for the action today, and that row was
+    // never written. awardActivity() is the correct entry point: it honours the
+    // rule's daily cap and the global coin switch.
     try {
       const [mat] = await this.db.query(
         `SELECT uploader_id FROM study_materials WHERE id=$1`, [id]
       );
       if (mat?.uploader_id) {
-        await this.coinsService.claimTask('upload_note', mat.uploader_id);
+        await this.coinsService.awardActivity(mat.uploader_id, 'material_upload', id);
         // ── Referral milestone 2 — engagement: friend uploaded a material ──
         // Done inline to avoid circular dependency with AuthService
         this.awardReferralMilestoneInline(mat.uploader_id, 'engagement').catch(() => {});

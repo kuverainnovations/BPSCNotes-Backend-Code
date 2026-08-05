@@ -156,6 +156,14 @@ export class CoursesRepository {
    WHERE ue2.course_id = c.id
 ) AS enrollment_count,
                 c.bpsc_relevance,
+                -- syllabus_coverage was missing from this list while
+                -- bpsc_relevance beside it was selected, so the marketplace
+                -- card and its detail sheet — both built from this endpoint —
+                -- saw the field absent and fell back to 0, rendering "—" no
+                -- matter what an admin typed. findOneById already selected it,
+                -- which is why the value looked correct everywhere except the
+                -- one screen students actually see.
+                c.syllabus_coverage,
                 c.exam_tags, c.language, c.status, c.created_at, c.trial_lesson_title,
                 c.what_you_learn, c.has_certificate${userSubQuery}
          FROM courses c
