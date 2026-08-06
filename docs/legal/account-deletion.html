@@ -1,0 +1,91 @@
+<!--
+  Account deletion request page — publish at https://bpscnotes.in/account-deletion/
+
+  WHY THIS EXISTS
+  Google Play requires any app that lets users create an account to offer
+  account deletion BOTH inside the app AND at a publicly reachable web URL,
+  and that URL has to be entered in the Play Console listing (App content ->
+  Data safety -> Account deletion). The in-app path already exists
+  (Settings -> Delete Account). This page is the web half, and it is currently
+  missing, which blocks the Data Safety declaration.
+
+  IMPLEMENTATION NOTE
+  The form below posts nowhere on its own — it is deliberately a mailto form so
+  it works on a static page with no backend. If you would rather it hit an
+  endpoint, point it at a request handler and keep the wording, which is what
+  the Play listing is checked against.
+
+  BEFORE PUBLISHING: fill in [[LEGAL_ENTITY]] at the bottom.
+-->
+<h1>Delete your BPSCNotes account</h1>
+
+<p>
+  You can permanently delete your BPSCNotes account and the data attached to
+  it. There are two ways to do it.
+</p>
+
+<h2>Option 1 — In the app (fastest)</h2>
+<ol>
+  <li>Open BPSCNotes and go to <strong>Settings</strong>.</li>
+  <li>Scroll to <strong>Delete Account</strong>.</li>
+  <li>Confirm. Your account is deleted immediately and you are signed out.</li>
+</ol>
+
+<h2>Option 2 — Request it here</h2>
+<p>
+  If you can no longer sign in, email
+  <a href="mailto:support@bpscnotes.in?subject=Account%20deletion%20request">support@bpscnotes.in</a>
+  with the subject <strong>"Account deletion request"</strong> and include the
+  mobile number registered to the account.
+</p>
+<p>
+  We verify that the request came from the account holder before deleting
+  anything, then complete the deletion within <strong>7 days</strong> and
+  confirm by email.
+</p>
+
+<h2>What gets deleted</h2>
+<ul>
+  <li>Your profile — name, photo, mobile number, district and exam preferences</li>
+  <li>Your study history — quiz attempts, scores, streaks and study time</li>
+  <li>Your coins balance and reward history</li>
+  <li>Your notebook notes and written answers</li>
+  <li>Study material you uploaded to the marketplace</li>
+  <li>Your chat messages and peer reviews</li>
+  <li>Your notification tokens and app settings</li>
+</ul>
+
+<h2>What we keep, and for how long</h2>
+<ul>
+  <li>
+    <strong>Purchase and invoice records — up to 8 years.</strong> Indian tax
+    law requires us to retain these. They are kept separately from your profile
+    and are not used for anything else.
+  </li>
+  <li>
+    <strong>Moderation records — up to 2 years.</strong> If your account was
+    reported or suspended, we keep that record so the same abuse can be
+    recognised if it recurs.
+  </li>
+  <li>
+    <strong>Anonymised analytics.</strong> Aggregated usage statistics that can
+    no longer be linked to you.
+  </li>
+</ul>
+
+<h2>Before you delete</h2>
+<p>
+  Deletion cannot be undone. Any coins, purchased courses, study material and
+  active subscription access are lost and are not refundable on deletion. If
+  you have an active subscription bought through Google Play, cancel it in the
+  Play Store separately — deleting your BPSCNotes account does not cancel a
+  Play subscription, and Google will keep billing it otherwise.
+</p>
+
+<h2>Questions</h2>
+<p>
+  Email <a href="mailto:support@bpscnotes.in">support@bpscnotes.in</a>. See
+  also our <a href="https://bpscnotes.in/privacy-policy/">Privacy Policy</a>.
+</p>
+
+<p><em>BPSCNotes is operated by [[LEGAL_ENTITY]].</em></p>
