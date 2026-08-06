@@ -43,6 +43,7 @@ import { StudyMaterialsModule } from '@modules/study-materials/study-materials.m
 import { MaterialChatModule } from '@modules/study-materials/material-chat.module';
 import { MarketplaceModule }   from './modules/marketplace.module';
 import { AnswerWritingModule } from './modules/answer-writing/answer-writing.module';
+import { ModerationModule } from './modules/moderation/moderation.module';
 
 @Module({
   imports: [
@@ -147,6 +148,7 @@ import { AnswerWritingModule } from './modules/answer-writing/answer-writing.mod
     MaterialChatModule,
     MarketplaceModule,
     AnswerWritingModule,
+    ModerationModule,
     CoinsModule,
     SearchModule,
     BookmarksModule,

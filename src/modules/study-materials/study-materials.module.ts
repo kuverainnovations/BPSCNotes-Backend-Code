@@ -188,6 +188,17 @@ export class StudyMaterialsService {
       conditions.push(`EXISTS (SELECT 1 FROM material_bookmarks mb WHERE mb.material_id=sm.id AND mb.user_id=$${pi++})`);
       params.push(query.userId);
     }
+    // Blocking a user hides what they uploaded too, not just what they say —
+    // otherwise the block is only half honoured and their material keeps
+    // surfacing in Explore. Applies to the blocker's view alone.
+    if (query.userId) {
+      conditions.push(
+        `(sm.uploader_id IS NULL OR sm.uploader_id NOT IN (
+            SELECT blocked_id FROM user_blocks WHERE blocker_id = $${pi++}
+          ))`
+      );
+      params.push(query.userId);
+    }
 
     const sortMap: Record<string, string> = {
       newest:    'sm.created_at DESC',

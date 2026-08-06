@@ -1949,10 +1949,12 @@ export class TierRoomsController {
    */
   @Get('tiers/:tierKey/messages')
   async getChatHistory(
+    @Req()            r:       any,
     @Param('tierKey') tierKey: string,
     @Query('limit')   limit:   number = 50,
   ) {
-    const msgs = await this.gateway.getChatHistory(tierKey, Math.min(+limit || 50, 100));
+    // The viewer id is what lets the gateway drop senders this user blocked.
+    const msgs = await this.gateway.getChatHistory(tierKey, Math.min(+limit || 50, 100), r.user.id);
     // gateway returns newest-first from DB; reverse for oldest-first display
     return successResponse({ messages: msgs.reverse() });
   }

@@ -472,13 +472,21 @@ export class AnswerWritingService {
         // Ordered most-useful-first (the client's "Top Review Highlights"):
         // reviews the author found helpful rise, ones they marked unhelpful
         // sink, unvoted ones sit in between by recency.
+        // reviewer_id is selected so the app can offer Report/Block on a
+        // review. hidden_at drops what a moderator took down (for everyone);
+        // the user_blocks subquery drops reviewers this reader blocked (for
+        // them only).
         peerReviews = await this.db.query(
-          `SELECT pr.id, pr.verdict, pr.rating, pr.improvement_area, pr.improvement_areas,
+          `SELECT pr.id, pr.reviewer_id, pr.verdict, pr.rating, pr.improvement_area, pr.improvement_areas,
                   pr.suggestion, pr.created_at, pr.helpful_votes, pr.unhelpful_votes,
                   v.helpful AS my_vote
            FROM answer_peer_reviews pr
            LEFT JOIN answer_review_votes v ON v.review_id = pr.id AND v.voter_id = $2
            WHERE pr.submission_id = $1
+             AND pr.hidden_at IS NULL
+             AND pr.reviewer_id NOT IN (
+                   SELECT blocked_id FROM user_blocks WHERE blocker_id = $2
+                 )
            ORDER BY (pr.helpful_votes - pr.unhelpful_votes) DESC, pr.created_at DESC`,
           [sub.id, userId]
         );

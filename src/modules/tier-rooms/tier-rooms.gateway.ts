@@ -241,8 +241,23 @@ export class TierRoomsGateway
     if (!saved.length) return;
 
     const row = saved[0];
+
+    // Anyone who has blocked the sender must not receive this live, or a
+    // block would only take effect after a reload — the history query already
+    // filters it. Excluding by socket keeps the broadcast a single emit, and
+    // the extra lookup is cheap behind the 1 msg/sec rate limit above.
+    const blockers = await this.db.query(
+      `SELECT blocker_id FROM user_blocks WHERE blocked_id = $1`,
+      [userId],
+    );
+    let target = this.server.to(`tier:${tierKey}`);
+    for (const { blocker_id } of blockers) {
+      const socketId = this.userSockets.get(blocker_id);
+      if (socketId) target = target.except(socketId);
+    }
+
     // Broadcast to everyone in this tier room (including sender for confirmation)
-    this.server.to(`tier:${tierKey}`).emit('room:new_message', {
+    target.emit('room:new_message', {
       id:         row.id,
       senderId:   userId,
       senderName: row.sender_name,
@@ -255,15 +270,23 @@ export class TierRoomsGateway
   private readonly lastMsgTime = new Map<string, number>();
 
   // ── SERVER: get chat history (called from REST controller) ───
-  async getChatHistory(tierKey: string, limit = 50): Promise<any[]> {
+  // viewerId scopes the result to what THIS user is allowed to see: messages
+  // a moderator hid are gone for everyone, and messages from someone the
+  // viewer blocked are gone only for them. Both filters have to live in the
+  // query — the client cannot be trusted to hide content it already has.
+  async getChatHistory(tierKey: string, limit = 50, viewerId?: string): Promise<any[]> {
     return this.db.query(`
       SELECT id, sender_id AS "senderId", sender_name AS "senderName",
              message, tier_key AS "tierKey", created_at AS "createdAt"
       FROM room_messages
       WHERE tier_key = $1
+        AND hidden_at IS NULL
+        AND ($3::uuid IS NULL OR sender_id NOT IN (
+              SELECT blocked_id FROM user_blocks WHERE blocker_id = $3::uuid
+            ))
       ORDER BY created_at DESC
       LIMIT $2
-    `, [tierKey, limit]);
+    `, [tierKey, limit, viewerId ?? null]);
   }
 
   // ── SERVER: emit promotion event to a specific user ───────
