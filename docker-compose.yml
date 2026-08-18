@@ -170,6 +170,17 @@ services:
       - /etc/letsencrypt:/etc/letsencrypt:ro   # read certs written by certbot
       - certbot-webroot:/var/www/certbot:ro     # serve ACME challenges written by certbot
       - ./nginx/logs:/var/log/nginx
+    # Reload every 6h so a certbot-renewed certificate is actually picked up.
+    #
+    # nginx reads the certificate once at startup and holds it in memory. The
+    # certbot sidecar below writes a renewed cert into /etc/letsencrypt but has
+    # no way to signal this container, so without this loop nginx keeps serving
+    # the old certificate until something happens to restart it. That is how the
+    # api.bpscnotes.in certificate reached its 14 Aug 2026 expiry on the wire
+    # while renewal was nominally running every 12h — which broke every API call
+    # in the app and triggered the Play "Broken Functionality" rejection.
+    command: >
+      /bin/sh -c 'while :; do sleep 6h & wait $${!}; nginx -s reload; done & nginx -g "daemon off;"'
     depends_on:
       api:
         condition: service_healthy
