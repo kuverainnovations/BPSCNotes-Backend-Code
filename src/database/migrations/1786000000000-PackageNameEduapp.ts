@@ -3,7 +3,7 @@ import { MigrationInterface, QueryRunner } from 'typeorm';
 /**
  * Point the Play Store link at the new package name.
  *
- * The app's applicationId changed from `com.bpscnotes.app` to
+ * The app's applicationId changed from `com.bpscnotes.eduapp` to
  * `com.bpscnotes.eduapp` before the first Play release. `android_store_url`
  * was seeded with the old id by PublicConfigDefaults1785400000000, and that
  * migration has already run — so editing the seed there would fix nothing on
@@ -25,16 +25,16 @@ export class PackageNameEduapp1786000000000 implements MigrationInterface {
     // manually edited link (extra query params, a different locale) survives.
     await queryRunner.query(`
       UPDATE app_settings
-         SET value = REPLACE(value, 'com.bpscnotes.app', 'com.bpscnotes.eduapp')
+         SET value = REPLACE(value, 'com.bpscnotes.eduapp', 'com.bpscnotes.eduapp')
        WHERE key = 'android_store_url'
-         AND value LIKE '%com.bpscnotes.app%'
+         AND value LIKE '%com.bpscnotes.eduapp%'
     `);
   }
 
   public async down(queryRunner: QueryRunner): Promise<void> {
     await queryRunner.query(`
       UPDATE app_settings
-         SET value = REPLACE(value, 'com.bpscnotes.eduapp', 'com.bpscnotes.app')
+         SET value = REPLACE(value, 'com.bpscnotes.eduapp', 'com.bpscnotes.eduapp')
        WHERE key = 'android_store_url'
          AND value LIKE '%com.bpscnotes.eduapp%'
     `);

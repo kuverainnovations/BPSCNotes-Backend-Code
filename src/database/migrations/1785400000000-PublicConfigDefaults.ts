@@ -27,7 +27,7 @@ export class PublicConfigDefaults1785400000000 implements MigrationInterface {
         ('force_update',       'false', 'Kill-switch: hard-block every version until users update'),
         ('app_version',        '1.0.4', 'Latest version on the Play Store — users below this get a dismissible nudge'),
         ('min_app_version',    '1.0.0', 'Hard floor — users below this are blocked until they update'),
-        ('android_store_url',  'https://play.google.com/store/apps/details?id=com.bpscnotes.app', 'Play Store listing opened by the update prompt')
+        ('android_store_url',  'https://play.google.com/store/apps/details?id=com.bpscnotes.eduapp', 'Play Store listing opened by the update prompt')
       ON CONFLICT (key) DO NOTHING
     `);
   }

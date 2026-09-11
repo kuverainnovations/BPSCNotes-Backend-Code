@@ -1952,8 +1952,8 @@ class SubscriptionsService {
     }
 
     // packageName from env; fallback matches the current applicationId in
-    // app/build.gradle.kts (com.bpscnotes.app) — verify against Play Console.
-    const packageName = process.env.ANDROID_PACKAGE_NAME || 'com.bpscnotes.app';
+    // app/build.gradle.kts (com.bpscnotes.eduapp) — verify against Play Console.
+    const packageName = process.env.ANDROID_PACKAGE_NAME || 'com.bpscnotes.eduapp';
     let androidpublisher: any;
     let purchaseData: any;
     try {

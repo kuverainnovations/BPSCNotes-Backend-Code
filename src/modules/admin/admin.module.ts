@@ -368,7 +368,7 @@ export class AdminSettingsService {
       force_update:          'false',
       app_version:           '1.0.4',
       min_app_version:       '1.0.0',
-      android_store_url:     'https://play.google.com/store/apps/details?id=com.bpscnotes.app',
+      android_store_url:     'https://play.google.com/store/apps/details?id=com.bpscnotes.eduapp',
       // ── Everything else ─────────────────────────────────────
       daily_quiz_limit:      '5',
       leaderboard_enabled:   'true',
