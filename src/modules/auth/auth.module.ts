@@ -1115,8 +1115,12 @@ export class AuthService {
 
   // ── POST /auth/login-mpin ────────────────────────────
   async loginMpin(mobile: string, mpin: string) {
-    console.log('[MPIN_LOGIN] mobile received:', JSON.stringify(mobile));
 
+    const normalizedMobile = mobile.replace(/\s+/g, '');
+  
+    console.log('[MPIN_LOGIN] received:', JSON.stringify(mobile));
+    console.log('[MPIN_LOGIN] normalized:', JSON.stringify(normalizedMobile));
+  
     const [user] = await this.db.query(
       `SELECT id, name, email, mobile, role, status, coins, streak, primary_exam,
               prep_level, referral_code, is_verified, mpin_hash,
