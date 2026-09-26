@@ -1116,7 +1116,24 @@ export class AuthService {
   // ── POST /auth/login-mpin ────────────────────────────
   async loginMpin(mobile: string, mpin: string) {
 
-    const normalizedMobile = mobile.replace(/\s+/g, '').replace(/^\+91(?=91\d{10}$)/, '');
+    // Normalize Indian mobile number to: +91XXXXXXXXXX
+    const digits = mobile.replace(/\D/g, '');
+  
+    let normalizedMobile: string;
+  
+    if (digits.startsWith('91') && digits.length >= 12) {
+      // +91 / 91 prefix
+      normalizedMobile = `+91${digits.slice(-10)}`;
+    } else if (digits.startsWith('0') && digits.length === 11) {
+      // 0XXXXXXXXXX
+      normalizedMobile = `+91${digits.slice(1)}`;
+    } else if (digits.length === 10) {
+      // XXXXXXXXXX
+      normalizedMobile = `+91${digits}`;
+    } else {
+      // Keep as-is; query will fail safely for invalid input
+      normalizedMobile = mobile.trim();
+    }
   
     console.log('[MPIN_LOGIN] received:', JSON.stringify(mobile));
     console.log('[MPIN_LOGIN] normalized:', JSON.stringify(normalizedMobile));
@@ -1125,17 +1142,28 @@ export class AuthService {
       `SELECT id, name, email, mobile, role, status, coins, streak, primary_exam,
               prep_level, referral_code, is_verified, mpin_hash,
               mpin_failed_attempts, mpin_locked_until
-       FROM users WHERE mobile=$1 AND deleted_at IS NULL`,
-      [mobile]
+       FROM users
+       WHERE mobile=$1 AND deleted_at IS NULL`,
+      [normalizedMobile]
     );
+  
     if (!user) throw new UnauthorizedException('Mobile number not registered');
-    if (user.status === 'banned') throw new UnauthorizedException('Account suspended. Contact support.');
-    if (!user.mpin_hash) throw new UnauthorizedException('No MPIN set. Please login with OTP first.');
-
+  
+    if (user.status === 'banned') {
+      throw new UnauthorizedException('Account suspended. Contact support.');
+    }
+  
+    if (!user.mpin_hash) {
+      throw new UnauthorizedException('No MPIN set. Please login with OTP first.');
+    }
+  
     // Check lockout
     if (user.mpin_locked_until && new Date(user.mpin_locked_until) > new Date()) {
-      const secsLeft = Math.ceil((new Date(user.mpin_locked_until).getTime() - Date.now()) / 1000);
+      const secsLeft = Math.ceil(
+        (new Date(user.mpin_locked_until).getTime() - Date.now()) / 1000
+      );
       const minsLeft = Math.ceil(secsLeft / 60);
+  
       throw new UnauthorizedException(
         `Too many failed attempts. Try again in ${minsLeft} minute${minsLeft > 1 ? 's' : ''}.`
       );
