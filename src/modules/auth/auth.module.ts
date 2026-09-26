@@ -1116,7 +1116,7 @@ export class AuthService {
   // ── POST /auth/login-mpin ────────────────────────────
   async loginMpin(mobile: string, mpin: string) {
 
-    const normalizedMobile = mobile.replace(/\s+/g, '');
+    const normalizedMobile = mobile.replace(/\s+/g, '').replace(/^\+91(?=91\d{10}$)/, '');
   
     console.log('[MPIN_LOGIN] received:', JSON.stringify(mobile));
     console.log('[MPIN_LOGIN] normalized:', JSON.stringify(normalizedMobile));
