@@ -94,7 +94,7 @@ export async function syncCourseToPlayCatalog(course: CourseForSync): Promise<st
         productId,
         listings: [
           {
-            languageCode: 'en-GB',
+            languageCode: 'en-US',
             title: course.title.slice(0, 55),
             description: (course.description || course.title).slice(0, 200),
           },
@@ -178,7 +178,7 @@ export async function syncMaterialToPlayCatalog(material: MaterialForSync): Prom
         productId,
         listings: [
           {
-            languageCode: 'en-GB',
+            languageCode: 'en-US',
             title: material.title.slice(0, 55),
             description: (material.description || material.title).slice(0, 200),
           },
