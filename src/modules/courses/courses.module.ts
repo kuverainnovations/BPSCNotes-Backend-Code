@@ -852,11 +852,26 @@ export class CoursesService {
     // build that predates this fix (never sets obfuscatedAccountId) has no
     // value here and is rejected too — only enrollments already recorded
     // before this deploys are grandfathered in (caught by the dup-check above).
-    if (!purchase.obfuscatedExternalAccountId || purchase.obfuscatedExternalAccountId !== userId) {
+
+    
+    // if (!purchase.obfuscatedExternalAccountId || purchase.obfuscatedExternalAccountId !== userId) {
+    //   console.warn(
+    //     `GPlay course purchase account mismatch: user=${userId} course=${courseId} tokenAccountId=${purchase.obfuscatedExternalAccountId}`
+    //   );
+    //   throw new BadRequestException('This purchase does not belong to your account.');
+    // }
+
+    if (
+      purchase.obfuscatedExternalAccountId &&
+      purchase.obfuscatedExternalAccountId !== userId
+    ) {
       console.warn(
-        `GPlay course purchase account mismatch: user=${userId} course=${courseId} tokenAccountId=${purchase.obfuscatedExternalAccountId}`
+        `GPlay course purchase account mismatch: user=${userId} tokenAccountId=${purchase.obfuscatedExternalAccountId}`
       );
-      throw new BadRequestException('This purchase does not belong to your account.');
+    
+      throw new BadRequestException(
+        'This purchase does not belong to your account.'
+      );
     }
 
     const amount = Math.max(0, Math.floor(Number(dto.clientPriceInr) || 0));
