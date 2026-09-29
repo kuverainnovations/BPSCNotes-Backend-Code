@@ -1631,12 +1631,27 @@ console.log("SECRET =", cfMap["cashfree_secret_key"]?.substring(0, 10));
     // than trusting the caller's userId alone — otherwise a purchase token
     // captured by a second user (shared device, leaked log) could be replayed
     // against this endpoint to claim someone else's paid purchase for free.
-    if (!purchase.obfuscatedExternalAccountId || purchase.obfuscatedExternalAccountId !== userId) {
+    
+    // if (!purchase.obfuscatedExternalAccountId || purchase.obfuscatedExternalAccountId !== userId) {
+    //   this.logger.warn(
+    //     `GPlay material purchase account mismatch: user=${userId} material=${materialId} ` +
+    //     `tokenAccountId=${purchase.obfuscatedExternalAccountId}`
+    //   );
+    //   throw new BadRequestException('This purchase does not belong to your account.');
+    // }
+
+    if (
+      purchase.obfuscatedExternalAccountId &&
+      purchase.obfuscatedExternalAccountId !== userId
+    ) {
       this.logger.warn(
         `GPlay material purchase account mismatch: user=${userId} material=${materialId} ` +
         `tokenAccountId=${purchase.obfuscatedExternalAccountId}`
       );
-      throw new BadRequestException('This purchase does not belong to your account.');
+    
+      throw new BadRequestException(
+        'This purchase does not belong to your account.'
+      );
     }
 
     // Dup-check scoped to this token — safe to treat as an idempotent retry
