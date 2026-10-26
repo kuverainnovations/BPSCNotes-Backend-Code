@@ -1397,6 +1397,18 @@ class UsersService {
     if (fields.length) { fields.push('updated_at=NOW()'); await this.db.query(`UPDATE live_classes SET ${fields.join(',')} WHERE id=$${i}`, [...vals, classId]); }
     return successResponse(null, 'Live class updated ✅');
   }
+  async deleteLiveClass(classId: string) {
+    const result = await this.db.query(
+      `DELETE FROM live_classes WHERE id = $1 RETURNING id`,
+      [classId]
+    );
+
+    if (!result.length) {
+      throw new NotFoundException('Live class not found');
+    }
+
+    return successResponse(null, 'Live class deleted successfully');
+  }
 
   async getLearningProgress(userId: string) {
     const [inProgressRows, recentRows] = await Promise.all([
@@ -1476,6 +1488,7 @@ class AdminUsersExtraController {
   @Get('certificates')          @RequirePermission('certificates') getCerts(@Query() q: any) { return this.s.getCertificatesAdmin(q); }
   @Get('live-classes')          @RequirePermission('live-classes') getLiveClasses(@Query() q: any) { return this.s.getLiveClassesAdmin(q); }
   @Post('live-classes')         @RequirePermission('live-classes') @HttpCode(201) createLiveClass(@Body() dto: any, @Req() r: any) { return this.s.createLiveClass(dto, r.admin.id); }
+  @Delete('live-classes/:id') @RequirePermission('live-classes') deleteLiveClass(@Param('id', ParseUUIDPipe) id: string) { return this.s.deleteLiveClass(id); }
   @Put('live-classes/:id')      @RequirePermission('live-classes') updateLiveClass(@Param('id', ParseUUIDPipe) id: string, @Body() dto: any) { return this.s.updateLiveClass(id, dto); }
   @Put('live-classes/:id/toggle') @RequirePermission('live-classes') toggleLiveClass(@Param('id', ParseUUIDPipe) id: string, @Body() dto: any) { return this.s.toggleLiveClass(id, dto.isLive ?? false); }
 }
