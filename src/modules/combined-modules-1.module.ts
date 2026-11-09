@@ -2586,17 +2586,17 @@ export class NotificationService {
   // status='scheduled' and nothing ever read it back, so scheduled
   // notifications sat in the table forever and never reached anyone.
   //
-  // Runs every minute — the admin UI schedules to the minute, so a coarser
-  // tick would show up as notifications arriving visibly late.
-  @Cron('* * * * *')
+  // Called once a minute by ScheduledNotificationCron below, which exists
+  // only so the tick is registered once. The admin UI schedules to the
+  // minute, so a coarser tick would show up as notifications arriving late.
   async dispatchScheduledNotifications() {
     // Claim and mark in ONE statement. Two app instances both running this
     // cron would otherwise each read the same 'scheduled' rows and send
     // every notification twice. FOR UPDATE SKIP LOCKED lets a second
     // instance move past rows this one has already taken.
-    let due: any[];
+    let claimed: any;
     try {
-      due = await this.db.query(`
+      claimed = await this.db.query(`
         UPDATE notifications SET status='sent', sent_at=NOW()
         WHERE id IN (
           SELECT id FROM notifications
@@ -2611,6 +2611,12 @@ export class NotificationService {
       this.logger.error(`Could not claim scheduled notifications: ${err.message}`);
       return;
     }
+
+    // raw query() returns [rows, affectedCount] for UPDATE/DELETE RETURNING.
+    // Reading it as rows made `due` that two-element wrapper every single
+    // minute, so the dispatcher reported two due notifications even with an
+    // empty table and fanned out the array and the count instead of a row.
+    const [due] = claimed as [any[], number];
 
     if (!due.length) return;
     this.logger.log(`Dispatching ${due.length} scheduled notification(s)`);
@@ -2952,11 +2958,34 @@ class AdminNotificationsController {
   @Post('send') @RequirePermission('notifications') @HttpCode(200) send(@Body() dto: any, @Req() r: any) { return this.s.send(dto, r.admin.id); }
 }
 
+/**
+ * Owns the once-a-minute scheduled-notification tick, and nothing else.
+ *
+ * NotificationService is listed in the `providers` of four separate modules
+ * (NotificationsModule, DailyTargetsModule, QuizzesModule, CoursesModule), so
+ * Nest builds four instances of it and @nestjs/schedule registers every @Cron
+ * method on each one. The three older crons in that class each take a Redis
+ * lock to survive that. The dispatcher relies on an atomic DB claim instead,
+ * which is correct under concurrency but means five instances racing on the
+ * same statement every minute for nothing. This provider is declared only by
+ * NotificationsModule, so there is exactly one of it and the tick fires once.
+ */
+@Injectable()
+export class ScheduledNotificationCron {
+  constructor(private readonly notifications: NotificationService) {}
+
+  @Cron('* * * * *')
+  handleTick() {
+    return this.notifications.dispatchScheduledNotifications();
+  }
+}
+
 @Module({
   imports:   [ConfigModule],
   controllers: [NotificationsController, AdminNotificationsController],
   providers: [
     NotificationService,
+    ScheduledNotificationCron,
     { provide: 'NOTIFICATION_SERVICE', useExisting: NotificationService },
   ],
   exports: [NotificationService, 'NOTIFICATION_SERVICE'],
