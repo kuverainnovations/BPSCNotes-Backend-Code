@@ -2,7 +2,7 @@ import * as CashfreeUtil from '../common/utils/cashfree.util';
 import {
   Module, Injectable, Controller, Get, Post, Put, Delete,
   Body, Param, Query, Req, Res, HttpCode, HttpStatus,
-  NotFoundException, BadRequestException, ConflictException,
+  NotFoundException, BadRequestException, ConflictException, ForbiddenException,
   UseGuards, ParseUUIDPipe, OnModuleInit, UseInterceptors, UploadedFile,
   Logger,
 } from '@nestjs/common';
@@ -389,14 +389,88 @@ class CurrentAffairsService {
     `);
   }
 
-  async getMcqs(affairId: string) {
+  /** Coins charged to attempt a CA MCQ set. 0 (the seeded default) = free. */
+  private async caQuizCoinCost(): Promise<number> {
+    const [row] = await this.db.query(
+      `SELECT value FROM app_settings WHERE key='ca_quiz_coin_cost'`
+    );
+    return Math.max(0, parseInt(row?.value ?? '0', 10) || 0);
+  }
+
+  private async hasUnlockedCaMcqs(affairId: string, userId: string): Promise<boolean> {
+    if (!userId) return false;
+    const rows = await this.db.query(
+      `SELECT 1 FROM ca_mcq_unlocks WHERE affair_id=$1 AND user_id=$2 LIMIT 1`,
+      [affairId, userId]
+    );
+    return rows.length > 0;
+  }
+
+  /**
+   * @param bypassLock set by the admin controller — staff review questions
+   *        through this same method and must never meet the student paywall.
+   */
+  async getMcqs(affairId: string, userId?: string, bypassLock = false) {
     await this.ensureCaMcqTable();
+    const cost = await this.caQuizCoinCost();
+    const unlocked = bypassLock || cost === 0 || await this.hasUnlockedCaMcqs(affairId, userId ?? '');
+
+    // Questions carry their own correct answers, so a locked set must not be
+    // handed over at all — returning them and hiding the UI would put the
+    // paid content on the wire for anyone reading the response.
+    if (!unlocked) {
+      const [{ count }] = await this.db.query(
+        `SELECT COUNT(*)::int AS count FROM ca_mcqs WHERE affair_id=$1`, [affairId]
+      );
+      return successResponse({
+        mcqs: [], markingConfig: null,
+        locked: true, coinCost: cost, questionCount: count,
+      }, 'Unlock this quiz to attempt it');
+    }
+
     const rows = await this.db.query(
       `SELECT * FROM ca_mcqs WHERE affair_id=$1 ORDER BY created_at ASC`,
       [affairId]
     );
     const markingConfig = (await this.getEffectiveMcqMarkingConfig(affairId)).data.config;
-    return successResponse({ mcqs: rows, markingConfig });
+    return successResponse({ mcqs: rows, markingConfig, locked: false, coinCost: cost });
+  }
+
+  /** Spend coins to open an article's MCQ set. Idempotent per user+article. */
+  async unlockMcqs(affairId: string, userId: string) {
+    await this.ensureCaMcqTable();
+    const cost = await this.caQuizCoinCost();
+    if (cost === 0) return successResponse({ unlocked: true, coinsSpent: 0 }, 'This quiz is free');
+    if (await this.hasUnlockedCaMcqs(affairId, userId)) {
+      return successResponse({ unlocked: true, coinsSpent: 0 }, 'Already unlocked');
+    }
+
+    return this.db.transaction(async (tx) => {
+      const [user] = await tx.query(`SELECT coins FROM users WHERE id=$1 FOR UPDATE`, [userId]);
+      if (!user) throw new NotFoundException('User not found');
+      if (Number(user.coins) < cost) {
+        throw new BadRequestException(`Not enough coins — this quiz costs ${cost}, you have ${user.coins}`);
+      }
+
+      await tx.query(`UPDATE users SET coins = coins - $2 WHERE id=$1`, [userId, cost]);
+      await tx.query(
+        `INSERT INTO ca_mcq_unlocks (user_id, affair_id, coins_spent) VALUES ($1,$2,$3)
+         ON CONFLICT DO NOTHING`,
+        [userId, affairId, cost]
+      );
+      const [after] = await tx.query(`SELECT coins FROM users WHERE id=$1`, [userId]);
+      // `type` and `balance` are NOT NULL on coin_transactions; only `balance`
+      // has a default, so both are passed explicitly.
+      await tx.query(
+        `INSERT INTO coin_transactions (user_id, type, amount, description, action, balance)
+         VALUES ($1,'spent',$2,'Current Affairs quiz unlock','ca_quiz_unlock',$3)`,
+        [userId, -cost, Number(after.coins)]
+      );
+      return successResponse(
+        { unlocked: true, coinsSpent: cost, balance: Number(after.coins) },
+        'Quiz unlocked 🎯',
+      );
+    });
   }
 
   // Persists a CA MCQ practice result so the article list/detail can show
@@ -407,6 +481,17 @@ class CurrentAffairsService {
   // practice questions), but a submission endpoint specifically should
   // still grade independently rather than accept an arbitrary number.
   async submitMcqAttempt(affairId: string, userId: string, dto: any) {
+    // Mirror of the gate in getMcqs — a client that kept an old payload
+    // around must not be able to record an attempt on a locked set.
+    const gateCost = await this.caQuizCoinCost();
+    if (gateCost > 0 && !(await this.hasUnlockedCaMcqs(affairId, userId))) {
+      throw new ForbiddenException({
+        message: 'Unlock this quiz to attempt it',
+        code: 'CA_QUIZ_LOCKED',
+        coinCost: gateCost,
+      });
+    }
+
     await this.ensureCaMcqTable();
     const mcqs = await this.db.query(
       `SELECT id, correct, option_e FROM ca_mcqs WHERE affair_id=$1`,
@@ -721,7 +806,10 @@ class CurrentAffairsController {
   @Get('mcq-config') getMcqMarkingConfig() { return this.s.getMcqMarkingConfig(); }
   @Get(':id') findOne(@Param('id', ParseUUIDPipe) id: string, @Req() r: any) { return this.s.findOne(id, r.user.id); }
   @Post(':id/bookmark') @HttpCode(200) toggleBookmark(@Param('id', ParseUUIDPipe) id: string, @Req() r: any) { return this.s.toggleBookmark(id, r.user.id); }
-  @Get(':id/mcqs') getMcqs(@Param('id', ParseUUIDPipe) id: string) { return this.s.getMcqs(id); }
+  @Get(':id/mcqs') getMcqs(@Param('id', ParseUUIDPipe) id: string, @Req() r: any) { return this.s.getMcqs(id, r.user.id); }
+  @Post(':id/mcqs/unlock') @HttpCode(200) unlockMcqs(@Param('id', ParseUUIDPipe) id: string, @Req() r: any) {
+    return this.s.unlockMcqs(id, r.user.id);
+  }
   @Post(':id/mcqs/submit') @HttpCode(201) submitMcqAttempt(@Param('id', ParseUUIDPipe) id: string, @Body() dto: any, @Req() r: any) {
     return this.s.submitMcqAttempt(id, r.user.id, dto);
   }
@@ -789,7 +877,7 @@ class AdminCurrentAffairsController {
   @Put(':id') @RequirePermission('current-affairs') update(@Param('id', ParseUUIDPipe) id: string, @Body() dto: any) { return this.s.adminUpdate(id, dto); }
   @Delete(':id') @RequirePermission('current-affairs') remove(@Param('id', ParseUUIDPipe) id: string) { return this.s.adminDelete(id); }
   // MCQ management
-  @Get(':id/mcqs') @RequirePermission('current-affairs') getMcqs(@Param('id', ParseUUIDPipe) id: string) { return this.s.getMcqs(id); }
+  @Get(':id/mcqs') @RequirePermission('current-affairs') getMcqs(@Param('id', ParseUUIDPipe) id: string) { return this.s.getMcqs(id, undefined, true); }
   @Post(':id/mcqs') @RequirePermission('current-affairs') @HttpCode(201) addMcq(@Param('id', ParseUUIDPipe) id: string, @Body() dto: any) { return this.s.addMcq(id, dto); }
   @Put('mcqs/:mcqId') @RequirePermission('current-affairs') updateMcq(@Param('mcqId', ParseUUIDPipe) mcqId: string, @Body() dto: any) { return this.s.updateMcq(mcqId, dto); }
   @Delete('mcqs/:mcqId') @RequirePermission('current-affairs') deleteMcq(@Param('mcqId', ParseUUIDPipe) mcqId: string) { return this.s.deleteMcq(mcqId); }
@@ -2381,6 +2469,7 @@ export class SubscriptionsModule {}
 // ════════════════════════════════════════════════════════════
 @Injectable()
 export class NotificationService {
+  private readonly logger = new Logger(NotificationService.name);
   private firebaseInitialized = false;
 
   constructor(
@@ -2400,32 +2489,56 @@ export class NotificationService {
 
     if (data.scheduledAt) {
       const result = await this.db.query(
-        `INSERT INTO notifications (title, body, type, target, target_exam, data, status, scheduled_at, created_by) VALUES ($1,$2,$3,$4,$5,$6,'scheduled',$7,$8) RETURNING id`,
-        [data.title, data.body, data.type||'announcement', data.target||'all', data.targetExam||null, JSON.stringify(data.data||{}), data.scheduledAt, adminId]
+        `INSERT INTO notifications (title, body, type, target, target_exam, target_user_id, data, status, scheduled_at, created_by) VALUES ($1,$2,$3,$4,$5,$6,$7,'scheduled',$8,$9) RETURNING id`,
+        [data.title, data.body, data.type||'announcement', data.target||'all', data.targetExam||null, data.targetUserId||null, JSON.stringify(data.data||{}), data.scheduledAt, adminId]
       );
       return successResponse({ notificationId: result[0].id }, `Notification scheduled for ${data.scheduledAt}`);
     }
 
     const notifResult = await this.db.query(
-      `INSERT INTO notifications (title, body, type, target, target_exam, data, status, sent_at, created_by) VALUES ($1,$2,$3,$4,$5,$6,'sent',NOW(),$7) RETURNING id`,
-      [data.title, data.body, data.type||'announcement', data.target||'all', data.targetExam||null, JSON.stringify(data.data||{}), adminId]
+      `INSERT INTO notifications (title, body, type, target, target_exam, target_user_id, data, status, sent_at, created_by) VALUES ($1,$2,$3,$4,$5,$6,$7,'sent',NOW(),$8) RETURNING id`,
+      [data.title, data.body, data.type||'announcement', data.target||'all', data.targetExam||null, data.targetUserId||null, JSON.stringify(data.data||{}), adminId]
     );
     const notifId = notifResult[0].id;
 
+    const { totalSent, pushSuccess, pushFail } = await this.fanOut({
+      id:             notifId,
+      title:          data.title,
+      body:           data.body,
+      type:           data.type || 'announcement',
+      target:         data.target || 'all',
+      target_exam:    data.targetExam || null,
+      target_user_id: data.targetUserId || null,
+    });
+
+    return successResponse({ notificationId: notifId, totalSent, pushSuccess, pushFail }, `Notification sent to ${totalSent} users ✅`);
+  }
+
+  /**
+   * Resolve a notification's audience, drop it in their in-app inbox, and
+   * push it over FCM. Shared by the immediate send path and the scheduled
+   * dispatcher below so the two can never drift apart.
+   *
+   * `notif` takes DB column names, because the cron hands rows straight in.
+   */
+  private async fanOut(notif: {
+    id: string; title: string; body: string; type: string;
+    target: string; target_exam: string | null; target_user_id: string | null;
+  }) {
     let userQuery = `SELECT id, fcm_token FROM users WHERE status='active' AND notification_enabled=TRUE AND deleted_at IS NULL`;
     const params: any[] = [];
-    if (data.target === 'pro' || data.target === 'premium') {
+    if (notif.target === 'pro' || notif.target === 'premium') {
       userQuery += ` AND id IN (SELECT user_id FROM subscriptions WHERE status='active' AND ends_at>NOW())`;
-    } else if (data.target === 'free') {
+    } else if (notif.target === 'free') {
       userQuery += ` AND id NOT IN (SELECT user_id FROM subscriptions WHERE status='active' AND ends_at>NOW())`;
-    } else if (data.target === 'inactive') {
+    } else if (notif.target === 'inactive') {
       userQuery += ` AND (last_active_at IS NULL OR last_active_at < NOW() - INTERVAL '7 days')`;
-    } else if (data.target === 'exam' && data.targetExam) {
+    } else if (notif.target === 'exam' && notif.target_exam) {
       userQuery += ` AND primary_exam=$1`;
-      params.push(data.targetExam);
-    } else if (data.target === 'user' && data.targetUserId) {
+      params.push(notif.target_exam);
+    } else if (notif.target === 'user' && notif.target_user_id) {
       userQuery += ` AND id=$1`;
-      params.push(data.targetUserId);
+      params.push(notif.target_user_id);
     }
 
     const users = await this.db.query(userQuery, params);
@@ -2436,38 +2549,85 @@ export class NotificationService {
       for (let i = 0; i < users.length; i += chunkSize) {
         const chunk = users.slice(i, i + chunkSize);
         const vals  = chunk.map((_: any, j: number) => `($${j*4+1},$${j*4+2},$${j*4+3},$${j*4+4})`).join(',');
-        const flat  = chunk.flatMap((u: any) => [u.id, notifId, data.title, data.body]);
+        const flat  = chunk.flatMap((u: any) => [u.id, notif.id, notif.title, notif.body]);
         await this.db.query(`INSERT INTO user_notifications (user_id, notification_id, title, body) VALUES ${vals}`, flat);
       }
     }
 
     // FCM push
     let pushSuccess = 0, pushFail = 0;
-    console.log('==== PUSH DEBUG ====');
-console.log('firebaseInitialized:', this.firebaseInitialized);
-console.log('users count:', users.length);
     if (this.firebaseInitialized) {
       const tokens = users.map((u: any) => u.fcm_token).filter(Boolean);
-      if (tokens.length > 0) {
-        for (let i = 0; i < tokens.length; i += 500) {
-          try {
-            const result = await admin.messaging().sendEachForMulticast({
-              tokens: tokens.slice(i, i + 500),
-              notification: { title: data.title, body: data.body },
-              data: { type: data.type || 'announcement', notifId },
-              android: { priority: 'high' },
-            });
-            pushSuccess += result.successCount;
-            pushFail    += result.failureCount;
-          } catch (err: any) {
-            console.error('FCM multicast failed:', err.message);
-          }
+      for (let i = 0; i < tokens.length; i += 500) {
+        try {
+          const result = await admin.messaging().sendEachForMulticast({
+            tokens: tokens.slice(i, i + 500),
+            notification: { title: notif.title, body: notif.body },
+            data: { type: notif.type || 'announcement', notifId: notif.id },
+            android: { priority: 'high' },
+          });
+          pushSuccess += result.successCount;
+          pushFail    += result.failureCount;
+        } catch (err: any) {
+          this.logger.error(`FCM multicast failed for ${notif.id}: ${err.message}`);
         }
       }
+    } else {
+      this.logger.warn(`Firebase not initialised — ${users.length} users got the in-app notification but no push`);
     }
 
-    await this.db.query(`UPDATE notifications SET total_sent=$1 WHERE id=$2`, [users.length, notifId]);
-    return successResponse({ notificationId: notifId, totalSent: users.length, pushSuccess, pushFail }, `Notification sent to ${users.length} users ✅`);
+    await this.db.query(`UPDATE notifications SET total_sent=$1 WHERE id=$2`, [users.length, notif.id]);
+    return { totalSent: users.length, pushSuccess, pushFail };
+  }
+
+  // ── Cron: dispatch notifications whose scheduled time has arrived ──────
+  //
+  // Scheduling used to be a dead end: send() wrote the row with
+  // status='scheduled' and nothing ever read it back, so scheduled
+  // notifications sat in the table forever and never reached anyone.
+  //
+  // Runs every minute — the admin UI schedules to the minute, so a coarser
+  // tick would show up as notifications arriving visibly late.
+  @Cron('* * * * *')
+  async dispatchScheduledNotifications() {
+    // Claim and mark in ONE statement. Two app instances both running this
+    // cron would otherwise each read the same 'scheduled' rows and send
+    // every notification twice. FOR UPDATE SKIP LOCKED lets a second
+    // instance move past rows this one has already taken.
+    let due: any[];
+    try {
+      due = await this.db.query(`
+        UPDATE notifications SET status='sent', sent_at=NOW()
+        WHERE id IN (
+          SELECT id FROM notifications
+          WHERE status='scheduled' AND scheduled_at <= NOW()
+          ORDER BY scheduled_at
+          LIMIT 50
+          FOR UPDATE SKIP LOCKED
+        )
+        RETURNING id, title, body, type, target, target_exam, target_user_id
+      `);
+    } catch (err: any) {
+      this.logger.error(`Could not claim scheduled notifications: ${err.message}`);
+      return;
+    }
+
+    if (!due.length) return;
+    this.logger.log(`Dispatching ${due.length} scheduled notification(s)`);
+
+    for (const notif of due) {
+      try {
+        const { totalSent, pushSuccess } = await this.fanOut(notif);
+        this.logger.log(`Sent "${notif.title}" to ${totalSent} users (${pushSuccess} pushed)`);
+      } catch (err: any) {
+        // The row is already marked 'sent' by the claim above. Walk it back
+        // to 'failed' so it shows up as such in the admin list rather than
+        // silently claiming success, and so it is not retried forever.
+        this.logger.error(`Failed to dispatch ${notif.id}: ${err.message}`);
+        await this.db.query(`UPDATE notifications SET status='failed' WHERE id=$1`, [notif.id])
+          .catch(() => undefined);
+      }
+    }
   }
 
   async getUserNotifications(userId: string, query: any) {

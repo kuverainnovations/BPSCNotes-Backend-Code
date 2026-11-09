@@ -75,6 +75,10 @@ class QuizzesService {
            q.exam_tags, q.scheduled_for, q.attempt_count, q.avg_score, q.status,
            q.negative_marking_enabled, q.marks_per_correct, q.marks_per_wrong,
            COALESCE(q.is_exam_mode, FALSE) AS is_exam_mode,
+           COALESCE(q.is_paid, FALSE) AS is_paid,
+           COALESCE(q.price, 0)       AS price,
+           COALESCE(q.coin_price, 0)  AS coin_price,
+           (SELECT TRUE FROM quiz_purchases qp WHERE qp.user_id=$${params.length + 1} AND qp.quiz_id=q.id LIMIT 1) AS is_purchased,
            -- is_attempted / my_last_score must only look at COMPLETED attempts
            -- (total_questions > 0) — /start inserts a bare stub row with
            -- score=0 on every entry into the quiz, including re-opening an
@@ -119,6 +123,8 @@ class QuizzesService {
       );
       data.data.quiz.is_attempted  = attempted.length > 0;
       data.data.quiz.my_last_score = attempted[0]?.score ?? null;
+      // Entitlement is per-user, so it can never come from the shared cache.
+      data.data.quiz.is_purchased  = await this.hasPurchased(quizId, userId);
       return data;
     }
 
@@ -126,7 +132,10 @@ class QuizzesService {
       `SELECT id, title, description, subject, type,
               total_questions, duration_mins, coins_reward,
               exam_tags, scheduled_for, attempt_count, avg_score, status,
-              negative_marking_enabled, marks_per_correct, marks_per_wrong
+              negative_marking_enabled, marks_per_correct, marks_per_wrong,
+              COALESCE(is_paid, false) AS is_paid,
+              COALESCE(price, 0)       AS price,
+              COALESCE(coin_price, 0)  AS coin_price
        FROM quizzes WHERE id=$1 AND status='published'`,
       [quizId]
     );
@@ -141,11 +150,81 @@ class QuizzesService {
       ...quiz[0],
       is_attempted:  attempted.length > 0,
       my_last_score: attempted[0]?.score ?? null,
+      is_purchased:  await this.hasPurchased(quizId, userId),
     };
 
     const result = successResponse({ quiz: quizData });
     await this.cache.set(cacheKey, result, 120);
     return result;
+  }
+
+  /** True when this user already owns this quiz. Free quizzes never consult it. */
+  private async hasPurchased(quizId: string, userId: string): Promise<boolean> {
+    if (!userId) return false;
+    const rows = await this.db.query(
+      `SELECT 1 FROM quiz_purchases WHERE quiz_id=$1 AND user_id=$2 LIMIT 1`,
+      [quizId, userId]
+    );
+    return rows.length > 0;
+  }
+
+  /**
+   * Unlock a paid mock test.
+   *
+   * Coins are settled here and now, because the balance is ours. A rupee
+   * price is NOT settled here — that goes through the normal payment flow,
+   * which calls back in to grant the entitlement once the gateway confirms.
+   */
+  async purchaseQuiz(quizId: string, userId: string, payWith: 'coins' = 'coins') {
+    const [quiz] = await this.db.query(
+      `SELECT id, title, COALESCE(is_paid,false) AS is_paid, COALESCE(coin_price,0) AS coin_price
+         FROM quizzes WHERE id=$1 AND status='published'`,
+      [quizId]
+    );
+    if (!quiz)         throw new NotFoundException('Quiz not found');
+    if (!quiz.is_paid) throw new BadRequestException('This test is already free');
+
+    if (await this.hasPurchased(quizId, userId)) {
+      return successResponse({ alreadyOwned: true }, 'You already have this test');
+    }
+
+    const cost = Number(quiz.coin_price) || 0;
+    if (cost <= 0) throw new BadRequestException('This test cannot be unlocked with coins');
+
+    // One transaction: debit, record, entitle. A crash between the debit and
+    // the entitlement would otherwise take the coins and give nothing — the
+    // exact failure the retired 'mock_unlock' store item used to produce.
+    return this.db.transaction(async (tx) => {
+      const [user] = await tx.query(
+        `SELECT coins FROM users WHERE id=$1 FOR UPDATE`, [userId]
+      );
+      if (!user) throw new NotFoundException('User not found');
+      if (Number(user.coins) < cost) {
+        throw new BadRequestException(`Not enough coins — this test costs ${cost}, you have ${user.coins}`);
+      }
+
+      await tx.query(`UPDATE users SET coins = coins - $2 WHERE id=$1`, [userId, cost]);
+      await tx.query(
+        `INSERT INTO quiz_purchases (quiz_id, user_id, coins_spent) VALUES ($1,$2,$3)
+         ON CONFLICT (quiz_id, user_id) DO NOTHING`,
+        [quizId, userId, cost]
+      );
+
+      const [after] = await tx.query(`SELECT coins FROM users WHERE id=$1`, [userId]);
+
+      // `type` and `balance` are both NOT NULL on coin_transactions and only
+      // `balance` carries a default — omitting `type` makes the insert throw.
+      await tx.query(
+        `INSERT INTO coin_transactions (user_id, type, amount, description, action, balance)
+         VALUES ($1, 'spent', $2, $3, 'mock_test_unlock', $4)`,
+        [userId, -cost, `Unlocked mock test: ${quiz.title}`, Number(after.coins)]
+      );
+
+      return successResponse(
+        { quizId, coinsSpent: cost, balance: Number(after.coins) },
+        'Test unlocked — good luck! 🎯',
+      );
+    });
   }
 
   // ── POST /quizzes/:id/start — creates session, returns shuffled questions ──
@@ -157,6 +236,17 @@ class QuizzesService {
     if (!quiz.length) throw new NotFoundException('Quiz not found or not published');
 
     const q = quiz[0];
+
+    // Paywall. Enforced here rather than only in the UI — this is the
+    // endpoint that hands out the questions, so it is the one that matters.
+    if (q.is_paid && !(await this.hasPurchased(quizId, userId))) {
+      throw new ForbiddenException({
+        message: 'Unlock this mock test to attempt it',
+        code:    'QUIZ_LOCKED',
+        price:   Number(q.price) || 0,
+        coinPrice: Number(q.coin_price) || 0,
+      });
+    }
 
     if (q.scheduled_for) {
       const today     = new Date().toISOString().split('T')[0];
@@ -792,8 +882,9 @@ return successResponse({
       `INSERT INTO quizzes
          (title, description, subject, type, total_questions,
           duration_mins, coins_reward, exam_tags, scheduled_for, status, created_by,
-          negative_marking_enabled, marks_per_correct, marks_per_wrong)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+          negative_marking_enabled, marks_per_correct, marks_per_wrong,
+          is_paid, price, coin_price)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
        RETURNING *`,
       [
         data.title, data.description || null, data.subject,
@@ -807,6 +898,9 @@ return successResponse({
         data.negativeMarkingEnabled === true,
         data.marksPerCorrect != null ? +data.marksPerCorrect : 1,
         data.marksPerWrong   != null ? +data.marksPerWrong   : 0,
+        data.isPaid === true,
+        data.price      != null ? +data.price      : 0,
+        data.coinPrice  != null ? +data.coinPrice  : 0,
       ]
     );
     return successResponse({ quiz: result[0] }, 'Quiz created. Add questions next.');
@@ -980,6 +1074,7 @@ return successResponse({
       shuffleQuestions: 'shuffle_questions',
       shuffleOptions: 'shuffle_options',
       isExamMode: 'is_exam_mode',
+      isPaid: 'is_paid', price: 'price', coinPrice: 'coin_price',
     };
     for (const [key, col] of Object.entries(map)) {
       if (data[key] !== undefined) { fields.push(`${col}=$${i++}`); vals.push(data[key]); }
@@ -1293,6 +1388,13 @@ class QuizzesController {
   @HttpCode(HttpStatus.OK)
   startQuiz(@Param('id', ParseUUIDPipe) id: string, @Req() r: any) {
     return this.s.startQuiz(id, r.user.id);
+  }
+
+  /** POST /quizzes/:id/purchase — unlock a paid mock test with coins. */
+  @Post(':id/purchase')
+  @HttpCode(HttpStatus.OK)
+  purchase(@Param('id', ParseUUIDPipe) id: string, @Req() r: any) {
+    return this.s.purchaseQuiz(id, r.user.id);
   }
 
   /** POST /quizzes/:id/submit */

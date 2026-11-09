@@ -1626,30 +1626,35 @@ export class AdminAnswerWritingService {
   }
 }
 
+/**
+ * Answer Writing has its own permission rather than riding on 'quizzes'.
+ *
+ * Every endpoint here used to require 'quizzes', so the only way to let
+ * someone moderate answer submissions was to hand them the whole quiz bank
+ * as well. The permission is declared once on the class — PermissionGuard
+ * reads class-level metadata, so each handler inherits it.
+ */
 @UseGuards(AdminJwtGuard, PermissionGuard)
+@RequirePermission('answer-writing')
 @Controller('admin/answer-writing')
 export class AdminAnswerWritingController {
   constructor(private readonly svc: AdminAnswerWritingService) {}
 
   @Get('questions')
-  @RequirePermission('quizzes')
   listQuestions(@Query() query: any) { return this.svc.listQuestions(query); }
 
   @Post('questions')
-  @RequirePermission('quizzes')
   @HttpCode(HttpStatus.CREATED)
   createQuestion(@Body() dto: any, @Req() r: any) {
     return this.svc.createQuestion(dto, r.admin.id);
   }
 
   @Put('questions/:id')
-  @RequirePermission('quizzes')
   updateQuestion(@Param('id') id: string, @Body() dto: any) {
     return this.svc.updateQuestion(id, dto);
   }
 
   @Delete('questions/:id')
-  @RequirePermission('quizzes')
   @HttpCode(HttpStatus.OK)
   deleteQuestion(@Param('id') id: string) { return this.svc.deleteQuestion(id); }
 
@@ -1658,7 +1663,6 @@ export class AdminAnswerWritingController {
    * seeds peer review. Same three formats a student can submit.
    */
   @Post('questions/:id/seed')
-  @RequirePermission('quizzes')
   @HttpCode(HttpStatus.OK)
   @UseInterceptors(FileFieldsInterceptor(
     [{ name: 'images', maxCount: MAX_IMAGES }, { name: 'pdf', maxCount: 1 }],
@@ -1683,16 +1687,13 @@ export class AdminAnswerWritingController {
   }
 
   @Delete('questions/:id/seed')
-  @RequirePermission('quizzes')
   @HttpCode(HttpStatus.OK)
   deleteSeedAnswer(@Param('id') id: string) { return this.svc.deleteSeedAnswer(id); }
 
   @Get('submissions')
-  @RequirePermission('quizzes')
   listSubmissions(@Query() query: any) { return this.svc.listSubmissions(query); }
 
   @Put('submissions/:id/review')
-  @RequirePermission('quizzes')
   reviewSubmission(@Param('id') id: string, @Body() dto: any, @Req() r: any) {
     return this.svc.reviewSubmission(id, dto, r.admin.id);
   }

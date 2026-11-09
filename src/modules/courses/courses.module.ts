@@ -77,6 +77,9 @@ class CreateCourseDto {
   // discount on this course. Null/omitted -> falls back to the global
   // app_settings.max_coins_per_purchase setting.
   @ApiPropertyOptional() @IsOptional() @Type(() => Number) @IsNumber() maxCoinsRedeemable?: number;
+  // Whether lesson PDFs in this course may be downloaded. Reading them in
+  // the app is unaffected — this only removes the download action.
+  @ApiPropertyOptional() @IsOptional() @IsBoolean() allowDownload?: boolean;
 }
 
 class SubmitReviewDto {
@@ -358,6 +361,7 @@ export class CoursesRepository {
       whatYouLearn: 'what_you_learn', hasCertificate: 'has_certificate',
       rejection_reason: 'rejection_reason',
       maxCoinsRedeemable: 'max_coins_redeemable',
+      allowDownload: 'allow_download',
     };
 
     for (const [key, col] of Object.entries(map)) {

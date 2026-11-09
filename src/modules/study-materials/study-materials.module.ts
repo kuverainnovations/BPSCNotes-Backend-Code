@@ -140,6 +140,7 @@ export class StudyMaterialsService {
               COALESCE(sm.price, 0)          AS price,
               COALESCE(sm.free_pages, 3)     AS free_pages,
               COALESCE(sm.is_premium, false) AS is_premium,
+              COALESCE(sm.allow_download, true) AS allow_download,
               ${bookmarkSubq}
               ${purchaseSubq}
               sm.status
@@ -232,6 +233,7 @@ export class StudyMaterialsService {
                 COALESCE(sm.price, 0)          AS price,
                 COALESCE(sm.free_pages, 3)     AS free_pages,
                 COALESCE(sm.is_premium, false) AS is_premium,
+              COALESCE(sm.allow_download, true) AS allow_download,
                 ${bookmarkSubq}
                 ${purchaseSubq}
                 ${buyerCountSubq}
@@ -609,7 +611,9 @@ if (query.search)  { conditions.push(`(sm.title ILIKE $${pi} OR sm.subject ILIKE
     const [rows, [cnt]] = await Promise.all([
       this.db.query(
         `SELECT sm.*, sm.is_featured AS "isFeatured", sm.is_trending AS "isTrending",
-                sm.is_premium AS "isPremium", u.name AS uploader_name,
+                sm.is_premium AS "isPremium",
+                COALESCE(sm.allow_download, true) AS "allowDownload",
+                u.name AS uploader_name,
                 (SELECT mn.message FROM material_negotiations mn
                  WHERE mn.material_id = sm.id AND mn.offered_by = 'user' AND mn.message IS NOT NULL
                  ORDER BY mn.created_at DESC LIMIT 1) AS student_negotiation_message
@@ -1131,6 +1135,18 @@ if (query.search)  { conditions.push(`(sm.title ILIKE $${pi} OR sm.subject ILIKE
     if (!row) throw new NotFoundException();
     await this.db.query(`UPDATE study_materials SET is_featured=$2 WHERE id=$1`, [id, !row.is_featured]);
     return successResponse({ isFeatured: !row.is_featured });
+  }
+
+  /** Whether this material's PDF may leave the app. Reading in-app is unaffected. */
+  async adminToggleDownload(id: string) {
+    const [row] = await this.db.query(`SELECT allow_download FROM study_materials WHERE id=$1`, [id]);
+    if (!row) throw new NotFoundException();
+    const next = !row.allow_download;
+    await this.db.query(`UPDATE study_materials SET allow_download=$2 WHERE id=$1`, [id, next]);
+    return successResponse(
+      { allowDownload: next },
+      next ? 'Downloads enabled ✅' : 'Downloads disabled — students can still read it in the app',
+    );
   }
 
   async adminToggleTrending(id: string) {
@@ -2462,6 +2478,11 @@ export class AdminStudyMaterialsController {
   @RequirePermission('study-materials')
   @HttpCode(HttpStatus.OK)
   toggleTrending(@Param('id', ParseUUIDPipe) id: string) { return this.svc.adminToggleTrending(id); }
+
+  @Patch(':id/download')
+  @RequirePermission('study-materials')
+  @HttpCode(HttpStatus.OK)
+  toggleDownload(@Param('id', ParseUUIDPipe) id: string) { return this.svc.adminToggleDownload(id); }
 
   @Delete(':id')
   @RequirePermission('study-materials')

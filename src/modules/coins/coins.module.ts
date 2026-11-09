@@ -618,9 +618,14 @@ export class CoinsService implements OnModuleInit {
     if (item.stock !== null && item.stock <= 0)
       throw new (await import('@nestjs/common')).BadRequestException('Item out of stock');
 
+    // `type` is NOT NULL on coin_transactions and has no default, so leaving
+    // it out made this insert throw — every store redemption failed outright.
+    // `balance` defaults to 0, which would have quietly corrupted the running
+    // balance this method derives from SUM(amount), so it is set explicitly.
     await this.db.query(
-      `INSERT INTO coin_transactions(user_id,amount,action,description) VALUES($1,$2,'store_redeem',$3)`,
-      [userId, -item.coin_cost, `Redeemed: ${item.title}`]
+      `INSERT INTO coin_transactions(user_id,type,amount,action,description,balance)
+       VALUES($1,'spent',$2,'store_redeem',$3,$4)`,
+      [userId, -item.coin_cost, `Redeemed: ${item.title}`, +balance - item.coin_cost]
     );
     await this.db.query(
       `INSERT INTO coin_redemptions(user_id,item_id,coins_spent) VALUES($1,$2,$3)`,
