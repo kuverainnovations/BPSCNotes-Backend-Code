@@ -432,6 +432,54 @@ export class CoursesService {
     return successResponse({ course });
   }
 
+  /**
+   * Card data for the public share page at https://bpscnotes.in/courses/<id>.
+   *
+   * That page is WordPress, on separate hosting, and it fetches this
+   * server-side: a browser fetch would be refused by the CORS allowlist in
+   * main.ts, and WhatsApp's link crawler does not run JavaScript, so the og:
+   * tags have to be in the HTML before it is sent.
+   *
+   * This endpoint is unauthenticated, so it returns only the handful of
+   * fields the card shows — never the lesson list, enrolment state or
+   * anything else findOneById() exposes to a signed-in student. Unpublished
+   * courses 404, so a draft cannot be discovered by guessing ids.
+   */
+  async getShareMeta(courseId: string) {
+    const [course] = await this.db.query(
+      `SELECT id, title, description, instructor, subject,
+              thumbnail_url, is_paid, price, rating, review_count
+         FROM courses
+        WHERE id = $1 AND status = 'published'`,
+      [courseId],
+    );
+    if (!course) throw new NotFoundException('Course not found');
+
+    // Thumbnails are stored as site-relative paths; og:image needs absolute.
+    const base = (this.config.get<string>('PUBLIC_API_URL') || 'https://api.bpscnotes.in').replace(/\/$/, '');
+    const thumb: string | null = course.thumbnail_url || null;
+    const thumbnailUrl = !thumb
+      ? null
+      : /^https?:\/\//i.test(thumb)
+        ? thumb
+        : `${base}/${thumb.replace(/^\//, '')}`;
+
+    return successResponse({
+      course: {
+        id:           course.id,
+        title:        course.title,
+        description:  course.description,
+        instructor:   course.instructor,
+        subject:      course.subject,
+        thumbnailUrl,
+        isPaid:       course.is_paid,
+        price:        course.price,
+        rating:       course.rating,
+        reviewCount:  course.review_count,
+      },
+    });
+  }
+
   async enroll(courseId: string, userId: string, coinsToApply = 0) {
     const course = await this.db.query(`SELECT id, is_paid, price, title, max_coins_redeemable FROM courses WHERE id=$1 AND status='published'`, [courseId]);
     if (!course.length) throw new NotFoundException('Course not found');
@@ -1452,6 +1500,16 @@ export class CoursesController {
   findOne(@Param('id') id: string, @Req() req: any) {
     // No ParseUUIDPipe — prevents 'saved' from hitting 400 if routing mismatch
     return this.service.findOne(id, req.user?.id);
+  }
+
+  // Public: the website's share page reads this server-side. Marked @Public()
+  // so it bypasses both this controller's JwtAuthGuard and the global one.
+  // Returns card fields only — see getShareMeta().
+  @Public()
+  @Get(':id/share')
+  @ApiOperation({ summary: 'Public share-card metadata for a published course' })
+  shareMeta(@Param('id', ParseUUIDPipe) id: string) {
+    return this.service.getShareMeta(id);
   }
 
   @Post(':id/save')
