@@ -1544,14 +1544,21 @@ export class CoursesController {
   @Public()
   @Get(':id/share-page')
   @ApiExcludeEndpoint()
-  @Header('Content-Type', 'text/html; charset=utf-8')
   async sharePage(
     @Param('id', ParseUUIDPipe) id: string,
-    @Res({ passthrough: true }) res: any,
-  ): Promise<string> {
+    @Res() res: any,
+  ): Promise<void> {
     const { html, found } = await this.service.getSharePage(id);
-    res.status(found ? 200 : 404);
-    return html;
+
+    // Written straight to the response, not returned. TransformInterceptor
+    // wraps every returned value in the { success, message, data } envelope
+    // and has no opt-out, so returning the markup shipped the whole page as
+    // a JSON string. @Res() without passthrough takes this handler out of
+    // that pipeline entirely.
+    res
+      .status(found ? 200 : 404)
+      .type('text/html; charset=utf-8')
+      .send(html);
   }
 
   @Post(':id/save')
