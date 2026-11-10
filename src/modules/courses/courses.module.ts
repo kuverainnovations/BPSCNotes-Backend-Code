@@ -9,7 +9,7 @@ import {
   Module, Injectable, Controller, HttpException, Get, Post, Put, Delete,
   Body, Param, Query, Req, HttpCode, HttpStatus, NotFoundException,
   ForbiddenException, BadRequestException, ParseUUIDPipe, UseGuards, UseInterceptors,
-  UploadedFile, Header,
+  UploadedFile, Header, Res,
 } from '@nestjs/common';
 import { InjectDataSource } from '@nestjs/typeorm';
 import { DataSource } from 'typeorm';
@@ -18,7 +18,7 @@ import { CACHE_MANAGER } from '@nestjs/cache-manager';
 import { Cache } from 'cache-manager';
 import { Inject } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
-import { ApiTags, ApiBearerAuth, ApiOperation, ApiQuery } from '@nestjs/swagger';
+import { ApiTags, ApiBearerAuth, ApiOperation, ApiQuery, ApiExcludeEndpoint } from '@nestjs/swagger';
 import {
   IsString, IsOptional, IsBoolean, IsNumber, IsArray,
   IsEnum, IsNotEmpty, Min, Max,
@@ -430,6 +430,32 @@ export class CoursesService {
     if (!course) throw new NotFoundException('Course not found');
 
     return successResponse({ course });
+  }
+
+  /**
+   * The share page itself, served at https://api.bpscnotes.in/c/<id>.
+   *
+   * It lives on the API host because bpscnotes.in is on WordPress.com, which
+   * will not run custom code on the current plan — so the main site cannot
+   * answer /courses/<id> at all. This host is ours and already has a
+   * certificate, so the app shares links here instead.
+   *
+   * Rendered server-side on purpose: WhatsApp's link crawler does not run
+   * JavaScript, so the og: tags have to be in the HTML as it leaves nginx or
+   * the shared link shows no title and no picture.
+   */
+  async getSharePage(courseId: string): Promise<{ html: string; found: boolean }> {
+    let course: any = null;
+    try {
+      const res: any = await this.getShareMeta(courseId);
+      course = res?.data?.course ?? null;
+    } catch {
+      course = null; // unknown id, or unpublished — both render the same page
+    }
+
+    return course
+      ? { html: renderCourseSharePage(course), found: true }
+      : { html: renderCourseMissingPage(), found: false };
   }
 
   /**
@@ -1512,6 +1538,22 @@ export class CoursesController {
     return this.service.getShareMeta(id);
   }
 
+  // The HTML page a shared link opens. nginx maps /c/<id> onto this, so the
+  // public URL stays short. Returns 404 for an unknown or unpublished id so
+  // crawlers do not index a dead course as a real page.
+  @Public()
+  @Get(':id/share-page')
+  @ApiExcludeEndpoint()
+  @Header('Content-Type', 'text/html; charset=utf-8')
+  async sharePage(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Res({ passthrough: true }) res: any,
+  ): Promise<string> {
+    const { html, found } = await this.service.getSharePage(id);
+    res.status(found ? 200 : 404);
+    return html;
+  }
+
   @Post(':id/save')
   @HttpCode(200)
   saveCourse(@Param('id', ParseUUIDPipe) id: string, @Req() r: any) {
@@ -1694,3 +1736,154 @@ export class AdminCoursesController {
   exports:     [CoursesService],
 })
 export class CoursesModule {}
+
+
+// ════════════════════════════════════════════════════════════
+// SHARE PAGE RENDERING
+//
+// Plain string templates rather than a view engine: this is the only HTML
+// the API serves, and adding Handlebars/EJS for one page would mean a new
+// dependency, a views directory and a Dockerfile COPY to keep in sync.
+// ════════════════════════════════════════════════════════════
+
+const SHARE_PACKAGE   = process.env.ANDROID_PACKAGE_NAME || 'com.bpscnotes.eduapp';
+const SHARE_PLAY_URL  = `https://play.google.com/store/apps/details?id=${SHARE_PACKAGE}`;
+
+/** Escape for HTML text and double-quoted attributes. */
+function esc(value: unknown): string {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+/** Escape for inside a single-quoted JS string literal. */
+function escJs(value: unknown): string {
+  return String(value ?? '')
+    .replace(/\\/g, '\\\\')
+    .replace(/'/g, "\\'")
+    .replace(/</g, '\\u003c');
+}
+
+function clip(text: string, limit: number): string {
+  const t = text.trim();
+  return t.length > limit ? `${t.slice(0, limit).trimEnd()}…` : t;
+}
+
+const SHARE_STYLES = `
+  :root { --bg:#f6f7fb; --card:#fff; --ink:#0f172a; --muted:#5b6478; --brand:#0d47a1; --line:#e4e7ef; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#0b1220; --card:#131c2e; --ink:#eef2f8; --muted:#9aa5b8; --brand:#5b8def; --line:#223049; }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink);
+         font:16px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+         display:flex; align-items:center; justify-content:center; min-height:100vh; padding:24px 16px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:18px;
+          max-width:520px; width:100%; overflow:hidden; box-shadow:0 10px 36px rgba(15,23,42,.09); }
+  .thumb { width:100%; aspect-ratio:16/9; object-fit:cover; display:block; background:var(--line); }
+  .body { padding:22px; }
+  .kicker { font-size:12px; font-weight:700; letter-spacing:.09em; text-transform:uppercase;
+            color:var(--brand); margin:0 0 8px; }
+  h1 { font-size:22px; line-height:1.3; margin:0 0 10px; }
+  .meta { color:var(--muted); font-size:14px; margin:0 0 14px; }
+  .desc { color:var(--muted); font-size:15px; margin:0 0 22px; }
+  .btn { display:block; text-align:center; text-decoration:none; font-weight:700;
+         padding:14px 18px; border-radius:12px; background:var(--brand); color:#fff; }
+  .btn.secondary { background:transparent; color:var(--brand); border:1.5px solid var(--brand); margin-top:10px; }
+  .foot { color:var(--muted); font-size:12.5px; text-align:center; margin:16px 0 0; }
+`;
+
+function renderCourseSharePage(course: any): string {
+  const id    = String(course.id);
+  const title = String(course.title || 'Course');
+  const url   = `https://api.bpscnotes.in/c/${id}`;
+
+  const descRaw = String(course.description || '')
+    .replace(/<[^>]*>/g, ' ')
+    .replace(/\s+/g, ' ');
+  const desc  = clip(descRaw || `Study ${title} on BNotes+.`, 200);
+  const thumb = course.thumbnailUrl ? String(course.thumbnailUrl) : '';
+  const byline = [course.instructor, course.subject].filter(Boolean).join(' · ');
+
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${esc(title)} — BNotes+</title>
+<link rel="canonical" href="${esc(url)}">
+
+<meta property="og:type"        content="website">
+<meta property="og:site_name"   content="BNotes+">
+<meta property="og:title"       content="${esc(title)}">
+<meta property="og:description" content="${esc(desc)}">
+<meta property="og:url"         content="${esc(url)}">
+${thumb ? `<meta property="og:image" content="${esc(thumb)}">` : ''}
+<meta name="twitter:card" content="${thumb ? 'summary_large_image' : 'summary'}">
+
+<!-- Declares the app counterpart for Chrome's own banner. App Links handle
+     the installed case before this page is ever fetched. -->
+<link rel="alternate" href="android-app://${esc(SHARE_PACKAGE)}/https/api.bpscnotes.in/c/${esc(id)}">
+
+<style>${SHARE_STYLES}</style>
+</head>
+<body>
+  <main class="card">
+    ${thumb ? `<img class="thumb" src="${esc(thumb)}" alt="">` : ''}
+    <div class="body">
+      <p class="kicker">BNotes+ Course</p>
+      <h1>${esc(title)}</h1>
+      ${byline ? `<p class="meta">${esc(byline)}</p>` : ''}
+      <p class="desc">${esc(desc)}</p>
+
+      <a class="btn" id="open" href="${esc(SHARE_PLAY_URL)}">Open in BNotes+</a>
+      <a class="btn secondary" href="${esc(SHARE_PLAY_URL)}">Get the app</a>
+
+      <p class="foot">Already installed? This link opens the course in the app.</p>
+    </div>
+  </main>
+<script>
+// A verified App Link never reaches this page — Android hands the URL to the
+// app first. This only runs when verification has not happened (iOS, desktop,
+// or an older build), so the button falls back to the Play listing.
+(function () {
+  if (!/Android/i.test(navigator.userAgent || '')) return;
+  var btn = document.getElementById('open');
+  if (!btn) return;
+  btn.addEventListener('click', function (e) {
+    e.preventDefault();
+    window.location.href =
+      'intent://api.bpscnotes.in/c/${escJs(id)}' +
+      '#Intent;scheme=https;package=${escJs(SHARE_PACKAGE)};S.browser_fallback_url=' +
+      encodeURIComponent('${escJs(SHARE_PLAY_URL)}') + ';end';
+  });
+})();
+</script>
+</body>
+</html>`;
+}
+
+function renderCourseMissingPage(): string {
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Course not available — BNotes+</title>
+<meta name="robots" content="noindex">
+<style>${SHARE_STYLES}</style>
+</head>
+<body>
+  <main class="card">
+    <div class="body" style="text-align:center">
+      <h1>This course isn’t available</h1>
+      <p class="desc">It may have been removed, or the link may be incomplete.</p>
+      <a class="btn" href="${esc(SHARE_PLAY_URL)}">Browse courses in BNotes+</a>
+    </div>
+  </main>
+</body>
+</html>`;
+}

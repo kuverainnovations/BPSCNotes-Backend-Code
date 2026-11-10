@@ -16,6 +16,7 @@ import { JwtAuthGuard } from './common/guards';
 import { AuthModule }        from './modules/auth/auth.module';
 import { SubjectsModule } from './modules/subjects/subjects.module';
 import { CoursesModule }     from './modules/courses/courses.module';
+import { AppLinksModule }    from './modules/app-links/app-links.module';
 import { AdminModule }       from './modules/admin/admin.module';
 import { QuizzesModule }     from './modules/quizzes/quizzes.module';
 import { LibraryModule }     from './modules/library/library.module';
@@ -126,6 +127,7 @@ import { ModerationModule } from './modules/moderation/moderation.module';
     AuthModule,
     AdminModule,
     CoursesModule,
+    AppLinksModule,
     SubjectsModule,
     QuizzesModule,
     LibraryModule,
