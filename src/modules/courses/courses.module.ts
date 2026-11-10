@@ -1846,10 +1846,13 @@ ${thumb ? `<meta property="og:image" content="${esc(thumb)}">` : ''}
       ${byline ? `<p class="meta">${esc(byline)}</p>` : ''}
       <p class="desc">${esc(desc)}</p>
 
-      <a class="btn" id="open" href="${esc(SHARE_PLAY_URL)}">Open in BNotes+</a>
-      <a class="btn secondary" href="${esc(SHARE_PLAY_URL)}">Get the app</a>
+      <!-- One button, labelled for where it actually goes. On Android the
+           script below relabels it and tries the app first; everywhere else
+           (desktop, iOS) the app does not exist, so promising to "open" it
+           would be a lie and two buttons to the same place is noise. -->
+      <a class="btn" id="open" href="${esc(SHARE_PLAY_URL)}">Get BNotes+ on Google Play</a>
 
-      <p class="foot">Already installed? This link opens the course in the app.</p>
+      <p class="foot" id="foot">Study this course in the BNotes+ app.</p>
     </div>
   </main>
 <script>
@@ -1858,8 +1861,15 @@ ${thumb ? `<meta property="og:image" content="${esc(thumb)}">` : ''}
 // or an older build), so the button falls back to the Play listing.
 (function () {
   if (!/Android/i.test(navigator.userAgent || '')) return;
+
   var btn = document.getElementById('open');
   if (!btn) return;
+
+  // Only on Android is "open the app" a promise we can keep.
+  btn.textContent = 'Open in BNotes+';
+  var foot = document.getElementById('foot');
+  if (foot) foot.textContent = "Don't have it yet? This takes you to Google Play.";
+
   btn.addEventListener('click', function (e) {
     e.preventDefault();
     window.location.href =
