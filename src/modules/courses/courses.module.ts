@@ -204,6 +204,7 @@ export class CoursesRepository {
 ) AS enrollment_count, c.bpsc_relevance, c.syllabus_coverage,
          c.language, c.trial_lesson_title, c.exam_tags, c.status,
          c.what_you_learn, c.has_certificate,
+         COALESCE(c.allow_download, FALSE) AS allow_download,
          c.created_at, c.updated_at,
 
          ${userId ? `(
@@ -1249,6 +1250,16 @@ export class CoursesService {
     if (!rows[0]) throw new NotFoundException('Lesson not found');
     const lesson = rows[0];
 
+    // Whether the student may save this PDF to their device. Lives on the
+    // course, not the lesson: notes are authored in bulk, and a course is
+    // what gets sold, so the decision belongs at the level money changes
+    // hands. Defaults to false — see 1786600000000.
+    const [courseRow] = await this.db.query(
+      `SELECT COALESCE(allow_download, FALSE) AS allow_download FROM courses WHERE id = $1`,
+      [courseId],
+    );
+    const allowDownload = courseRow?.allow_download === true;
+
     // ── Access control: a locked lesson requires enrollment,
     // regardless of whether the course itself is free or paid.
     // Free preview lessons (is_locked=false) are always accessible.
@@ -1263,7 +1274,7 @@ export class CoursesService {
       lesson.is_locked = false;
     }
 
-    return successResponse({ lesson, isEnrolled });
+    return successResponse({ lesson, isEnrolled, allowDownload });
   }
 
   async submitReview(courseId: string, userId: string, dto: SubmitReviewDto) {
