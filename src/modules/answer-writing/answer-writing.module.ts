@@ -466,8 +466,19 @@ export class AnswerWritingService {
     // to this same question (client reciprocity rule).
     let peerReviews: any[] = [];
     let gate = { unlocked: true, reviewsGivenHere: 0, reviewableCount: 0 };
+    let usedFreeRead = false;
     if (sub) {
       gate = await this.peerReviewUnlock(userId, questionId);
+
+      // Reciprocity still governs, but a student's first few questions are
+      // free — the gate otherwise bites hardest right after someone writes
+      // their first answer and wants to see how others approached it, which
+      // is the moment they are most willing to engage.
+      if (!gate.unlocked) {
+        usedFreeRead = await this.claimFreeRead(userId, questionId);
+        if (usedFreeRead) gate = { ...gate, unlocked: true };
+      }
+
       if (gate.unlocked) {
         // Ordered most-useful-first (the client's "Top Review Highlights"):
         // reviews the author found helpful rise, ones they marked unhelpful
@@ -535,6 +546,10 @@ export class AnswerWritingService {
       peerReviewsLocked: !!sub && !gate.unlocked,
       peerReviewCount:   sub ? Number(sub.peer_review_count) || 0 : 0,
       reviewableCount:   gate.reviewableCount,
+      // Lets the app say "2 free reads left" instead of silently unlocking,
+      // so the gate does not come as a surprise when the quota runs out.
+      freeReadsLeft:     sub ? await this.freeReadsLeft(userId) : null,
+      usedFreeRead,
     });
   }
 
@@ -733,6 +748,66 @@ export class AnswerWritingService {
    * workflow, and when it gets missed a student should see their feedback
    * rather than be blocked by an empty pool they can do nothing about.
    */
+  /**
+   * How many questions a student may read peer answers on before the
+   * reciprocity gate starts applying. Tunable without a deploy; 0 restores
+   * the original all-or-nothing behaviour.
+   */
+  private async freeReadQuota(): Promise<number> {
+    const [row] = await this.db.query(
+      `SELECT value FROM app_settings WHERE key='answer_free_reads'`
+    ).catch(() => []);
+    return Math.max(0, parseInt(row?.value ?? '3', 10) || 0);
+  }
+
+  /**
+   * Spend a free read on this question, if the student has one left.
+   *
+   * Idempotent per question: the INSERT is ON CONFLICT DO NOTHING against
+   * the (user_id, question_id) unique key, so re-opening a question already
+   * paid for costs nothing. Without that, the quota would be consumed by
+   * navigation rather than by reading, and going back to an answer you had
+   * already seen would lock it again.
+   *
+   * The count is read inside the same statement rather than checked first
+   * and inserted after: two taps arriving together would both pass a
+   * separate check and spend one slot twice.
+   */
+  private async claimFreeRead(userId: string, questionId: string): Promise<boolean> {
+    const quota = await this.freeReadQuota();
+    if (quota <= 0) return false;
+
+    const rows = await this.db.query(
+      `INSERT INTO answer_free_reads (user_id, question_id)
+       SELECT $1, $2
+       WHERE (SELECT COUNT(*) FROM answer_free_reads WHERE user_id = $1) < $3
+       ON CONFLICT (user_id, question_id) DO NOTHING
+       RETURNING id`,
+      [userId, questionId, quota]
+    );
+
+    // Already claimed earlier → the insert is a no-op but the read is still
+    // free, so ask the table rather than trusting the empty RETURNING.
+    if (rows.length > 0) return true;
+
+    const [existing] = await this.db.query(
+      `SELECT 1 FROM answer_free_reads WHERE user_id = $1 AND question_id = $2 LIMIT 1`,
+      [userId, questionId]
+    );
+    return !!existing;
+  }
+
+  /** Free reads still available, for the app to show before one is spent. */
+  private async freeReadsLeft(userId: string): Promise<number> {
+    const quota = await this.freeReadQuota();
+    if (quota <= 0) return 0;
+    const [row] = await this.db.query(
+      `SELECT COUNT(*)::int AS cnt FROM answer_free_reads WHERE user_id = $1`,
+      [userId]
+    );
+    return Math.max(0, quota - (Number(row?.cnt) || 0));
+  }
+
   private async peerReviewUnlock(userId: string, questionId: string) {
     const [given] = await this.db.query(
       `SELECT COUNT(*)::int AS cnt
