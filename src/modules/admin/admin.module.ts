@@ -111,7 +111,7 @@ export class AdminDashboardService {
     const cached = await this.cache.get(cacheKey);
     if (cached) return cached;
   
-    const [users, revenue, subs, marketplaceRevenue, content, coins, quizStats, rooms] = await Promise.all([
+    const [users, revenue, subs, marketplaceRevenue, courseRevenue, content, coins, quizStats, rooms] = await Promise.all([
       this.db.query(`
         SELECT
           COUNT(*) AS total,
@@ -141,6 +141,20 @@ export class AdminDashboardService {
                              AND created_at < date_trunc('month', NOW()) THEN platform_fee END), 0) AS last_month
         FROM material_purchases WHERE price_paid > 0
       `),
+      // Course sales. Unlike marketplace materials — where 60% passes
+      // through to the seller and only platform_fee is ours — a course is
+      // first-party content, so the whole amount is revenue, the same as a
+      // subscription. Only 'completed' counts: Cashfree rows sit at
+      // 'pending' until the gateway confirms, and counting those would
+      // report money that may never arrive.
+      this.db.query(`
+        SELECT
+          COALESCE(SUM(amount), 0) AS total,
+          COALESCE(SUM(CASE WHEN created_at >= date_trunc('month', NOW()) THEN amount END), 0) AS this_month,
+          COALESCE(SUM(CASE WHEN created_at >= date_trunc('month', NOW()) - INTERVAL '1 month'
+                             AND created_at < date_trunc('month', NOW()) THEN amount END), 0) AS last_month
+        FROM course_purchases WHERE status = 'completed'
+      `).catch(() => [{ total: 0, this_month: 0, last_month: 0 }]),
       this.db.query(`
         SELECT
           (SELECT COUNT(*) FROM courses WHERE status='published') AS courses,
@@ -177,19 +191,20 @@ export class AdminDashboardService {
       newThisWeek:         Number(users?.[0]?.new_this_week || 0),
       newThisMonth:        Number(users?.[0]?.new_this_month || 0),
   
-      // Revenue = subscriptions (100% BPSCNotes) + marketplace platform_fee
+      // Revenue = subscriptions + course sales (both 100% BPSCNotes)
+      //           + marketplace platform_fee
       // (the platform's net cut from study material sales; the seller's
       // 60% share is excluded since it's a pass-through, not BPSCNotes revenue).
-      totalRevenue:        Number(revenue?.[0]?.total || 0) + Number(marketplaceRevenue?.[0]?.total || 0),
-      revenueThisMonth:    Number(revenue?.[0]?.this_month || 0) + Number(marketplaceRevenue?.[0]?.this_month || 0),
-      revenueLastMonth:    Number(revenue?.[0]?.last_month || 0) + Number(marketplaceRevenue?.[0]?.last_month || 0),
+      totalRevenue:        Number(revenue?.[0]?.total || 0) + Number(marketplaceRevenue?.[0]?.total || 0) + Number(courseRevenue?.[0]?.total || 0),
+      revenueThisMonth:    Number(revenue?.[0]?.this_month || 0) + Number(marketplaceRevenue?.[0]?.this_month || 0) + Number(courseRevenue?.[0]?.this_month || 0),
+      revenueLastMonth:    Number(revenue?.[0]?.last_month || 0) + Number(marketplaceRevenue?.[0]?.last_month || 0) + Number(courseRevenue?.[0]?.last_month || 0),
   
       revenueGrowthPct:
-        (Number(revenue?.[0]?.last_month || 0) + Number(marketplaceRevenue?.[0]?.last_month || 0)) > 0
+        (Number(revenue?.[0]?.last_month || 0) + Number(marketplaceRevenue?.[0]?.last_month || 0) + Number(courseRevenue?.[0]?.last_month || 0)) > 0
           ? Math.round(
-              ((Number(revenue?.[0]?.this_month || 0) + Number(marketplaceRevenue?.[0]?.this_month || 0)) -
-               (Number(revenue?.[0]?.last_month || 0) + Number(marketplaceRevenue?.[0]?.last_month || 0))) /
-              (Number(revenue?.[0]?.last_month || 0) + Number(marketplaceRevenue?.[0]?.last_month || 0)) * 100
+              ((Number(revenue?.[0]?.this_month || 0) + Number(marketplaceRevenue?.[0]?.this_month || 0) + Number(courseRevenue?.[0]?.this_month || 0)) -
+               (Number(revenue?.[0]?.last_month || 0) + Number(marketplaceRevenue?.[0]?.last_month || 0) + Number(courseRevenue?.[0]?.last_month || 0))) /
+              (Number(revenue?.[0]?.last_month || 0) + Number(marketplaceRevenue?.[0]?.last_month || 0) + Number(courseRevenue?.[0]?.last_month || 0)) * 100
             )
           : 0,
   
@@ -236,7 +251,9 @@ export class AdminDashboardService {
     } else if (type === 'revenue') {
       query = `
         SELECT TO_CHAR(DATE_TRUNC('month', gs), 'Mon') AS date,
-               COALESCE(SUM(s.final_amount), 0) + COALESCE(MAX(mp.platform_fee_sum), 0) AS value
+               COALESCE(SUM(s.final_amount), 0)
+                 + COALESCE(MAX(mp.platform_fee_sum), 0)
+                 + COALESCE(MAX(cp.course_sum), 0) AS value
         FROM generate_series(NOW() - INTERVAL '${months - 1} months', NOW(), '1 month') gs
         LEFT JOIN subscriptions s ON DATE_TRUNC('month', s.created_at) = DATE_TRUNC('month', gs)
           AND s.payment_status = 'success'
@@ -245,6 +262,14 @@ export class AdminDashboardService {
           FROM material_purchases WHERE price_paid > 0
           GROUP BY DATE_TRUNC('month', created_at)
         ) mp ON mp.month = DATE_TRUNC('month', gs)
+        -- Pre-aggregated like mp above, and read with MAX for the same
+        -- reason: joining the rows directly would multiply them against the
+        -- subscription rows for that month and inflate the total.
+        LEFT JOIN (
+          SELECT DATE_TRUNC('month', created_at) AS month, SUM(amount) AS course_sum
+          FROM course_purchases WHERE status = 'completed'
+          GROUP BY DATE_TRUNC('month', created_at)
+        ) cp ON cp.month = DATE_TRUNC('month', gs)
         GROUP BY gs ORDER BY gs
       `;
     } else {
@@ -276,6 +301,15 @@ export class AdminDashboardService {
              COALESCE(SUM(platform_fee), 0)::int AS amount
       FROM material_purchases
       WHERE price_paid > 0
+      HAVING COUNT(*) > 0
+
+      UNION ALL
+
+      SELECT 'courses' AS plan,
+             COUNT(*)::int AS count,
+             COALESCE(SUM(amount), 0)::int AS amount
+      FROM course_purchases
+      WHERE status = 'completed'
       HAVING COUNT(*) > 0
 
       ORDER BY amount DESC
