@@ -206,3 +206,82 @@ export async function syncMaterialToPlayCatalog(material: MaterialForSync): Prom
     return null;
   }
 }
+
+// ── Mock tests — same sync again, applied to quizzes ──────────────────
+// Third near-copy of the same upsert. Deliberately a copy: courses and
+// materials are live revenue paths and folding all three into one generic
+// helper in the same change that introduces quiz purchases would put that
+// money at risk for a tidiness win. Worth collapsing once this has run in
+// production for a while.
+export interface QuizForSync {
+  id: string;
+  title: string;
+  description?: string | null;
+  price: number;
+  isPaid: boolean;
+}
+
+// quiz_ + 32 hex = 37 chars, inside Play's 40-char product id limit.
+export function gplayProductIdForQuiz(quizId: string): string {
+  return `quiz_${quizId.replace(/-/g, '')}`;
+}
+
+// Same best-effort contract as the two above: never throws, returns null
+// when there is nothing to sync (free test, zero price) or when Play
+// rejects the call. A catalog failure must never stop an admin saving a
+// quiz — it only means the test cannot be bought with money yet.
+export async function syncQuizToPlayCatalog(quiz: QuizForSync): Promise<string | null> {
+  if (!quiz.isPaid || !quiz.price || quiz.price <= 0) return null;
+
+  const productId = gplayProductIdForQuiz(quiz.id);
+
+  try {
+    const { rawClient, packageName } = await getPlayAuthClients();
+    const regionsVersion = requireEnv('GOOGLE_PLAY_REGIONS_VERSION');
+
+    const units = Math.floor(quiz.price);
+    const nanos = Math.round((quiz.price - units) * 1_000_000_000);
+
+    const url = `https://androidpublisher.googleapis.com/androidpublisher/v3/applications/${encodeURIComponent(packageName)}/onetimeproducts/${encodeURIComponent(productId)}`;
+
+    await rawClient.request({
+      url,
+      method: 'PATCH',
+      params: {
+        allowMissing: true,
+        'regionsVersion.version': regionsVersion,
+        updateMask: 'listings,purchaseOptions',
+      },
+      data: {
+        packageName,
+        productId,
+        listings: [
+          {
+            languageCode: 'en-US',
+            title: quiz.title.slice(0, 55),
+            description: (quiz.description || quiz.title).slice(0, 200),
+          },
+        ],
+        purchaseOptions: [
+          {
+            purchaseOptionId: PURCHASE_OPTION_ID,
+            buyOption: { legacyCompatible: true },
+            regionalPricingAndAvailabilityConfigs: [
+              {
+                regionCode: 'IN',
+                price: { currencyCode: 'INR', units: String(units), nanos },
+                availability: 'AVAILABLE',
+              },
+            ],
+          },
+        ],
+      },
+    });
+
+    return productId;
+  } catch (e: any) {
+    const detail = e?.response?.data ? JSON.stringify(e.response.data) : (e?.message || e);
+    console.error(`Play catalog sync failed for quiz ${quiz.id}:`, detail);
+    return null;
+  }
+}

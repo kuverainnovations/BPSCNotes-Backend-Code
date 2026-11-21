@@ -9,6 +9,8 @@ import { Throttle } from '@nestjs/throttler';
 import { InjectDataSource } from '@nestjs/typeorm';
 import { AchievementsService, WeeklyChallengesService, AchievementsModule } from '../achievements/achievements.module';
 import { NotificationsModule, NotificationService } from '../combined-modules-1.module';
+import { syncQuizToPlayCatalog } from '../../common/utils/gplay-catalog.util';
+import { getOneTimeProductPurchase, acknowledgeOneTimeProductPurchase } from '../../common/utils/gplay-purchase.util';
 import { DataSource } from 'typeorm';
 import { CACHE_MANAGER } from '@nestjs/cache-manager';
 import { Cache } from 'cache-manager';
@@ -78,6 +80,7 @@ class QuizzesService {
            COALESCE(q.is_paid, FALSE) AS is_paid,
            COALESCE(q.price, 0)       AS price,
            COALESCE(q.coin_price, 0)  AS coin_price,
+           q.gplay_product_id,
            (SELECT TRUE FROM quiz_purchases qp WHERE qp.user_id=$${params.length + 1} AND qp.quiz_id=q.id LIMIT 1) AS is_purchased,
            -- is_attempted / my_last_score must only look at COMPLETED attempts
            -- (total_questions > 0) — /start inserts a bare stub row with
@@ -135,7 +138,8 @@ class QuizzesService {
               negative_marking_enabled, marks_per_correct, marks_per_wrong,
               COALESCE(is_paid, false) AS is_paid,
               COALESCE(price, 0)       AS price,
-              COALESCE(coin_price, 0)  AS coin_price
+              COALESCE(coin_price, 0)  AS coin_price,
+              gplay_product_id
        FROM quizzes WHERE id=$1 AND status='published'`,
       [quizId]
     );
@@ -175,6 +179,96 @@ class QuizzesService {
    * price is NOT settled here — that goes through the normal payment flow,
    * which calls back in to grant the entitlement once the gateway confirms.
    */
+  /**
+   * Unlock a paid mock test with money, through Google Play Billing.
+   *
+   * Mirrors verifyGPlayCoursePurchase: Play checkout is entirely
+   * client-driven, so there is no pending row to look up — the app buys the
+   * product, hands the token here, and this records the entitlement only
+   * once Google confirms the token itself.
+   *
+   * clientPriceInr is bookkeeping only. Play's verification API never
+   * returns the amount actually charged, so this is the best record
+   * available, and the entitlement below never depends on it.
+   */
+  async verifyGPlayQuizPurchase(
+    quizId: string,
+    userId: string,
+    dto: { purchaseToken: string; clientPriceInr?: number },
+  ) {
+    const purchaseToken = dto?.purchaseToken;
+    if (!purchaseToken) throw new BadRequestException('purchaseToken required');
+
+    // Idempotency, scoped to the requesting user. Matching on the token
+    // alone would let a token captured by someone else be replayed here to
+    // mint them an entitlement without ever calling Google; scoping it
+    // means their replay falls through to the real verification below,
+    // where the account binding rejects it.
+    const [dup] = await this.db.query(
+      'SELECT id FROM quiz_purchases WHERE gplay_purchase_token=$1 AND user_id=$2',
+      [purchaseToken, userId],
+    );
+    if (dup) return successResponse({ alreadyOwned: true }, 'You already have this test');
+
+    const [quiz] = await this.db.query(
+      "SELECT id, title, COALESCE(is_paid,false) AS is_paid, gplay_product_id FROM quizzes WHERE id=$1 AND status='published'",
+      [quizId],
+    );
+    if (!quiz) throw new NotFoundException('Quiz not found');
+    if (!quiz.is_paid) throw new BadRequestException('This test is already free');
+    if (!quiz.gplay_product_id) {
+      throw new BadRequestException('This test is not available for purchase via Google Play yet.');
+    }
+
+    let purchase: any;
+    try {
+      purchase = await getOneTimeProductPurchase(purchaseToken);
+    } catch (e: any) {
+      console.error(
+        `GPlay quiz purchase verify failed: user=${userId} quiz=${quizId}`,
+        e?.response?.data ?? e?.message ?? e,
+      );
+      throw new BadRequestException('Google Play purchase verification failed. Contact support.');
+    }
+
+    if (purchase.productId !== quiz.gplay_product_id) {
+      throw new BadRequestException('This purchase does not match this test.');
+    }
+    if (purchase.purchaseState !== 'PURCHASED') {
+      throw new BadRequestException(`Play purchase not completed (state: ${purchase.purchaseState}).`);
+    }
+    if (purchase.obfuscatedExternalAccountId && purchase.obfuscatedExternalAccountId !== userId) {
+      console.warn(
+        `GPlay quiz purchase account mismatch: user=${userId} tokenAccountId=${purchase.obfuscatedExternalAccountId}`,
+      );
+      throw new BadRequestException('This purchase does not belong to your account.');
+    }
+
+    const amount = Math.max(0, Math.floor(Number(dto.clientPriceInr) || 0));
+
+    await this.db.query(
+      `INSERT INTO quiz_purchases
+         (quiz_id, user_id, price_paid, coins_spent, payment_provider, gplay_purchase_token, gplay_order_id)
+       VALUES ($1,$2,$3,0,'gplay',$4,$5)
+       ON CONFLICT (quiz_id, user_id) DO UPDATE
+         SET price_paid=$3, payment_provider='gplay',
+             gplay_purchase_token=$4, gplay_order_id=$5`,
+      [quizId, userId, amount, purchaseToken, purchase.orderId],
+    );
+
+    // Required within 3 days or Google auto-refunds. Awaited rather than
+    // fired and forgotten: there is no reconciliation job to retry a missed
+    // acknowledge, so this is the only attempt that will ever happen.
+    if (purchase.acknowledgementState !== 'ACKNOWLEDGEMENT_STATE_ACKNOWLEDGED') {
+      const acked = await acknowledgeOneTimeProductPurchase(quiz.gplay_product_id, purchaseToken);
+      if (!acked) {
+        console.error(`GPlay quiz acknowledge failed: user=${userId} quiz=${quizId} token=${purchaseToken}`);
+      }
+    }
+
+    return successResponse({ unlocked: true }, `Unlocked: ${quiz.title}`);
+  }
+
   async purchaseQuiz(quizId: string, userId: string, payWith: 'coins' = 'coins') {
     const [quiz] = await this.db.query(
       `SELECT id, title, COALESCE(is_paid,false) AS is_paid, COALESCE(coin_price,0) AS coin_price
@@ -903,7 +997,39 @@ return successResponse({
         data.coinPrice  != null ? +data.coinPrice  : 0,
       ]
     );
+    await this.syncPlayCatalog(result[0].id);
     return successResponse({ quiz: result[0] }, 'Quiz created. Add questions next.');
+  }
+
+  /**
+   * Keep the Play one-time product in step with what admin just saved, so
+   * a paid test becomes purchasable without anyone touching Play Console.
+   *
+   * Best-effort, exactly like the course and material equivalents: never
+   * throws, never blocks the save. A failure means the test cannot be
+   * bought with money yet, not that the save failed.
+   */
+  private async syncPlayCatalog(quizId: string): Promise<void> {
+    const [quiz] = await this.db.query(
+      'SELECT id, title, description, price, COALESCE(is_paid,false) AS is_paid FROM quizzes WHERE id=$1',
+      [quizId]
+    ).catch(() => []);
+    if (!quiz) return;
+
+    const productId = await syncQuizToPlayCatalog({
+      id: quiz.id,
+      title: quiz.title,
+      description: quiz.description,
+      price: Number(quiz.price),
+      isPaid: quiz.is_paid,
+    });
+
+    if (productId) {
+      await this.db.query(
+        'UPDATE quizzes SET gplay_product_id=$1 WHERE id=$2',
+        [productId, quizId]
+      ).catch(() => {});
+    }
   }
 
   async bulkImport(data: any, adminId: string) {
@@ -1083,6 +1209,7 @@ return successResponse({
     fields.push('updated_at=NOW()');
     await this.db.query(`UPDATE quizzes SET ${fields.join(',')} WHERE id=$${i}`, [...vals, quizId]);
     await this.cache.del(`quiz_meta:${quizId}`);
+    await this.syncPlayCatalog(quizId);
     return successResponse(null, 'Quiz updated ✅');
   }
 
@@ -1395,6 +1522,19 @@ class QuizzesController {
   @HttpCode(HttpStatus.OK)
   purchase(@Param('id', ParseUUIDPipe) id: string, @Req() r: any) {
     return this.s.purchaseQuiz(id, r.user.id);
+  }
+
+  // Money path. Play Billing rather than Cashfree because this is digital
+  // content bought inside the app, which Play policy requires to go
+  // through their billing — the same route courses and materials take.
+  @Post(':id/purchase/gplay/verify')
+  @HttpCode(HttpStatus.OK)
+  verifyGplayPurchase(
+    @Param('id', ParseUUIDPipe) id: string,
+    @Body() dto: { purchaseToken: string; clientPriceInr?: number },
+    @Req() r: any,
+  ) {
+    return this.s.verifyGPlayQuizPurchase(id, r.user.id, dto);
   }
 
   /** POST /quizzes/:id/submit */
