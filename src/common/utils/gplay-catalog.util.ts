@@ -285,3 +285,73 @@ export async function syncQuizToPlayCatalog(quiz: QuizForSync): Promise<string |
     return null;
   }
 }
+
+// -- Mock test packages -- a bundle bought once, like a course -----------
+export interface QuizPackageForSync {
+  id: string;
+  title: string;
+  description?: string | null;
+  price: number;
+  isPaid: boolean;
+}
+
+// qpkg_ + 32 hex = 37 chars, inside Play's 40-char product id limit.
+export function gplayProductIdForQuizPackage(packageId: string): string {
+  return `qpkg_${packageId.replace(/-/g, '')}`;
+}
+
+export async function syncQuizPackageToPlayCatalog(pkg: QuizPackageForSync): Promise<string | null> {
+  if (!pkg.isPaid || !pkg.price || pkg.price <= 0) return null;
+
+  const productId = gplayProductIdForQuizPackage(pkg.id);
+
+  try {
+    const { rawClient, packageName } = await getPlayAuthClients();
+    const regionsVersion = requireEnv('GOOGLE_PLAY_REGIONS_VERSION');
+
+    const units = Math.floor(pkg.price);
+    const nanos = Math.round((pkg.price - units) * 1_000_000_000);
+
+    const url = `https://androidpublisher.googleapis.com/androidpublisher/v3/applications/${encodeURIComponent(packageName)}/onetimeproducts/${encodeURIComponent(productId)}`;
+
+    await rawClient.request({
+      url,
+      method: 'PATCH',
+      params: {
+        allowMissing: true,
+        'regionsVersion.version': regionsVersion,
+        updateMask: 'listings,purchaseOptions',
+      },
+      data: {
+        packageName,
+        productId,
+        listings: [
+          {
+            languageCode: 'en-US',
+            title: pkg.title.slice(0, 55),
+            description: (pkg.description || pkg.title).slice(0, 200),
+          },
+        ],
+        purchaseOptions: [
+          {
+            purchaseOptionId: PURCHASE_OPTION_ID,
+            buyOption: { legacyCompatible: true },
+            regionalPricingAndAvailabilityConfigs: [
+              {
+                regionCode: 'IN',
+                price: { currencyCode: 'INR', units: String(units), nanos },
+                availability: 'AVAILABLE',
+              },
+            ],
+          },
+        ],
+      },
+    });
+
+    return productId;
+  } catch (e: any) {
+    const detail = e?.response?.data ? JSON.stringify(e.response.data) : (e?.message || e);
+    console.error(`Play catalog sync failed for quiz package ${pkg.id}:`, detail);
+    return null;
+  }
+}

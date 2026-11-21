@@ -81,6 +81,10 @@ class QuizzesService {
            COALESCE(q.price, 0)       AS price,
            COALESCE(q.coin_price, 0)  AS coin_price,
            q.gplay_product_id,
+           q.package_id,
+           EXISTS (SELECT 1 FROM quiz_package_purchases pp
+                    WHERE pp.package_id = q.package_id
+                      AND pp.user_id = $${params.length + 1}) AS package_owned,
            (SELECT TRUE FROM quiz_purchases qp WHERE qp.user_id=$${params.length + 1} AND qp.quiz_id=q.id LIMIT 1) AS is_purchased,
            -- is_attempted / my_last_score must only look at COMPLETED attempts
            -- (total_questions > 0) — /start inserts a bare stub row with
@@ -163,10 +167,28 @@ class QuizzesService {
   }
 
   /** True when this user already owns this quiz. Free quizzes never consult it. */
+  /**
+   * Does this student have access to this test?
+   *
+   * Two ways in, and either is enough: they bought the test on its own, or
+   * they bought the package it belongs to. Packages are the course-shaped
+   * bundle the client asked for; individual pricing stayed, so a test can
+   * be sold both ways at once.
+   */
   private async hasPurchased(quizId: string, userId: string): Promise<boolean> {
     if (!userId) return false;
     const rows = await this.db.query(
-      `SELECT 1 FROM quiz_purchases WHERE quiz_id=$1 AND user_id=$2 LIMIT 1`,
+      `SELECT 1
+         FROM quizzes q
+        WHERE q.id = $1
+          AND (
+            EXISTS (SELECT 1 FROM quiz_purchases qp
+                     WHERE qp.quiz_id = q.id AND qp.user_id = $2)
+            OR (q.package_id IS NOT NULL AND EXISTS (
+                  SELECT 1 FROM quiz_package_purchases pp
+                   WHERE pp.package_id = q.package_id AND pp.user_id = $2))
+          )
+        LIMIT 1`,
       [quizId, userId]
     );
     return rows.length > 0;
